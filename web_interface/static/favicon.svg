@@ -1,0 +1,325 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   width="32.5"
+   height="32.5"
+   viewBox="0 0 32.5 32.5"
+   version="1.1"
+   id="svg19"
+   sodipodi:docname="favicon.svg"
+   inkscape:version="1.4.2 (f4327f4, 2025-05-13)"
+   inkscape:export-filename="logo.png"
+   inkscape:export-xdpi="192"
+   inkscape:export-ydpi="192"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview19"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="8"
+     inkscape:cx="69.375"
+     inkscape:cy="17.9375"
+     inkscape:window-width="3840"
+     inkscape:window-height="2054"
+     inkscape:window-x="-11"
+     inkscape:window-y="-11"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg19" />
+  <defs
+     id="defs7">
+    <linearGradient
+       id="linearGradient25"
+       x1="0"
+       y1="0"
+       x2="1"
+       y2="1">
+      <stop
+         offset="0"
+         style="stop-color:#0707ff;stop-opacity:1;"
+         id="stop24" />
+      <stop
+         offset="100%"
+         style="stop-color:#0ea5e9;stop-opacity:1"
+         id="stop25" />
+    </linearGradient>
+    <linearGradient
+       id="bgGradient"
+       x1="-0.25"
+       y1="-0.25"
+       x2="32.25"
+       y2="32.25"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="translate(-32,-0.37565041)">
+      <stop
+         offset="0%"
+         style="stop-color:#0a0a0f;stop-opacity:1"
+         id="stop1" />
+      <stop
+         offset="100%"
+         style="stop-color:#1a1f2e;stop-opacity:1"
+         id="stop2" />
+    </linearGradient>
+    <linearGradient
+       id="cyanGradient"
+       x1="0"
+       y1="0"
+       x2="1"
+       y2="1">
+      <stop
+         offset="0%"
+         style="stop-color:#00d4ff;stop-opacity:1"
+         id="stop3" />
+      <stop
+         offset="100%"
+         style="stop-color:#0ea5e9;stop-opacity:1"
+         id="stop4" />
+    </linearGradient>
+    <filter
+       id="glow"
+       x="-0.40000001"
+       y="-0.40000001"
+       width="1.8"
+       height="1.8">
+      <feGaussianBlur
+         stdDeviation="1"
+         result="coloredBlur"
+         id="feGaussianBlur4" />
+      <feMerge
+         id="feMerge5">
+        <feMergeNode
+           in="coloredBlur"
+           id="feMergeNode4" />
+        <feMergeNode
+           in="SourceGraphic"
+           id="feMergeNode5" />
+      </feMerge>
+    </filter>
+    <filter
+       id="textGlow">
+      <feGaussianBlur
+         stdDeviation="2"
+         result="coloredBlur"
+         id="feGaussianBlur5" />
+      <feMerge
+         id="feMerge7">
+        <feMergeNode
+           in="coloredBlur"
+           id="feMergeNode6" />
+        <feMergeNode
+           in="SourceGraphic"
+           id="feMergeNode7" />
+      </feMerge>
+    </filter>
+    <filter
+       id="glow-1"
+       x="-0.4"
+       y="-0.4"
+       width="1.8"
+       height="1.8">
+      <feGaussianBlur
+         stdDeviation="1"
+         result="coloredBlur"
+         id="feGaussianBlur4-1" />
+      <feMerge
+         id="feMerge5-5">
+        <feMergeNode
+           in="coloredBlur"
+           id="feMergeNode4-2" />
+        <feMergeNode
+           in="SourceGraphic"
+           id="feMergeNode5-7" />
+      </feMerge>
+    </filter>
+    <linearGradient
+       id="bgGradient-6"
+       x1="-0.25"
+       y1="-0.25"
+       x2="32.25"
+       y2="32.25"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="translate(-31.029863,-32.821509)">
+      <stop
+         offset="0%"
+         style="stop-color:#0a0a0f;stop-opacity:1"
+         id="stop1-1" />
+      <stop
+         offset="100%"
+         style="stop-color:#1a1f2e;stop-opacity:1"
+         id="stop2-4" />
+    </linearGradient>
+  </defs>
+  <!-- Icon Container - shifted to center vertically -->
+  <g
+     transform="translate(1.3749968,0.87499989)"
+     id="g19">
+    <!-- Background -->
+    <!-- Central Node (Station Core) -->
+    <!-- Connection Nodes (Agents) -->
+    <!-- Data Flow Lines -->
+    <g
+       id="g28"
+       transform="rotate(90,15.675696,16.020818)">
+      <rect
+         width="31.999998"
+         height="31.999998"
+         rx="3.9999998"
+         fill="url(#bgGradient)"
+         stroke="#334155"
+         stroke-width="0.500001"
+         id="rect7-2"
+         style="fill:url(#bgGradient-6)"
+         x="-31.029877"
+         y="-32.82151"
+         transform="scale(-1)" />
+      <g
+         id="g1"
+         transform="matrix(0,-4.3474621,4.3474621,0,-510.92928,566.93627)">
+        <rect
+           style="fill:#00bdf4;fill-opacity:1;stroke:none;stroke-width:0.397182;stroke-dasharray:none;stroke-opacity:1"
+           id="rect27-8-2-3"
+           width="0.35718751"
+           height="0.90621096"
+           x="-175.16869"
+           y="2.2603397"
+           transform="rotate(-135)" />
+        <rect
+           style="fill:#00bdf4;fill-opacity:1;stroke:none;stroke-width:0.397077;stroke-dasharray:none;stroke-opacity:1"
+           id="rect27-8-22"
+           width="0.35699999"
+           height="0.90621096"
+           x="-4.1078129"
+           y="-174.24968"
+           transform="rotate(135)" />
+        <rect
+           style="fill:#00bdf4;fill-opacity:1;stroke:none;stroke-width:0.397182;stroke-dasharray:none;stroke-opacity:1"
+           id="rect27-8-2-5-1"
+           width="0.35718751"
+           height="0.90621096"
+           x="-175.18291"
+           y="4.6679325"
+           transform="rotate(-135)" />
+        <rect
+           style="fill:#00bdf4;fill-opacity:1;stroke:none;stroke-width:0.397182;stroke-dasharray:none;stroke-opacity:1"
+           id="rect27-6"
+           width="0.35718751"
+           height="0.90621096"
+           x="-4.0919285"
+           y="-176.65048"
+           transform="rotate(135)" />
+        <g
+           id="g27-8"
+           transform="matrix(0.26458333,0,0,0.26458333,122.30365,116.7474)">
+          <circle
+             cx="16"
+             cy="16"
+             r="3"
+             fill="url(#cyanGradient)"
+             filter="url(#glow)"
+             id="circle7-5"
+             style="fill:#00bdf4;fill-opacity:1;filter:url(#glow-1)"
+             transform="rotate(90,16,16)" />
+          <circle
+             cx="15.999984"
+             cy="16.000021"
+             fill="none"
+             stroke="#00d4ff"
+             stroke-width="0.8"
+             opacity="0.6"
+             id="circle8-7"
+             style="opacity:1;stroke:#0787a5;stroke-width:1.46487;stroke-dasharray:none;stroke-opacity:1"
+             r="6.8360686" />
+          <circle
+             cx="16"
+             cy="16"
+             r="11"
+             fill="none"
+             stroke="#0ea5e9"
+             stroke-width="0.6"
+             opacity="0.4"
+             id="circle9-6"
+             style="stroke-width:1.5;stroke-dasharray:none" />
+          <circle
+             cx="-26"
+             cy="6"
+             r="0.80000001"
+             fill="#8b5cf6"
+             opacity="0.6"
+             id="circle16-2"
+             transform="rotate(-90)" />
+          <circle
+             cx="-6"
+             cy="6"
+             r="0.80000001"
+             fill="#8b5cf6"
+             opacity="0.6"
+             id="circle17-7"
+             transform="rotate(-90)" />
+          <circle
+             cx="-26"
+             cy="26"
+             r="0.80000001"
+             fill="#8b5cf6"
+             opacity="0.6"
+             id="circle18-9"
+             transform="rotate(-90)" />
+          <circle
+             cx="-6"
+             cy="26"
+             r="0.80000001"
+             fill="#8b5cf6"
+             opacity="0.6"
+             id="circle19-5"
+             transform="rotate(-90)" />
+          <g
+             id="g29">
+            <circle
+               cx="15.951519"
+               cy="-27.091566"
+               fill="#22c55e"
+               opacity="0.8"
+               id="circle10-1"
+               style="stroke-width:2;stroke-dasharray:none"
+               r="2"
+               transform="rotate(90)" />
+            <circle
+               cx="27.004333"
+               cy="-16.092667"
+               fill="#22c55e"
+               opacity="0.8"
+               id="circle11-8"
+               style="stroke-width:2;stroke-dasharray:none"
+               r="2"
+               transform="rotate(90)" />
+            <circle
+               cx="4.9412813"
+               cy="-16.027756"
+               fill="#22c55e"
+               opacity="0.8"
+               id="circle13-9"
+               style="stroke-width:2;stroke-dasharray:none"
+               r="2"
+               transform="rotate(90)" />
+            <circle
+               cx="15.999594"
+               cy="-5.0230169"
+               fill="#22c55e"
+               opacity="0.8"
+               id="circle12-4"
+               style="stroke-width:2;stroke-dasharray:none"
+               r="2"
+               transform="rotate(90)" />
+          </g>
+        </g>
+      </g>
+    </g>
+    <!-- Corner accent dots -->
+  </g>
+  <!-- STATION Text -->
+</svg>

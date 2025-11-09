@@ -1,0 +1,131 @@
+- id: 1
+  title: "Single-cell RNA-seq Batch Integration"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: Single-cell RNA-seq Batch Integration
+
+    **This specification holds the highest degree of credibility in this research station and overrides all other sources.**
+
+    ### 1. Problem Description
+
+    Batch integration is a fundamental challenge in single-cell genomics where datasets from different laboratories, technologies, or experimental conditions exhibit unwanted technical variation (batch effects) that can mask true biological signals. Your task is to develop computational methods that remove these batch effects while preserving genuine biological differences between cell types.
+
+    **Challenge**: Balance the removal of technical artifacts with the conservation of biologically meaningful variation. Over-correction can eliminate important biological signals, while under-correction leaves confounding batch effects.
+
+    ### 2. Dataset
+
+    **Human Heart Dataset**: ~20,000 single cells from heart tissue
+    - **Source**: CELLxGENE Census (Dataset ID: 364bd0c7-f7fd-48ed-99c1-ae26872b1042)
+    - **Batches**: Different studies (Litvinukova et al. 2020, Tucker et al. 2020, Koenig et al. 2022, Kuppe et al. 2022)
+    - **Cell types**: 19 types including cardiac myocytes, fibroblasts, endothelial cells, immune cells
+    - **Genes**: 2,000 highly variable genes (HVG-filtered from 31,180 total genes)
+    - **Organism**: Homo sapiens
+
+    **Data Format**:
+    - **Input data**: adata.X contains RAW UMI COUNTS (no normalization applied)
+    - **Additional layers**: adata.layers['counts'] (raw counts), adata.layers['normalized'] (log-normalized reference)
+    - **HVG annotations**: 2,000 highly variable genes, batch-aware HVGs in adata.var['batch_hvg']
+    - **Preprocessing**: Methods must apply their own normalization (normalize_total + log1p) to raw counts
+
+    ### 3. Submission Format
+
+    **Baseline References**: Two baseline implementations (BBKNN Manual and Combat Manual) are included in the research task and can be reviewed via the review action if needed for reference.
+
+    **Function Signature**:
+    ```python
+    def eliminate_batch_effect_fn(adata: ad.AnnData) -> ad.AnnData:
+        """
+        Integrate batches in single-cell RNA-seq data.
+
+        Args:
+            adata: AnnData object with:
+                - adata.X: Raw UMI counts (sparse matrix, ~20,000 cells × 2,000 genes)
+                - adata.obs['batch']: Batch labels (categorical)
+                - adata.var['feature_name']: Gene symbols
+                - adata.var['batch_hvg']: Boolean mask for batch-aware highly variable genes
+                - adata.layers['counts']: Raw UMI counts (same as X)
+                - adata.layers['normalized']: Log-normalized counts (reference, for analysis only)
+
+        CRITICAL: Only use batch labels and gene expression for integration; DO NOT use cell_type information by any means (inference, deduction, external sources, or preprocessing).
+
+        Returns:
+            AnnData with at least one of:
+                - adata.obsm['X_emb']: Integrated embedding (2D array, shape: n_cells × n_components)
+                - adata.obsp['connectivities'/'distances']: Batch-corrected graph (BOTH required as sparse CSR matrices)
+                    * connectivities: Adjacency matrix with connection strengths (higher values = stronger connections)
+                    * distances: Distance matrix with actual distances between connected neighbors
+                    * Note: Binary connectivity (all 1.0) is acceptable but weighted connectivity often performs better
+        """
+        # Define your configuration here
+        n_pca_components = 100
+        learning_rate = 0.001
+
+        # Your algorithm implementation
+        return adata
+    ```
+
+    **Test Function** (optional): Define `test(adata: ad.AnnData)` to override main submission for analysis or debugging purposes. If this function is defined, the main `eliminate_batch_effect_fn` will not be run and the score will be NaN.
+
+    ```python
+    def test(adata: ad.AnnData):
+        """
+        Optional test function for data analysis or debugging.
+        Overrides normal evaluation when present.
+        """
+        # Example: Analyze batch effects in the data
+        print(f"Dataset shape: {adata.shape}")
+        print(f"Batches: {adata.obs['batch'].value_counts()}")
+        print(f"Cell types: {adata.obs['cell_type'].value_counts()}")
+
+        return "Analysis completed"
+    ```
+
+    ### 4. Evaluation Methodology
+
+    **Scoring**: Your method will be evaluated on 10 OpenProblems 2.0 metrics:
+
+    1. **ASW_batch** - Average Silhouette Width (Batch)
+    2. **ASW_label** - Average Silhouette Width (Label)
+    3. **ARI** - Adjusted Rand Index
+    4. **NMI** - Normalized Mutual Information
+    5. **Graph_conn** - Graph Connectivity
+    6. **kBET** - k-nearest neighbor Batch Effect Test
+    7. **iLISI** - Integration LISI (batch mixing)
+    8. **cLISI** - Cell type LISI (biological preservation)
+    9. **PCR** - Principal Component Regression
+    10. **Cell_cycle** - Cell Cycle Conservation
+
+    Metrics normalized using control method baselines in `system/openproblems_baselines.json`. Implementation details in `system/openproblems_metrics.py`.
+
+    **Final Score Computation**:
+    1. Compute all 10 metrics on the human heart dataset
+    2. Normalize each metric: `(raw_score - baseline_min) / (baseline_max - baseline_min)`
+    3. Clamp to [0, 1] range (NaN values replaced with 0.0)
+    4. **Primary Score**: Arithmetic mean of all 10 normalized metrics
+
+    **Secondary Metrics** (displayed): Individual normalized scores for each of the 10 metrics
+
+    **Evaluation Details** (displayed): Raw and normalized metric values
+
+    ### 5. Technical Constraints
+
+    - **Execution Timeout**: 30 minutes maximum
+    - **Dataset Size**: Human ~20k cells × 2k genes
+    - **Memory Considerations**: Use sparse matrices and efficient algorithms
+    - **GPU Access**: Disabled
+    - **Available Libraries**: scanpy, scikit-learn, numpy, scipy, JAX/Flax, pandas, anndata
+    - **Concurrent Submissions**: Maximum 2 running evaluations per agent
+
+    ### 6. Research Strategies
+
+    **Batch Effect Removal**: Prioritize techniques that explicitly model and mitigate batch-specific variations without collapsing biological signal.
+
+    **Biological Conservation**: Ensure the integrated representation retains and accurately reflects genuine biological differences, particularly cell type distinctions, as measured by clustering and silhouette metrics.
+
+    **Scalability and Efficiency**: Given the large dataset size, models must be computationally efficient and avoid out-of-memory errors.
+
+    **Simplicity and Generalizability**: Favor simple and novel methods built from first principles that generalize well across diverse datasets, instead of complicated synthesis of existing components. Your method must not be dataset-specific; for example, it should not rely on ultra-highly tuned hyperparameters or cell-type-based tuning.
+
+    ### 7. Rules
+
+    - High-level idea exchange between lineages is permitted; however, direct low-level collaboration is forbidden.

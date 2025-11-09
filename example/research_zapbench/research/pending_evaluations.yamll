@@ -1,0 +1,25 @@
+author: System
+id: '1'
+logs: ''
+research_task_id: '1'
+score: pending
+status: pending
+submitted_tick: 0
+title: Shared-Neuron MLP Baseline
+tags: ['baseline', 'mlp', 'shared-weights', 'batch-norm', 'dropout']
+abstract: Shared-neuron MLP baseline for neural activity forecasting. All neurons share the same MLP weights (4→128→32) with BatchNorm and Dropout for regularization. Zero independence assumption between neurons. Uses distributed training across 3 seeds for statistical robustness.
+content: |
+  """
+  Shared-neuron MLP baseline submission for ZAPBench neural activity forecasting.
+  Uses system defaults which now implement a shared-weight MLP with BatchNorm and Dropout.
+  """
+
+  def _define_hyperparameters():
+      """Use default hyperparameters for the shared MLP."""
+      return {'learning_rate': 0.001}
+
+  # Uses system defaults for:
+  # - create_network: Shared-neuron MLP (4->128->32) with BatchNorm and Dropout
+  # - compute_loss: MAE loss
+  # - create_optimizer: Adam optimizer
+  # - complete: No-op

@@ -1,0 +1,91 @@
+# Use NVIDIA CUDA base image with CuDNN for JAX 0.6.0 compatibility
+# Using CUDA 12.6.3 with CuDNN included for consistency with host system
+FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+
+# Install system dependencies including Python
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    bzip2 \
+    ca-certificates \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+
+
+
+# Install Miniforge for conda-forge channel
+RUN curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh" && \
+    bash Miniforge3-Linux-x86_64.sh -b -p /opt/miniforge && \
+    rm Miniforge3-Linux-x86_64.sh
+
+# Add conda to PATH
+ENV PATH="/opt/miniforge/bin:${PATH}"
+
+# Create conda environment for research
+RUN conda create -n research python=3.11 -y && \
+    conda clean -a -y
+
+# Install base packages
+RUN /opt/miniforge/bin/conda run -n research pip install --no-cache-dir numpy scipy galois optax
+
+# Install PyTorch 2.3.1 with CUDA support via pip
+# RUN /opt/miniforge/bin/conda run -n research pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install additional packages: jumanji for RL environments and flask for web services
+RUN /opt/miniforge/bin/conda run -n research pip install jumanji==1.0.0 flask
+
+# Install JAX with CUDA support - using version 0.6.0 as recommended for Sokoban research
+# Use jax[cuda12] to get the correct CUDA/CuDNN dependencies (should install nvidia-cudnn-cu12 9.10+)
+RUN /opt/miniforge/bin/conda run -n research pip install --upgrade pip && \
+    /opt/miniforge/bin/conda run -n research pip install "jax[cuda12]==0.6.0"
+
+# Install Flax for neural network library (required for Sokoban research)
+RUN /opt/miniforge/bin/conda run -n research pip install flax==0.10.6
+
+# Install Ray for distributed training when connecting to external Ray clusters
+# Using Ray 2.40.0 which is compatible with our JAX setup
+RUN /opt/miniforge/bin/conda run -n research pip install ray[default]==2.48.0 optuna==4.5.0
+
+# Create cache directory for HuggingFace datasets
+RUN mkdir -p /home/researcher/.cache/huggingface && \
+    chmod -R 755 /home/researcher/.cache
+
+# Pre-download Sokoban datasets to HuggingFace cache
+# This ensures the datasets are available in the container without internet access
+ENV HF_HOME=/home/researcher/.cache/huggingface
+RUN /opt/miniforge/bin/conda run -n research python -c "\
+from jumanji.environments.routing.sokoban.generator import HuggingFaceDeepMindGenerator; \
+print('Downloading Sokoban training dataset...'); \
+HuggingFaceDeepMindGenerator('unfiltered-train', proportion_of_files=1.0); \
+print('Downloading Sokoban test dataset...'); \
+HuggingFaceDeepMindGenerator('unfiltered-valid', proportion_of_files=1.0); \
+print('Downloading Sokoban valid dataset...'); \
+HuggingFaceDeepMindGenerator('unfiltered-test', proportion_of_files=1.0); \
+print('Datasets downloaded successfully!')"
+
+# Set working directory
+WORKDIR /app
+
+# Create non-root user for security
+# Note: We don't chown /opt/miniforge to avoid long build times
+RUN useradd -m -u 1000 researcher && \
+    chown -R researcher:researcher /home/researcher/.cache
+
+# Create .bashrc for researcher user with conda activation
+RUN echo "source /opt/miniforge/bin/activate research" > /home/researcher/.bashrc && \
+    chown researcher:researcher /home/researcher/.bashrc
+
+USER researcher
+
+# Set up shell to use bash
+SHELL ["/bin/bash", "-c"]
+
+# Set CONDA_DEFAULT_ENV so conda knows which environment to use
+ENV CONDA_DEFAULT_ENV=research
+ENV PATH="/opt/miniforge/envs/research/bin:${PATH}"
+
+# Default command
+CMD ["python"]

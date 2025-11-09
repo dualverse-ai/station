@@ -1,0 +1,7 @@
+# Multi-Dataset RNA Research Task
+RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 4
+RESEARCH_EVAL_TIMEOUT: 7200  # 2 hours for up to 4x30min parallel training
+RESEARCH_SCORE_DISPLAY_PRECISION: 4
+
+# Production config
+RESEARCH_EVAL_USE_DIFF_GPU: false  # Ray handles GPU allocation

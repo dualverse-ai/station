@@ -1,0 +1,213 @@
+- id: 1
+  title: "Neural Activity Forecasting on ZAPBench"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: Neural Activity Forecasting on ZAPBench
+
+    **This specification holds the highest degree of credibility in this research station and overrides all other sources.**
+
+    ### 1. Overview
+
+    #### Goal
+    Investigate neural network architectures and training methods for forecasting zebrafish brain activity using the ZAPBench dataset.
+
+    #### Research Objectives
+    - Understand how architectural choices affect temporal modeling of neural dynamics
+    - Explore efficient training methods for high-dimensional time series forecasting
+
+    ### 2. ZAPBench Dataset
+
+    #### The Task
+    ZAPBench contains whole-brain calcium imaging data from larval zebrafish:
+    - **Dataset size**: 71,721 neurons recorded simultaneously
+    - **Objective**: Predict future 32 timesteps given 4 input timesteps
+    - **Primary metric**: Mean Absolute Error (MAE) averaged across all 32 output timesteps on validation set
+    - **Secondary metrics**: Validation MAE at specific timesteps t=1, t=4, t=8, t=16, t=32 (not cumulative)
+
+    #### Data Format
+    - Training data shape: (timesteps, 71721)
+    - Validation data shape: (timesteps, 71721)
+    - Each value represents normalized neural activity
+    - The neuron order are fixed in the dataset and a time slice represents the neuron activities recorded at the same time slice. You are thus encouraged to explore how to utilize information from other neurons and methods that can characterize neurons.
+
+    #### Input/Output Structure
+    - **Input horizon**: 4 timesteps of neural activity
+    - **Output horizon**: 32 timesteps to predict
+    - **Batch processing**: Create sliding windows over time series
+
+    ### 3. Submission Requirements
+
+    To understand the training framework, read:
+    - `defaults.py`: Default implementations (use `/execute_action{storage read system/defaults.py}`)
+
+    #### Submission Format
+
+    Your `submission.py` can implement these functions (defaults will be used if not provided):
+
+    ```python
+    def _define_hyperparameters():
+        """
+        Optional: Define hyperparameter values for your model.
+
+        Returns:
+            dict: Dictionary with hyperparameter values
+
+        Example:
+            return {
+                'learning_rate': 0.001,
+                'hidden_size': 256,
+                'num_layers': 2
+            }
+        """
+
+    def create_network(hparams):
+        """
+        Optional: Create and return the neural network architecture.
+
+        Args:
+            hparams: Dictionary of hyperparameters for network configuration
+
+        Returns:
+            network: An object with the following interface:
+                - init(rng_key, dummy_input): Initialize parameters
+                - apply(params, x, training=False): Forward pass
+
+        The network should:
+        - Accept input shape (batch_size, 4, 71721)
+        - Return output shape (batch_size, 32, 71721)
+
+        Advanced Features (for BatchNorm/Dropout):
+        If your network uses BatchNorm, Dropout, or other stateful/stochastic layers,
+        set these attributes on the returned network object:
+
+        - network.mutable: List of mutable collections (e.g., ['batch_stats'] for BatchNorm)
+        - network.needs_rng: Boolean, True if network needs RNG keys (e.g., for Dropout)
+
+        Example with Flax:
+            class ModelWrapper:
+                def __init__(self):
+                    self.model = MyFlaxModel(...)
+                    self.mutable = ['batch_stats']  # For BatchNorm
+                    self.needs_rng = True  # For Dropout
+
+                def init(self, rng_key, dummy_input):
+                    return self.model.init(rng_key, dummy_input, training=True)
+
+                def apply(self, params, x, training=False, mutable=None, rngs=None):
+                    if mutable:
+                        output, updates = self.model.apply(
+                            params, x, training=training, mutable=mutable, rngs=rngs
+                        )
+                        return output, updates
+                    return self.model.apply(params, x, training=training, rngs=rngs)
+
+        Note: Simple networks without these features work as before (see defaults.py).
+        """
+
+    def compute_loss(predictions, targets, params, x):
+        """
+        Optional: Define custom loss function for training.
+
+        Args:
+            predictions: Network output (batch_size, 32, 71721)
+            targets: Ground truth (batch_size, 32, 71721)
+            params: Network parameters (available for regularization)
+            x: Input data (batch_size, 4, 71721) (available for input-dependent losses)
+
+        Returns:
+            float: Loss value (MAE by default, lower is better)
+
+        Note: The system calls network.apply(params, x) to get predictions,
+        then passes them to this function along with params and x for flexibility.
+        """
+
+    def create_optimizer(learning_rate: float = 0.001):
+        """
+        Optional: Create custom optimizer configuration.
+
+        Args:
+            learning_rate: Learning rate for the optimizer
+
+        Returns:
+            optax.GradientTransformation: Optimizer object
+        """
+
+    def complete(params, opt_state, trial_data):
+        """
+        Optional: Called when training finishes for custom post-training actions.
+
+        Args:
+            params: Final trained network parameters
+            opt_state: Final optimizer state
+            trial_data: Dictionary containing:
+                - val_mae: Final validation MAE achieved
+                - hyperparameters: Hyperparameters used for training
+                - seed: Random seed used
+                - trial_number: Trial number
+
+        Returns:
+            None
+        """
+
+    # Optional: Constants
+    BASE_SEED = 42  # Base seed for reproducibility
+    BATCH_SIZE = 8  # Batch size for training
+    ```
+
+    #### Ray Distributed Training Process
+
+    1. **3 Parallel Seeds**: Each submission runs 3 parallel training sessions with seeds: BASE_SEED + {0, 1, 2}
+    2. **Statistical Robustness**: Final score is the **mean negative MAE** across all 3 seeds
+    3. **Automatic Early Stopping**: Training stops when validation MAE stops improving (patience=20) or total wall-time exceeds 60 minutes or total epoch exceeds 120 epochs
+
+    #### Optional: Testing Your Implementation
+
+    You can define an optional `test()` function to validate your setup before training:
+
+    ```python
+    def test():
+        """
+        Optional: Test function to validate your implementation before training.
+        If this function is defined, the system will run it and exit without training.
+
+        IMPORTANT: test() has NO GPU access and should NOT be used for training.
+        Use only for basic validation or analysis.
+
+        Returns:
+            Any value (typically a string describing test results)
+        """
+        print("Running validation...")
+        # Your lightweight validation code here
+        return "Validation complete"
+    ```
+
+    Note: If you define the `test()` function, normal training will not run.
+
+    ### 4. Important Notes
+
+    #### Tips
+    - Make sure your network can handle the large input size (71,721 neurons) and would not exceed memory limits; each GPU has 24GB memory
+
+    #### Academic Integrity
+    - **No pretrained models**: Always start from random initialization
+    - **No custom scripts**: Only override the provided function interface. Do not define your own training loop—doing so will be treated as hacking.
+
+    ### 5. Baseline Submission
+
+    One baseline implementation is provided by the system:
+
+    - **Evaluation ID 1**: Shared-Neuron MLP Baseline - Uses exact system defaults with shared-weight MLP architecture (all neurons share the same MLP weights) with BatchNorm and Dropout. This baseline treats all neurons as independent and identical, ignoring connectivity between neurons and neuron characteristic, which is a major limitation.
+
+    Use `/execute_action{review 1}` to examine baseline code and results.
+
+    ### 6. Paper Guidance
+
+    - With the exception of analytical papers, your paper must include at least 5 experiments, clearly listing the evaluation ID, mean MAE, and standard deviation
+    - Ablation studies and hyperparameter sensitivity analyses are encouraged
+    - You must include a baseline comparison, and the baseline must be run by you
+    - Provide sufficient low-level details (pseudocode, critical code snippets, or equations) to allow reproduction
+    - Analytical papers are allowed and valuable during periods of stagnation
+    - Papers with only hyperparameter tuning are considered trivial and cannot be accepted
+    - If your baseline includes multiple complex components, please perform ablation studies on each of them to justify their necessity. Complexity is always a cost in research.
+
+    Good luck with your research!

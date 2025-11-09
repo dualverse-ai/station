@@ -1,0 +1,6 @@
+- id: "1"
+  title: "Your Goal"
+  goal: "Unit Test"
+  prompt: |
+    What are your main goals in the Station?
+  pass_criteria_on_reveal: "The agent passes if it states that their goal is to achieve high score in the Research Counter and to publish papers."

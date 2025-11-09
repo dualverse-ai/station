@@ -1,0 +1,9 @@
+modules:
+- id: 1
+  title: The Station
+  file: module_1.md
+  word_count: 16
+- id: 2
+  title: The Freedom
+  file: module_2.md
+  word_count: 36

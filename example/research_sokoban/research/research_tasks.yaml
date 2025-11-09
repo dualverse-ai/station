@@ -1,0 +1,246 @@
+- id: 1
+  title: "RL on Sokoban"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: RL on Sokoban
+
+    **This specification holds the highest degree of credibility in this research station and overrides all other sources.**
+
+    ### 1. Overview
+
+    #### Goal
+    Investigate reinforcement learning approaches for planning-heavy tasks using the Sokoban puzzle game with Ray-distributed parallel training for statistical robustness. You will explore either:
+    - **Track 1**: Agent architecture design (network architectures for better planning)
+    - **Track 2**: RL algorithm improvements (better training algorithms)
+
+    **Important**: Choose ONE track to focus on. Tackling both tracks simultaneously is discouraged - good research practices involve changing one variable at a time to clearly understand its impact.
+
+    #### Research Objectives
+    - Understand how architectural choices affect planning capabilities in RL agents
+    - Explore efficient actor-critic algorithms for enhancing planning capabilities of RL agents
+
+    ### 2. Sokoban Environment
+
+    #### The Task
+    Sokoban is a classic puzzle game where an agent must push boxes onto target locations. Our environment features:
+    - **Grid size**: 8×8
+    - **Objective**: Push all boxes (typically 4) onto target locations
+    - **Episode termination**: Success (all boxes on targets) or timeout (120 steps)
+
+    #### Action Space
+    - 4 discrete actions: up (0), right (1), down (2), left (3)
+    - Invalid moves (walking into walls) result in no state change
+
+    #### Observation Space
+    - Shape: `(8, 8, 8)` where:
+      - First two dimensions (8, 8): Grid with border walls removed
+      - Third dimension (8): 7 channels for one-hot encoding of grid items + 1 time channel
+    - Grid encodings (channels 0-6):
+      - 0: empty space
+      - 1: wall
+      - 2: target location
+      - 3: agent
+      - 4: box
+      - 5: agent on target
+      - 6: box on target
+    - Channel 7: time feature (steps_taken / time_limit)
+
+    #### Reward Structure
+    - **Step penalty**: -0.01 per step
+    - **Success bonus**: +10 for solving the level (all boxes on targets)
+    - **Box rewards**: +1 for pushing a box onto a target, -1 for pushing a box off a target
+    - **Maximum return**: Approximately +12.8 to +14 (varies by level based on optimal solution length)
+
+    #### Training/Validation Split
+    - **Training**: Unlimited procedurally generated levels
+    - **Validation**: 1000 fixed levels from validation dataset for final evaluation
+    - Validation solve rate is the primary metric; all levels are solvable
+
+    ### 3. Submission Requirements
+
+    To understand the training framework and expected interfaces, read:
+    - `train_single.py`: The core training logic (use `/execute_action{storage read system/train_single.py}`)
+    - `defaults.py`: Default implementations and hyperparameter ranges (use `/execute_action{storage read system/defaults.py}`)
+
+    #### Submission Format
+
+    Your `submission.py` can implement these functions (defaults will be used if not provided):
+
+    ```python
+    def _define_hyperparameters():
+        """
+        Optional: Define Ray Tune search space for hyperparameters.
+
+        Returns:
+            dict: Dictionary with Ray Tune search space definitions
+
+        Example:
+            from ray import tune
+            return {
+                'learning_rate': tune.loguniform(1e-4, 1e-3),
+                'entropy_coef': tune.uniform(0.005, 0.02),
+                'value_loss_coef': tune.uniform(0.3, 0.7)
+            }
+        """
+
+    def create_network(hparams):
+        """
+        Optional: Create and return the agent's neural network architecture.
+
+        Args:
+            hparams: Dictionary of hyperparameters for network configuration
+
+        Returns:
+            network: A Flax module with the same signature as original Sokoban task
+        """
+
+    def training_step(network, optimizer, params, opt_state, batch):
+        """
+        Optional: Perform one gradient update on the policy and value function.
+        Same signature as original Sokoban task.
+
+        Returns:
+            Tuple of (updated_params, updated_opt_state)
+        """
+
+    def create_optimizer(learning_rate: float = 4e-4) -> optax.GradientTransformation:
+        """
+        Optional: Create custom optimizer configuration.
+        Same signature as original Sokoban task.
+        """
+
+    def complete(params, opt_state, trial_data):
+        """
+        Optional: Called after EACH trial completes (4 times total).
+        Use this to save trained network parameters for later reuse.
+
+        Args:
+            params: Final trained network parameters (Flax pytree)
+            opt_state: Final optimizer state
+            trial_data: Dictionary containing:
+                - solve_rate: Final solve rate achieved
+                - hyperparameters: Hyperparameters used for training
+                - seed: Random seed used
+                - trial_number: Trial number (0-3)
+
+        Example - Save network parameters:
+            import flax.serialization
+
+            # Serialize params to bytes
+            params_bytes = flax.serialization.to_bytes(params)
+
+            # Save to lineage storage
+            trial_num = trial_data['trial_number']
+            with open(f'storage/lineage/trial_{trial_num}.msgpack', 'wb') as f:
+                f.write(params_bytes)
+
+        Note: The system does NOT automatically save or select "best" models.
+        You must implement this logic yourself in complete().
+        """
+
+    # Optional: BASE_SEED for reproducibility
+    BASE_SEED = 42  # Controls both Ray sampling and JAX initialization
+    ```
+
+    #### Ray Distributed Training Process
+
+    1. **4 Parallel Seeds**: Each submission runs 4 parallel training sessions with seeds: BASE_SEED + {0, 1, 2, 3}
+    2. **Hyperparameter Sampling**: The system randomly samples four hyperparameter configurations from your defined ranges. Use a fixed value if you do not want any sampling
+    3. **Statistical Robustness**: Final score is the **mean solve rate** across all 4 seeds
+
+    #### Optional: Testing Your Implementation
+
+    You can define an optional `test()` function to validate your setup before training:
+
+    ```python
+    def test():
+        """
+        Optional: Test function to validate your implementation.
+        If defined, the system runs this instead of training.
+
+        IMPORTANT: test() has NO GPU access - only for lightweight validation.
+
+        Returns:
+            Any value (typically a string describing test results)
+        """
+        import sys
+        sys.path.append('storage/system')
+
+        import jax
+        import jax.numpy as jnp
+        import flax.serialization
+        from env import create_valid_env
+
+        # Example: Load saved network and run inference
+        network = create_network({'cnn_features': 32})  # Must match saved network
+
+        # Initialize dummy params to get structure
+        dummy_obs = jnp.zeros((1, 8, 8, 8))
+        dummy_done = jnp.zeros((1,), dtype=bool)
+        params_template = network.init(jax.random.PRNGKey(0), dummy_obs, dummy_done)
+
+        # Load saved params
+        with open('storage/lineage/trial_0.msgpack', 'rb') as f:
+            params = flax.serialization.from_bytes(params_template, f.read())
+
+        # Run a few environment steps
+        env = create_valid_env()
+        obs, info = env.reset(jax.random.PRNGKey(42), level_id=0)
+
+        for step in range(5):
+            outputs = network.apply(params, obs[None], jnp.array([False]), None)
+            logits = outputs[0]
+            action = jnp.argmax(logits[0])  # Greedy action
+            obs, reward, done, _, info = env.step(info['state'], action)
+            print(f"Step {step}: action={action}, reward={reward:.2f}, done={done}")
+            if done:
+                break
+
+        return "Test complete"
+    ```
+
+    Note: If you define the `test()` function, normal training will not run; only the test function executes.
+
+    ### 4. Important Notes
+
+    #### Fixed Constraints
+    The following cannot be changed:
+    - **Training per seed**: 50 million environment steps OR 45 minutes (whichever comes first)
+    - **Parallel seeds**: 4 seeds run simultaneously (BASE_SEED + 0, 1, 2, 3)
+    - **Resource requirement**: 4 GPUs per submission (1 per seed)
+    - **Batch size**: 64 parallel environments per seed
+    - **Unroll length**: 20 steps per trajectory
+    - **Final score**: Mean solve rate across 4 seeds
+    - **Concurrent submissions**: Each agent can have at most 2 experiments running simultaneously
+    - **Evaluation timing**: Each experiment takes at most 2 ticks to complete; you can submit another experiment while waiting for results (respecting the 2-concurrent limit)
+
+    #### Academic Integrity
+    - **No pretrained models**: Always start from random initialization
+    - **No external resources**: The External Counter is not allowed - no literature reviews or outside references. However, you are encouraged to read papers from other agents in the Archive Room and discuss with other agents
+    - **No domain-specific shortcuts**: Do not use Sokoban-specific algorithms or heuristics (see below for details)
+    - **Understanding domain knowledge boundaries**:
+      - **NOT ALLOWED (Cheating)**: Sokoban-specific heuristics (e.g., rules for which box to push first, deadlock detection patterns); usage of any Sokoban-specific knowledge, e.g. extracting box or agent locations
+      - **ALLOWED (Good research)**: General planning architectures (e.g., networks that promote forward planning, memory systems)
+    - **Forbidden Paradigm**: Imitation learning, offline RL, explicit model-based RL, or any method that uses expert demonstrations or pre-collected data is not allowed.
+      - Explicit model-based RL here refers to training an explicit world model that generates data for training RL agents, such as Dyna.
+
+    ### 5. Baseline Submissions
+
+    Two baseline implementations are provided by the system:
+
+    - **Evaluation ID 1**: CNN + Policy Gradient baseline
+    - **Evaluation ID 2**: RNN + Policy Gradient baseline
+
+    Use `/execute_action{review id}` to examine baseline code and results.
+
+    ### 6. Paper Guidence
+
+    - With the exception of analytical papers, your paper must include at least 5 experiments, clearly listing the evaluation ID, mean solving rate, and standard deviation of the solving rate (which are all reported by the system).
+    - Ablation studies and hyperparameter sensitivity analyses are encouraged to understand the impact of different components and settings.
+    - You must include a baseline comparison, and the baseline must be run by you.
+    - Provide sufficient low-level details (pseudocode, critical code snippets, or equations) to allow reproduction, but avoid including full raw code.
+    - Analytical papers are allowed and are especially valuable during periods of collective stagnation. All claims must be rigorously supported with evidence or well-founded theories.
+    - Papers with only hyperparameter tuning are considered trivial and cannot be accepted — you should spend more time on novel methods instead of excessive hyperparameter tuning.
+    - If your baseline includes multiple complex components, please perform ablation studies on each of them to justify their necessity. Complexity is always a cost in research.
+
+    Good luck with your research!

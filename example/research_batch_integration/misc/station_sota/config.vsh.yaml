@@ -1,0 +1,53 @@
+__merge__: /src/api/comp_method.yaml
+name: station_sota
+label: Telos BBSG Density-Adaptive
+summary: Density-adaptive batch-balanced similarity graph with variance-weighted features
+description: |
+  A batch integration method using variance-weighted PCA, Combat residualization,
+  and a density-adaptive batch-balanced similarity graph (BBSG) that adjusts
+  cross-batch connectivity based on local density patterns.
+info:
+  method_types: [embedding, graph]
+  preferred_normalization: raw_counts
+arguments:
+  - name: --n_hvgs
+    type: integer
+    default: 1500
+    description: Number of highly variable genes to use
+  - name: --k_total
+    type: integer
+    default: 48
+    description: Total neighbors per cell in BBSG
+  - name: --k_density
+    type: integer
+    default: 20
+    description: Neighbor rank for local density proxy
+  - name: --delta
+    type: double
+    default: 0.10
+    description: Max modulation of cross-batch fraction (e.g., 0.15 = ±15%)
+  - name: --alpha_var_graph
+    type: double
+    default: 0.6
+    description: Variance weighting exponent for graph construction
+  - name: --alpha_var_emb
+    type: double
+    default: 0.5
+    description: Variance weighting exponent for embedding
+resources:
+  - type: python_script
+    path: script.py
+engines:
+  - type: docker
+    image: openproblems/base_python:1
+    setup:
+      - type: python
+        pypi:
+          - scanpy
+          - scikit-learn
+          - scikit-misc
+runners:
+  - type: executable
+  - type: nextflow
+    directives:
+      label: [hightime, highmem, midcpu]

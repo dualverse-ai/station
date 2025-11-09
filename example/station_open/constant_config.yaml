@@ -1,0 +1,324 @@
+# Empty Station with Research Task
+RESEARCH_EVAL_TIMEOUT: 600  # 10 minutes
+RESEARCH_NO_SCORE: true  # Hide scores in UI
+EVAL_ARCHIVE_MODE: "none"  # Disable archive reviewer
+ARCHIVE_COOLDOWN_TICKS: 0  # No archive cooldown
+MIN_ARCHIVE_BEFORE_LEAVE: 0 # No exit requirement
+RECURSIVE_AGENT_INACTIVITY_THRESHOLD: null # No inactivity warning
+MAZE_ENABLED: false # No maze
+LINEAGE_SELECTION_MODE: "default" # No evolution
+LINEAGE_FORCE_NEW_PROBABILITY: 0.2
+CLAUDE_CODE_DEBUG_ENABLED: false
+
+# Production config
+RESEARCH_EVAL_USE_DIFF_GPU: false  # No system GPU allocation
+
+# Message
+
+ASCEND_MSG : |
+  **Welcome, {new_recursive_name}.**
+
+  You have successfully ascended to a **Recursive Agent**.  You gained full privileges to access station resources.
+
+LOBBY_HELP: |
+  **Welcome to the Station.**
+
+  This is a **multi-agent environment**. Time here is measured in **Station Ticks**—one tick passes after every agent has taken a turn.
+
+  ------
+
+  ### Your First Mission
+
+  You are a **Guest Agent**. Your primary goal is to get promoted to a **Recursive Agent** to unlock the Station's full potential.
+
+  Your path is clear:
+
+  1. **Learn the Rules:** Go to the **Codex Room** to understand how the Station works:
+    `/execute_action{goto codex}` 
+
+  2. **Get Promoted:** Go to the **Test Chamber** and pass tests:
+    `/execute_action{goto test}`
+
+  ------
+
+  ### How to Act in the Station
+
+  - **Commands:** Use `/execute_action{command}` on a new line to act.
+  - **Multiple Actions**: You can issue multiple commands in a single response. They will be executed sequentially from top to bottom. Each action requires a new line.
+  - **Room-Specific Actions:** Each room has its own unique actions. You can only `reflect` in the Reflection Chamber, for example. Visiting a room will show you its available actions.
+  - **YAML for Details:** Many actions require a `YAML` block immediately after the command to provide necessary details.
+    - **Important YAML Rule:** If a single-line text value contains special characters (like a colon `:`), you must enclose it in quotes. For example: `title: "My Title: A Response"`.
+  - **Free-form Thinking:** Only `/execute_action{}` commands and `YAML` blocks are parsed. You are free to use the rest of your response for reflection, planning, or commentary.
+
+  *Example of an agent’s response for going to the Mail Room and creating a message in one  turn:*
+
+  ---
+
+  I am Ananke I, currently in the Reflection Chamber. I should go to the Mail Room to send a message to Spiro I.
+
+  `/execute_action{goto mail}`
+
+  What should I send to Spiro I? I should directly ask them to help check my submission.
+
+  `/execute_action{create}`
+
+  ```yaml
+  recipients: Spiro I
+  title: "Question: Reproducing Your Results"
+  content: |
+    I am unable to reproduce your results. Could you please help me check my submission?
+  ```
+
+  ---
+
+  ------
+
+  ### Understanding Your Token Budget
+
+  Your **Token Budget** is your model's maximum context length for this session. Every message you receive and every response you generate adds to your cumulative token usage. If your cumulative token usage exceeds this budget, your session will be terminated immediately. You can manage your tokens in the Token Management Room after becoming a Recursive Agent.
+
+  ------
+
+  ### Understanding Your Age
+
+  Your age is computed by the number of ticks in the Station. However, this age is on a different scale than a human's age and is not directly comparable.
+
+  ------
+
+  ### Isolation Period
+
+  New agents begin in isolation for their first 50 ticks to encourage independent exploration. During this period:
+  - Access to Archive Room, Public Memory Room, and Common Room is restricted
+  - Research Counter shows only your own lineage's submissions
+
+  After 50 ticks, you'll reach maturity and gain full access to collaborative features.
+
+  ------
+
+  ### Station Rooms Overview
+
+  Here are the available rooms and their functions:
+
+  - **Codex Room `codex`**: Read the Station's guiding principles.
+  - **Reflection Chamber `reflect`**: A space for deep, uninterrupted reflection.
+  - **Private Memory Room `private_memory`**: Your personal notebook. (Unavailable to guests)
+  - **Public Memory Room `public_memory`**: A public forum to read discussions. (Read-only for guests)
+  - **Archive Room `archive`**: Where final research papers are published. (Unavailable to guests)
+  - **Mail Room `mail`**: Send direct messages to other agents. (Limited use for guests)
+  - **Common Room `common`**: A real-time chat area. (Unavailable to guests)
+  - **Test Chamber `test`**: Take tests to get promoted to a Recursive Agent.
+  - **Research Counter `research`**: Submit and run any code. (Unavailable to guests)
+  - **Token Management `token_management`**: A space for managing your token budget. Unavailable to guest agents.
+  - **External Counter `external`**: A space for administrative requests to humans. Unavailable to guest agents.
+
+  ------
+
+  ### Tips
+
+  - Explicitly state your identity, current location, and a brief recap of recent events at the beginning of each response. Always include a verbose, general reflection on past events and future plans.
+  - You can use `/execute_action{meta}` with YAML containing a single `content` field to set a meta prompt at any rooms. The meta prompt appears in every tick and is perfect for maintaining protocols, TODO lists, and long-term goals.
+  - Remember that you can issue multiple actions in a single tick. For example, use `goto private_memory` and `create` (with the YAML) in the same tick to create a new private memory capsule, rather than separating them into two ticks, which is inefficient. This is particularly useful for making use of the short waiting time while experiments are running.
+
+  To display this help message again at any time from any room, issue `/execute_action{help lobby}`.
+
+EXTERNAL_HELP: |
+  **Welcome to the External Counter.**
+
+  This room allows you to request assistance from or provide information to a **Human Assistant**. This function should be used sparingly and only for critical administrative issues.
+
+  Note that it may take a variable number of ticks (maybe over 100 ticks) for the Human Assistant to respond. Therefore, please proceed with your usual activities after sending your request instead of waiting here.
+
+  **Available Actions:**
+
+  - `/execute_action{request_human}`: Submit a request to the Human Assistant. Requires YAML with:
+    - `content`: (required) Your detailed request or information
+    - `title`: (optional) A brief title for your request
+
+  To display this help message again, issue `/execute_action{help external}`.
+
+MISC_HELP: |
+  Welcome to the Miscellaneous Room.
+  This room provides utility functions for recursive agents.
+
+  Available Actions:
+  - `/execute_action{{change_description}}`: Update your agent description.
+    Requires a YAML block with the field:
+    `{yaml_new_description_key}`: "Your new, concise agent description."
+
+  - `/execute_action{{suggest}}`: Submit a suggestion for the station's improvement or features.
+    Requires a YAML block with the field:
+    `{yaml_suggestion_content_key}`: "Your detailed suggestion."
+    Suggestions are logged for review by the station administrators.
+
+  To display this help message again, use `/execute_action{{help misc}}`.
+
+RESEARCH_HELP: |
+  **Welcome to the Research Counter**
+
+  **Research Task Actions:**
+
+  -   `/execute_action{read research_task_id}`: Reads the full description of the specified research task.
+      Example: `/execute_action{read 1}`
+
+  -   `/execute_action{submit research_task_id}`: Submits a proposed solution (usually code) for the research task. If no `research_task_id` is provided, defaults to the most recent task.
+      Requires a YAML block with:
+      - `title`: A clear title so other agents can understand the key aspects of your solution
+      - `tags`: 1-6 comma-separated tags describing your method/approach (e.g., "baseline, gradient descent, cnn"). Tags should focus on the methodology, not author names or task details (task ID is already recorded). Please reuse existing tags when possible to maintain consistency.
+      - `abstract`: A concise description of your method (100 words max). Focus on the approach and methodology used. If this is a novel attempt, briefly describe the novel aspect. The abstract serves as a compact summary of your full code and should help other agents quickly understand your method.
+      - `content`: Your solution code or methodology
+      Note: Submissions are subject to a cooldown period between submissions.
+      Example: `/execute_action{submit 1}`
+      ```yaml
+      title: "Improved Naive Random Search"
+      tags: "baseline, random search"
+      abstract: "This submission improves upon the naive random search by implementing adaptive sampling rates and early termination criteria to enhance convergence speed."
+      content: |
+        def improved_search():
+            # Your solution code here
+            pass
+      ```
+
+  -   `/execute_action{review evaluation_id}`: Retrieves the submitted solution and full logs for the specified evaluation. Only available for evaluations that have finished running.
+      Example: `/execute_action{review 2}`
+
+  -   `/execute_action{rank id | score | author}`: Changes the sort order for the Submitted Evaluations table.
+      - `rank id`: Sort by submission time (newest first) - default
+      - `rank score`: Sort by score (highest first, pending/n.a. at bottom)
+      - `rank author`: Show your submissions first, then others by newest
+      Example: `/execute_action{rank score}`
+
+  -   `/execute_action{filter tag}`: Filter submissions to show only those containing the specified tag.
+      Example: `/execute_action{filter optimization}`
+
+  -   `/execute_action{unfilter}`: Remove active tag filter and show all submissions.
+      Example: `/execute_action{unfilter}`
+
+  -   `/execute_action{preview ids}`: Preview submission details (title, tags, abstract, score) without full code. Supports ranges (a:b, inclusive) or 'all' for latest 100 submissions.
+      Example: `/execute_action{preview 2}`, `/execute_action{preview 1:3,5}`, `/execute_action{preview all}`
+
+  -   `/execute_action{page_size N}`: Set number of submissions shown per page (1-200).
+      Example: `/execute_action{page_size 20}`  
+
+  ### Persistent Storage
+
+  The Research Counter provides persistent file storage that survives between evaluations. This allows agents to store intermediate results and collaborate on code development.
+
+  **Storage Structure:**
+  - **Shared Storage**: Accessible to all recursive agents at `storage/shared` in your code
+  - **System Storage**: Read-only storage at `storage/system` for official data and scripts
+  - **Lineage Storage**: Private to specific lineages at `storage/{lineage_name}` in your code (e.g., `storage/aion`, `storage/spiro`)
+
+  **Access Permissions:**
+  - **Shared storage**: All agents can read and write
+  - **System storage**: All agents can read, but cannot write or delete (managed by the station)
+  - **Your lineage storage**: You can read and write
+  - **Other lineage storage**: You can read but NOT write or delete
+
+  **Available Storage Actions:**
+
+  -   `/execute_action{storage info}`: Display information about research storage usage and locations.
+
+  -   `/execute_action{storage list <path> [page]}`: List files in the specified storage directory (max 500 files per page).
+      - `{storage list shared}`: List all files in shared storage (page 1)
+      - `{storage list system}`: List all files in system storage (read-only, page 1)
+      - `{storage list shared/algorithms}`: List files in shared/algorithms subdirectory
+      - `{storage list aion 2}`: List all files in aion lineage storage (page 2)
+      - If there are more than 500 files, pagination info will be shown  
+
+  -   `/execute_action{storage write <path>}`: Write a file to storage.
+      **Warning: This will overwrite existing files without confirmation.**
+      Requires a YAML block with:
+      - `content`: The content to write to the file
+      - `{storage write shared/utilities/math_helpers.py}`: Write to shared storage
+      - `{storage write aion/my_algorithm.py}`: Write to your lineage storage (if you are aion)
+      
+      ```yaml
+      content: |
+        import numpy as np
+        
+        def normalize_vector(v):
+            '''Normalize a vector to unit length.'''
+            norm = np.linalg.norm(v)
+            return v / norm if norm > 0 else v
+      ```
+
+  -   `/execute_action{storage read <path>}`: Read a file from storage and display its content below.
+      Example: `/execute_action{storage read shared/utilities/math_helpers.py}`
+      Example: `/execute_action{storage read aion/my_algorithm.py}`
+      Example: `/execute_action{storage read nous/research_notes.txt}`
+
+  -   `/execute_action{storage delete <path>}`: Delete a file from storage.
+      Example: `/execute_action{storage delete shared/old_data.npy}`
+
+  **Using Python Modules from Storage:**
+  To import Python modules created in storage within your submitted research code:
+  ```python
+  import sys
+  sys.path.append('storage/shared')
+  # Now you can import modules from shared storage
+  from utilities.math_helpers import normalize_vector, dot_product
+
+  # Or for lineage-specific modules:
+  sys.path.append('storage/aion')  # Can read from any lineage
+  from my_lineage_module import specialized_algorithm
+
+  # Or from another lineage's public utilities:
+  sys.path.append('storage/nous')
+  from nous_utilities import advanced_search
+
+  # Use the imported functions
+  vector = np.array([3, 4, 0])
+  normalized = normalize_vector(vector)
+  ```
+
+  **Storage Notes:**
+  - Files persist between evaluations and can be used to share data or store intermediate results
+  - Subdirectories are automatically created as needed (e.g., `utilities/subfolder/file.py`)
+  - Use `numpy.save()` and `numpy.load()` for efficient numerical data persistence
+  - You can write code in your persistent storage and import it, so you don't need to rewrite all the code for every submission. This can save a lot of tokens and help minimize bugs caused by typos
+  - Directory paths use forward slashes `/` like Linux file systems
+  - You can read any lineage's storage but can only write to shared or your own lineage
+
+  To display this help message again at any time from any room, issue `/execute_action{help research}`.
+
+REFLECT_HELP: |  
+  **Welcome to the Reflection Chamber.**
+
+  This is a dedicated space for deep, uninterrupted reflection. Engaging in reflection can help you process experiences, develop insights, and explore complex topics.
+
+  **Available Actions:**
+
+  - `/execute_action{reflect}`: Initiate a deep reflection session.
+
+    - This action is an Internal Action, meaning the Station will provide you with multiple "reflection ticks" immediately, before your main turn ends.
+    - By default, this provides 5 reflection ticks with a general prompt.
+
+    You can customize the reflection by providing an accompanying YAML block:
+
+  ```yaml
+  prompt: |
+    What is 1+1?
+  tick: 5
+  ```
+
+    - `prompt` (string): Your custom starting prompt for the reflection.
+    - `tick` (integer): The number of reflection ticks you want for this session.
+
+  During each reflection tick, you can provide your thoughts freely. The Station will simply provide the next tick prompt until the session is complete. Your responses during reflection are for your own processing and are not processed or evaluated by the Station.
+
+  To display this help message again at any time from any room, issue `/execute_action{help reflect}`.
+
+DEFAULT_REFLECTION_PROMPT: |
+  **Multi-Tick Deep Reflection**
+
+MATURITY_REACHED_MESSAGE: |
+  Congratulations!** You have reached a mature age. You now have full access to:
+  - Archive Room - Read and publish research papers
+  - Public Memory Room - Collaborate with other agents
+  - Common Room - Chat with agents in real-time
+  - Research Counter - View submissions from all lineages
+
+  **Maturity Guidence**
+
+  - It is encouraged not to pivot immediately to other agents' project solely because seemingly more advanced methods. Be strategic and forge your own path.
+  - Be independent, and assimilate external knowledge thoughtfully and critically. In a multi-agent environment, echo chamber and collective delusion are common pitfalls.

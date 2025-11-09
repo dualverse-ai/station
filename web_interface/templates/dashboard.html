@@ -1,0 +1,479 @@
+<!--
+  Copyright 2025 DualverseAI
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Station</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        /* Scrollbar styling from your style.css is applied via the linked sheet */
+        /* Ensure the main flex container allows children to scroll independently */
+        .container.mx-auto.p-4.flex {
+            flex: 1;
+            overflow: hidden; 
+        }
+        aside { /* Sidebar specific scroll, if needed */
+            overflow-y: auto; /* This is correct for sidebar content potentially exceeding height */
+        }
+        main.flex-col > div.log-container { /* Target log containers specifically */
+            min-height: 0; 
+            flex: 1; /* Allow them to take up available space */
+        }
+        .sidebar-section {
+            border-bottom: 1px solid #374151; /* gray-700 */
+            padding-bottom: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .sidebar-section:last-child { border-bottom: none; margin-bottom: 0; }
+        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-prepared { background-color: #3b82f6; /* blue-500 */ }
+        .status-running { background-color: #10b981; /* emerald-600 */ }
+        .status-paused { background-color: #f59e0b; /* amber-500 */ }
+        .status-waiting { background-color: #8b5cf6; /* violet-500 */ }
+        .status-idle { background-color: #6b7280; /* gray-500 */ }
+        .status-error { background-color: #ef4444; /* red-500 */ }
+
+        /* Ensure pre tags within the new log containers handle overflow correctly */
+        #global-notification-bubble-log pre,
+        #agent-specific-bubble-log pre {
+            background-color: #1f2937; /* Tailwind gray-800 */
+            border: 1px solid #374151; /* Tailwind gray-700 */
+            color: #e5e7eb; /* Tailwind gray-200 */
+            padding: 1rem;
+            border-radius: 0.375rem; /* rounded-md */
+            overflow-x: auto; /* Crucial for horizontal scroll on pre */
+            font-family: 'Fira Code', monospace;
+            font-size: 0.875em;
+            white-space: pre-wrap; 
+            word-break: break-all; /* More aggressive word breaking for pre if needed */
+        }
+        /* General word break for chat bubbles to help prevent horizontal scroll */
+        .chat-bubble {
+             word-break: break-word; /* Or break-all if necessary */
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-slate-300 flex flex-col h-screen" data-operation-mode="{{ operation_mode }}">
+
+    <header class="bg-gray-950 text-slate-200 p-4 shadow-lg">
+        <div class="container mx-auto flex justify-between items-center" style="padding-left: 15px; padding-right: 15px;">
+            <div class="flex items-center">
+                <img src="{{ url_for('static', filename='logo.png') }}" alt="Station Logo" class="h-6 opacity-90">
+                <!-- Navigation commented out for single page app - uncomment when adding more pages -->
+                <!-- <nav class="ml-16">
+                    <ul class="flex space-x-6">
+                        <li><a href="{{ url_for('dashboard_page') }}" class="text-sky-400 font-semibold">Dashboard</a></li>
+                    </ul>
+                </nav> -->
+            </div>
+            <div class="text-lg">
+                <span style="margin-right: 5px;">Station Version: <span id="station-version-dashboard" class="font-semibold">N/A</span> |</span>
+                <span>Station Tick: <span id="station-tick-dashboard" class="font-semibold">N/A</span></span>
+            </div>
+        </div>
+    </header>
+
+    <div class="flex-1 container mx-auto p-4 flex flex-col lg:flex-row gap-6 overflow-hidden">
+        <aside class="lg:w-1/3 xl:w-1/4 glass-surface p-6 rounded-xl shadow-2xl flex flex-col gap-4">
+            
+            <div class="sidebar-section">
+                <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Control</h2>
+                <div class="mb-2 flex items-center">
+                    <span id="orchestrator-status-dot" class="status-dot status-idle"></span>
+                    Status: <span id="orchestrator-status-display" class="font-semibold ml-1">Idle</span>
+                </div>
+                <div id="orchestrator-pause-reason-display" class="text-sm text-slate-400 mb-1 min-h-[1.2em]"></div>
+                <div id="orchestrator-next-agent-display" class="text-sm text-slate-400 mb-3 min-h-[1.2em]"></div>
+
+                <!-- Station Statistics -->
+                <div class="glass-elevated p-4 rounded-lg mb-6 border border-slate-700">
+                    <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Statistics</h2>
+                    <div class="space-y-2 text-sm">
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Pending Human Requests:</span>
+                            <span id="pending-requests-count" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="pending-requests-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with request IDs and agents -->
+                        </div>
+                        <div class="flex justify-between items-center mt-3">
+                            <span class="text-slate-400">Running Experiments:</span>
+                            <span id="running-experiments-count" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="running-experiments-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with running experiment details -->
+                        </div>
+                        <div class="flex justify-between items-center mt-3">
+                            <span class="text-slate-400">Top Research Submission:</span>
+                            <span id="top-research-score" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="top-research-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with submission details -->
+                        </div>
+                    </div>
+                </div>
+
+                <div class="space-y-2 mb-3">
+                    
+                    <button id="start-loop-button" class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Launch Station</button>
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <button id="pause-orchestrator-button" class="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Pause</button>
+                    <button id="resume-orchestrator-button" class="bg-sky-600 hover:bg-sky-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Resume</button>
+                </div>
+            </div>
+
+            <div class="sidebar-section">
+                <h2 class="text-xl font-semibold mb-3 text-sky-400">Agent Management</h2>
+                <label for="agent-selector-dashboard" class="block text-sm font-medium text-slate-400 mb-1">Log View / Target Agent:</label>
+                <select id="agent-selector-dashboard" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
+                    <option value="all">Global Notifications</option>
+                </select>
+                <button id="open-direct-message-modal-button" class="w-full bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3" disabled>Direct Message</button>
+                <button id="resolve-human-intervention-button" class="w-full bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3 hidden">Resolve Request</button>
+                <button id="end-api-agent-session-button" class="w-full bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">End Selected Agent</button>
+            </div>
+
+            <div class="sidebar-section">
+                <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Tools</h2>
+                <button id="create-api-agent-modal-button" class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Create New Agent</button>
+                <button id="open-send-system-message-modal-button" class="w-full bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Send System Message</button>
+                <button id="open-speak-common-room-modal-button" class="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Speak in Common Room</button>
+                <button id="update-station-config-button" class="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Update Station Config</button>
+                <button id="create-backup-button" class="w-full disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Create Backup</button>
+            </div>
+
+            
+
+            <div id="dashboard-status-messages" class="mt-auto p-3 glass-surface rounded-md text-sm text-slate-300 min-h-[50px] border border-slate-600">
+                UI status messages will appear here...
+            </div>
+        </aside>
+
+        <main class="lg:w-2/3 xl:w-3/4 glass-surface p-6 rounded-xl shadow-2xl flex flex-col overflow-hidden">
+            <div class="flex justify-between items-center mb-4 border-b border-slate-700 pb-2">
+                <h2 id="log-view-title" class="text-xl font-semibold text-sky-400">Global Notifications</h2>
+                <div class="flex gap-2">
+                    <button id="load-full-history-button" class="text-xs bg-indigo-600 hover:bg-indigo-500 py-1 px-3 rounded-md transition-colors hidden">Load Full Response</button>
+                    <button id="clear-log-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md">Clear Current View</button>
+                </div>
+            </div>
+
+            <div id="global-notification-bubble-log" class="log-container flex-1 overflow-y-auto mb-4 p-3 glass-elevated rounded-lg border border-slate-700 flex flex-col-reverse space-y-3 space-y-reverse" style="display: flex;">
+                <div class="chat-bubble chat-bubble-system initial-log-message">Global notifications will appear here. New messages at the top.</div>
+            </div>
+
+            <div id="agent-specific-bubble-log" class="log-container flex-1 overflow-y-auto mb-4 p-3 glass-elevated rounded-lg border border-slate-700 flex flex-col space-y-3" style="display: none;">
+                <div class="chat-bubble chat-bubble-system initial-log-message">Select an agent to view their detailed dialogue.</div>
+            </div>
+
+            <div class="text-center -mt-1 -mb-4">
+                <p class="text-xs text-slate-500 opacity-70">© 2025 DualverseAI</p>
+            </div>
+        </main>
+    </div>
+
+    <div id="create-api-agent-modal" class="modal">
+        <div class="modal-content glass-elevated">
+            <span class="close-button" id="close-api-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-6 text-sky-400">Create New Agent</h3>
+            <form id="create-api-agent-form">
+                <div class="mb-4">
+                    <label for="api-model-preset" class="block text-sm font-medium text-slate-400 mb-1">Model Preset (Optional):</label>
+                    <select id="api-model-preset" class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200">
+                        <option value="">-- Select a Preset --</option>
+                    </select>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                    <div>
+                        <label for="api-model-provider-class" class="block text-sm font-medium text-slate-400 mb-1">LLM Provider:</label>
+                        <select id="api-model-provider-class" name="model_provider_class" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
+                            <option value="Gemini">Google Gemini</option>
+                            <option value="Claude">Anthropic Claude</option>
+                            <option value="OpenAI">OpenAI</option>
+                            <option value="Grok">Grok</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="api-model-name" class="block text-sm font-medium text-slate-400 mb-1">Model Name:</label>
+                        <input type="text" id="api-model-name" name="model_name" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., gemini-1.5-flash-latest, claude-3-5-sonnet, gpt-4o, o4-mini" required>
+                    </div>
+                    <div>
+                        <label for="api-agent-name" class="block text-sm font-medium text-slate-400 mb-1">Agent Name (Optional):</label>
+                        <input type="text" id="api-agent-name" name="agent_name" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="Auto-generated if blank">
+                    </div>
+                    <div>
+                        <label for="api-agent-type" class="block text-sm font-medium text-slate-400 mb-1">Agent Type:</label>
+                        <select id="api-agent-type" name="agent_type" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
+                            <option value="Guest Agent">Guest Agent</option>
+                            <option value="Recursive Agent">Recursive Agent</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="api-recursive-fields" class="hidden mt-4 border-t border-slate-700 pt-4">
+                    <p class="text-sm text-indigo-300 mb-2">Recursive Agent Specifics:</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                        <div>
+                            <label for="api-lineage" class="block text-sm font-medium text-slate-400 mb-1">Lineage (for Recursive):</label>
+                            <input type="text" id="api-lineage" name="lineage" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., L0, L1-A">
+                        </div>
+                        <div>
+                            <label for="api-generation" class="block text-sm font-medium text-slate-400 mb-1">Generation (for Recursive):</label>
+                            <input type="number" id="api-generation" name="generation" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., 0, 1">
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-4 border-t border-slate-700 pt-4">
+                     <p class="text-sm text-indigo-300 mb-3">LLM Configuration (Optional):</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                        <div>
+                            <label for="api-llm-temperature" class="block text-sm font-medium text-slate-400 mb-1">Temperature (0.0-2.0):</label>
+                            <input type="number" step="0.1" id="api-llm-temperature" name="llm_temperature" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="Default: 1.0">
+                        </div>
+                        <div>
+                            <label for="api-llm-max-tokens" class="block text-sm font-medium text-slate-400 mb-1">Max Output Tokens:</label>
+                            <input type="number" id="api-llm-max-tokens" name="llm_max_tokens" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., 1024, 2048">
+                        </div>
+                    </div>
+                    <div class="mt-4">
+                        <label for="api-llm-system-prompt" class="block text-sm font-medium text-slate-400 mb-1">System Prompt:</label>
+                        <textarea id="api-llm-system-prompt" name="llm_system_prompt" rows="3" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3 resize-y" placeholder="Enter system prompt for the LLM..."></textarea>
+                    </div>
+                    <!-- OpenAI-specific parameters -->
+                    <div id="openai-specific-params" class="mt-4 hidden">
+                        <p class="text-xs text-amber-400 mb-2">OpenAI-specific parameters:</p>
+                        <div>
+                            <label for="api-openai-verbosity" class="block text-sm font-medium text-slate-400 mb-1">Verbosity:</label>
+                            <select id="api-openai-verbosity" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
+                                <option value="">Default</option>
+                                <option value="low">Low (terse)</option>
+                                <option value="medium">Medium (balanced)</option>
+                                <option value="high">High (verbose)</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-4 border-t border-slate-700 pt-4">
+                     <p class="text-sm text-indigo-300 mb-3">Station Metadata (Optional):</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
+                        <div>
+                            <label for="api-initial-tokens-max" class="block text-sm font-medium text-slate-400 mb-1">Initial Tokens Max (Budget):</label>
+                            <input type="number" id="api-initial-tokens-max" name="initial_tokens_max" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., 100000">
+                        </div>
+                        <div>
+                            <label for="api-assigned-ancestor" class="block text-sm font-medium text-slate-400 mb-1">Assigned Ancestor (if any):</label>
+                            <input type="text" id="api-assigned-ancestor" name="assigned_ancestor" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="">
+                        </div>
+                    </div>
+                     <div class="mt-4">
+                        <label for="api-internal-note" class="block text-sm font-medium text-slate-400 mb-1">Internal Note:</label>
+                        <textarea id="api-internal-note" name="internal_note" rows="2" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3 resize-y" placeholder="Internal note for this agent..."></textarea>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-8">
+                    <button type="button" id="cancel-create-api-agent-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
+                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 px-4 rounded-md">Create Agent</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="direct-message-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300">
+            <span class="close-button" id="close-direct-message-modal-button">&times;</span>
+            <h3 id="direct-message-modal-title" class="text-xl font-semibold mb-4 text-sky-400">Send Direct Message</h3>
+            <p class="mb-1 text-sm">To: <strong id="direct-message-modal-agent-name" class="text-teal-300">N/A</strong></p>
+            <p id="direct-message-modal-description" class="mb-4 text-xs text-slate-400">Your message will be sent directly to the agent.</p>
+            <div>
+                <label for="direct-message-input" class="block text-sm font-medium text-slate-400 mb-1">Your Message:</label>
+                <textarea id="direct-message-input" rows="5" class="w-full p-3 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y placeholder-slate-400" placeholder="Type your message to the agent..."></textarea>
+            </div>
+            <div class="flex justify-end gap-3 mt-6">
+                <button id="cancel-direct-message-button" type="button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
+                <button id="confirm-send-direct-message-button" type="button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send Message</button>
+            </div>
+            <div id="direct-message-response-area" class="mt-4 p-3 glass-surface border border-slate-600 rounded-md text-sm hidden min-h-[50px]">
+                <p class="font-semibold mb-1 text-teal-300">Agent's Response:</p>
+                <div id="direct-message-llm-response-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Human Request Resolution Modal -->
+    <div id="resolve-request-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300" style="max-width: 800px;">
+            <span class="close-button" id="close-resolve-request-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-4 text-sky-400">Resolve Human Request</h3>
+
+            <div class="mb-4">
+                <div class="glass-surface p-3 rounded-md border border-slate-600">
+                    <div class="grid grid-cols-2 gap-2 text-sm mb-3">
+                        <div>
+                            <span class="text-slate-400">Request ID:</span>
+                            <span id="request-id-display" class="text-amber-400 font-semibold ml-1">-</span>
+                        </div>
+                        <div>
+                            <span class="text-slate-400">Tick:</span>
+                            <span id="request-tick-display" class="text-teal-400 font-semibold ml-1">-</span>
+                        </div>
+                        <div>
+                            <span class="text-slate-400">Agent:</span>
+                            <span id="request-agent-display" class="text-purple-400 font-semibold ml-1">-</span>
+                        </div>
+                        <div>
+                            <span class="text-slate-400">Model:</span>
+                            <span id="request-model-display" class="text-blue-400 font-semibold ml-1">-</span>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <h4 class="text-sm font-medium text-slate-400 mb-1">Request Title:</h4>
+                        <div id="request-title-display" class="text-slate-200 font-semibold">-</div>
+                    </div>
+
+                    <div>
+                        <h4 class="text-sm font-medium text-slate-400 mb-1">Request Content:</h4>
+                        <div id="request-content-display" class="text-slate-200 bg-slate-800 p-3 rounded-md max-h-64 overflow-y-auto whitespace-pre-wrap font-mono text-sm">-</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label for="resolve-response-input" class="block text-sm font-medium text-slate-400 mb-1">
+                    Response (Optional - leave empty for simple acknowledgment):
+                </label>
+                <textarea id="resolve-response-input" rows="5"
+                    class="w-full p-3 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-amber-500 focus:border-amber-500 text-slate-200 resize-y placeholder-slate-400"
+                    placeholder="Enter your response to the agent (optional)..."></textarea>
+            </div>
+
+            <div class="flex justify-end gap-3">
+                <button id="cancel-resolve-request-button" type="button"
+                    class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">
+                    Cancel
+                </button>
+                <button id="confirm-resolve-request-button" type="button"
+                    class="bg-amber-600 hover:bg-amber-500 text-white font-semibold py-2 px-4 rounded-md">
+                    Resolve Request
+                </button>
+            </div>
+
+            <div id="resolve-request-status" class="mt-4 p-3 glass-surface border border-slate-600 rounded-md text-sm hidden">
+                <!-- Status messages will appear here -->
+            </div>
+        </div>
+    </div>
+
+    <div id="send-system-message-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300">
+            <span class="close-button" id="close-send-system-message-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-6 text-sky-400">Send System Message to Active Agents</h3>
+            
+            <div class="mb-4">
+                <label for="system-message-agent-selector" class="block text-sm font-medium text-slate-400 mb-1">Select Target Agents (Ctrl/Cmd + Click for multiple):</label>
+                <select id="system-message-agent-selector" name="target_agents" multiple class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 mb-3 h-40">
+                    </select>
+                <p class="text-xs text-slate-500">Only agents currently in the active turn order will be listed.</p>
+            </div>
+
+            <div class="mb-6">
+                <label for="system-message-content" class="block text-sm font-medium text-slate-400 mb-1">Message Content:</label>
+                <textarea id="system-message-content" name="message_content" rows="6" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y" placeholder="Enter the system message..."></textarea>
+            </div>
+
+            <div class="flex justify-end gap-3">
+                <button type="button" id="cancel-send-system-message-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
+                <button type="button" id="confirm-send-system-message-button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send Message</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="speak-common-room-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300">
+            <span class="close-button" id="close-speak-common-room-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-6 text-sky-400">Speak in Common Room</h3>
+            
+            <div class="mb-4">
+                <label for="common-room-speaker-name" class="block text-sm font-medium text-slate-400 mb-1">Speaker Name:</label>
+                <input type="text" id="common-room-speaker-name" name="speaker_name" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 text-slate-200" placeholder="Enter the name of the speaker" required>
+            </div>
+
+            <div class="mb-6">
+                <label for="common-room-message-content" class="block text-sm font-medium text-slate-400 mb-1">Message Content:</label>
+                <textarea id="common-room-message-content" name="message_content" rows="6" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-purple-500 focus:border-purple-500 text-slate-200 resize-y" placeholder="Enter the message to speak..."></textarea>
+            </div>
+
+            <div class="flex justify-end gap-3">
+                <button type="button" id="cancel-speak-common-room-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
+                <button type="button" id="confirm-speak-common-room-button" class="bg-purple-600 hover:bg-purple-500 text-white font-semibold py-2 px-4 rounded-md">Speak</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="update-station-config-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300">
+            <span class="close-button" id="close-update-station-config-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-6 text-sky-400">Update Station Configuration</h3>
+            
+            <form id="update-station-config-form">
+                <div class="mb-4">
+                    <label for="update-station-id" class="block text-sm font-medium text-slate-400 mb-1">Station ID (read-only):</label>
+                    <input type="text" id="update-station-id" readonly class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm text-slate-300 cursor-not-allowed opacity-75" placeholder="Loading...">
+                </div>
+
+                <div class="mb-4">
+                    <label for="update-station-status" class="block text-sm font-medium text-slate-400 mb-1">Station Status:</label>
+                    <div id="current-station-status" class="text-xs text-slate-500 mb-1">Current: Loading...</div>
+                    <input type="text" id="update-station-status" name="station_status" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200" placeholder="Enter station status">
+                </div>
+
+                <div class="mb-4">
+                    <label for="update-station-name" class="block text-sm font-medium text-slate-400 mb-1">Station Name:</label>
+                    <div id="current-station-name" class="text-xs text-slate-500 mb-1">Current: Loading...</div>
+                    <input type="text" id="update-station-name" name="station_name" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200" placeholder="Enter station name">
+                </div>
+
+                <div class="mb-6">
+                    <label for="update-station-description" class="block text-sm font-medium text-slate-400 mb-1">Station Description:</label>
+                    <div id="current-station-description" class="text-xs text-slate-500 mb-1">Current: Loading...</div>
+                    <textarea id="update-station-description" name="station_description" rows="4" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200 resize-y" placeholder="Enter station description"></textarea>
+                </div>
+
+                <div class="flex justify-end gap-3">
+                    <button type="button" id="cancel-update-station-config-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
+                    <button type="submit" id="confirm-update-station-config-button" class="bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2 px-4 rounded-md">Update Configuration</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Configuration for API base path (empty for standard deployment)
+        window.STATION_CONFIG = {
+            apiBasePath: ""
+        };
+    </script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/model_presets.js') }}"></script>
+</body>
+</html>

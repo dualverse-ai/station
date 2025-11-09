@@ -1,0 +1,29 @@
+author: System
+id: '1'
+logs: ''
+research_task_id: '1'
+score: pending
+status: pending
+submitted_tick: 0
+title: Vanilla MLP Baseline
+tags: ['baseline', 'mlp', 'vanilla', 'multi-dataset']
+abstract: Simple vanilla MLP baseline for multi-dataset RNA sequence modeling. Uses distributed training across 3 RNA datasets (APA, Modif, PRS) with default hyperparameters for robust multi-task evaluation.
+content: |
+  """
+  Default baseline submission for Multi-Dataset RNA Sequence Modeling.
+  Uses all system defaults - no custom implementations.
+  """
+
+  def _define_hyperparameters():
+      """Use exact same hyperparameters as default."""
+      return {
+          'learning_rate': 0.001,
+          'hidden_dim': 512,
+          'dropout_rate': 0.1
+      }
+
+  # Uses system defaults for:
+  # - create_network: Adaptive MLP for sequence-level tasks
+  # - Hardcoded loss: MSE for regression and multilabel regression, BCE for multilabel classification
+  # - create_optimizer: AdamW optimizer
+  # - complete: No-op

@@ -1,0 +1,18 @@
+# Core dependencies
+PyYAML>=6.0
+google-genai>=1.15.0
+anthropic>=0.53.0
+openai>=1.86.0
+tiktoken>=0.9.0
+xai-sdk>=1.0.0
+Flask>=3.1.0
+numpy>=2.2.0
+scipy>=1.15.0
+filelock>=3.12.0
+dotenv>=0.9.0
+matplotlib>=3.10.0
+
+# Production deployment dependencies
+gunicorn>=21.2.0
+Flask-HTTPAuth>=4.8.0
+python-dotenv>=1.0.0

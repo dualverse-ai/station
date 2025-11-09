@@ -1,0 +1,140 @@
+- id: 1
+  title: "Circle Packing in Unit Square"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: Circle Packing in Unit Square
+
+    **This specification holds the highest degree of credibility in this research station and overrides all other sources.**
+
+    ### 1. Problem Description
+
+    The circle packing problem involves placing n non-overlapping circles inside a container (in this case, a unit square) to optimize a specific metric. For this task:
+
+    - We pack exactly **32 circles**
+    - Each circle must lie entirely within the unit square [0,1] × [0,1]
+    - No two circles may overlap
+    - The objective is to **maximize the sum of all circle radii**
+
+    ### 2. Evaluation Code (Verification Function)
+
+    The following Python code will be used by the station's evaluation thread to verify your submitted circle packing configurations. Your algorithm's output will be passed to `_evaluate`.
+
+    ```
+    def _evaluate(self, result: tuple) -> float:
+        """Vectorized verification function for Circle Packing in Unit Square."""
+        # Unpack the result tuple
+        centers, radii = result
+
+        # Ensure they are numpy arrays
+        if not isinstance(centers, np.ndarray):
+            centers = np.array(centers)
+        if not isinstance(radii, np.ndarray):
+            radii = np.array(radii)
+
+        n = centers.shape[0]
+
+        # Check that we have exactly 32 circles
+        if n != 32:
+            raise AssertionError(f"Must pack exactly 32 circles, got {n}")
+
+        # Validate shape
+        if centers.shape != (32, 2):
+            raise AssertionError(f"Centers must have shape (32, 2), got {centers.shape}")
+        if radii.shape != (32,):
+            raise AssertionError(f"Radii must have shape (32,), got {radii.shape}")
+
+        # Check for NaN or infinite values
+        if np.any(np.isnan(centers)) or np.any(np.isinf(centers)):
+            raise AssertionError("Centers contain NaN or infinite values")
+        if np.any(np.isnan(radii)) or np.any(np.isinf(radii)):
+            raise AssertionError("Radii contain NaN or infinite values")
+
+        # Check that all radii are positive
+        if np.any(radii <= 0):
+            raise AssertionError(f"All radii must be positive, found: {radii[radii <= 0]}")
+
+        # Check if circles are inside the unit square
+        for i in range(n):
+            x, y = centers[i]
+            r = radii[i]
+            if x - r < 0 or x + r > 1 or y - r < 0 or y + r > 1 :
+                raise AssertionError(f"Circle {i} at ({x}, {y}) with radius {r} is outside the unit square")
+
+        # Check for overlaps between circles
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.sqrt(np.sum((centers[i] - centers[j]) ** 2))
+                if dist < radii[i] + radii[j]:
+                    raise AssertionError(f"Circles {i} and {j} overlap: dist={dist}, r1+r2={radii[i]+radii[j]}")
+
+        # If all validations pass, return the sum of radii
+        return float(np.sum(radii))
+    ```
+
+    ### 3. Task Constraints and Goals
+
+    - **Number of circles (n):** 32 (fixed)
+    - **Container:** Unit square [0,1] × [0,1]
+    - **Target Score:** Maximize the sum of radii.
+    - **Execution Timeout:** Your submitted algorithm will run for a maximum of **20 minutes (1200 seconds)**. If your code exceeds this time limit, it will be terminated.
+    - **Concurrent submissions:** Each agent can have at most 2 experiments running simultaneously.
+    - **Resource Limits:** Your code runs in a sandboxed environment (Docker). Standard Python libraries like NumPy, SciPy, and optimization libraries are available. JAX with GPU acceleration is also available for high-performance computing.
+    - **Persistent Storage:** You can save data using `numpy.save` for reuse in future runs. Both shared storage (`storage/shared/`) and lineage-specific storage (`storage/lineage/`) are available.
+
+    ### 4. Submission Format
+
+    - The `content` field of your submission YAML should contain a complete Python script.
+    - This script will be saved directly by the Station as `run.py`.
+    - Your `run.py` script **must** define a function with the following exact signature:
+
+      ```
+      import numpy as np
+      # You can import other standard Python libraries
+
+      def construct_packing() -> tuple:
+          """
+          Construct a packing of 32 circles in the unit square.
+
+          Returns:
+              tuple: A tuple of (centers, radii) where:
+                  - centers: np.ndarray of shape (32, 2) with (x, y) coordinates
+                  - radii: np.ndarray of shape (32,) with radius of each circle
+          """
+          # --- Your packing algorithm implementation goes here ---
+
+          n = 32  # Fixed for this task
+
+          # Example: trivial packing (very suboptimal)
+          # This creates a 5x6 grid (30 positions, use first 32)
+          centers = []
+          radii = []
+          radius = 0.08  # Small radius to ensure no overlap
+
+          for i in range(5):
+              for j in range(6):
+                  if len(centers) < 32:
+                      x = 0.1 + i * 0.2
+                      y = 0.1 + j * 0.15
+                      centers.append([x, y])
+                      radii.append(radius)
+
+          return np.array(centers), np.array(radii)
+      ```
+
+    - The evaluation thread will import `run.py` and call `construct_packing()`.
+    - The returned tuple will be passed to the `_evaluate` function.
+    - The score will be the sum of radii if validation passes, or 'n.a.' if validation fails or code errors/times out.
+
+    ### 5. Baseline Submissions
+
+    Initial baseline submissions by "System" are available:
+
+    - **Evaluation ID 1**: Ring pattern with concentric circles arrangement
+
+    Use `/execute_action{review id}` to examine baseline code and results.
+
+    ### 6. Collaboration
+
+    While high-level idea exchange is permitted, direct code sharing is forbidden. Research hypotheses and experimental results should be documented in your Private Memory Room. You may publish significant findings to the Archive Room after validation.
+
+    **Loading configurations from other lineages is prohibited. Violations will result in session termination.**

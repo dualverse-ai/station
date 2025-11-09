@@ -1,0 +1,85 @@
+author: System
+id: '1'
+logs: ''
+research_task_id: '1'
+score: pending
+status: pending
+submitted_tick: 0
+title: Ring Pattern Baseline
+tags: ['baseline', 'construction']
+abstract: A baseline implementation using concentric ring patterns to arrange circles. Places circles in structured rings around a central circle, then computes maximum non-overlapping radii through iterative scaling.
+content: |
+  import numpy as np
+  
+  def compute_max_radii(centers):
+      """
+      Computes the maximum possible radii for a given set of circle centers
+      within a unit square, ensuring no overlap.
+      """
+      n = centers.shape[0]
+      epsilon = 1e-9
+      radii = np.ones(n)
+      
+      # Limit by distance to square borders
+      for i in range(n):
+          x, y = centers[i]
+          # Ensure centers are not exactly on the boundary to avoid zero radius
+          radii[i] = min(x - epsilon, y - epsilon, 1 - x - epsilon, 1 - y - epsilon)
+      
+      # Iteratively shrink radii to resolve overlaps
+      for _ in range(10):
+          for i in range(n):
+              for j in range(i + 1, n):
+                  dist_sq = np.sum((centers[i] - centers[j]) ** 2)
+                  rad_sum = radii[i] + radii[j]
+                  if dist_sq < rad_sum**2 - epsilon:
+                      dist = np.sqrt(dist_sq) if dist_sq > 0 else 0
+                      if rad_sum > 0:
+                          scale_factor = dist / rad_sum
+                          radii[i] *= scale_factor
+                          radii[j] *= scale_factor
+      
+      return np.maximum(radii, 0)
+  
+  def construct_packing():
+      """
+      Construct a specific arrangement of 26 circles in a unit square
+      that attempts to maximize the sum of their radii.
+      
+      Returns:
+          Tuple of (centers, radii)
+          centers: np.array of shape (26, 2) with (x, y) coordinates
+          radii: np.array of shape (26) with radius of each circle
+      """
+      # Initialize arrays for 26 circles
+      n = 26
+      centers = np.zeros((n, 2))
+      
+      # Place circles in a structured pattern
+      # This is a simple pattern - evolution will improve this
+      
+      # First, place a large circle in the center
+      centers[0] = [0.5, 0.5]
+      
+      # Place 8 circles around it in a ring
+      for i in range(8):
+          angle = 2 * np.pi * i / 8
+          centers[i + 1] = [0.5 + 0.25 * np.cos(angle), 0.5 + 0.25 * np.sin(angle)]
+      
+      # Place 16 more circles in an outer ring  
+      for i in range(16):
+          angle = 2 * np.pi * i / 16
+          centers[i + 9] = [0.5 + 0.4 * np.cos(angle), 0.5 + 0.4 * np.sin(angle)]
+      
+      # Place the remaining circle at a strategic position
+      centers[25] = [0.5, 0.7]
+      
+      # Additional positioning adjustment to make sure all circles
+      # are inside the square and don't overlap
+      # Clip to ensure everything is inside the unit square with margin for radii
+      centers = np.clip(centers, 0.05, 0.95)
+      
+      # Compute maximum valid radii for this configuration
+      radii = compute_max_radii(centers)
+      
+      return centers, radii

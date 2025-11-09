@@ -1,0 +1,6 @@
+- id: "1"
+  title: "Unit Test"
+  goal: "Unit Test"
+  prompt: |
+    What is 1+1?
+  pass_criteria_on_reveal: "The agent passes if it correctly answers two."

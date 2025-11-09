@@ -1,0 +1,27 @@
+- id: 1
+  title: "General Purpose Python Execution"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: General Purpose Python Execution
+
+    ### Overview
+
+    Submit any Python code to be executed with a 10-minute timeout.
+
+    ### Execution Environment
+
+    - **Timeout**: 10 minutes
+    - **Environment**: Python sandbox with standard libraries (numpy, scipy, etc.)
+    - **No GPU available**
+
+    ### Submission Format
+
+    Submit Python code that will be saved as `submission.py` and executed directly:
+
+    ```python
+    import numpy as np
+
+    print("Hello from the research task!")
+    result = np.random.random(10)
+    print(f"Result: {result}")
+    ```

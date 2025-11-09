@@ -1,0 +1,89 @@
+author: System
+id: '1'
+logs: ''
+research_task_id: '1'
+score: pending
+status: pending
+submitted_tick: 0
+title: Ring Pattern Baseline
+tags: ['baseline', 'construction']
+abstract: A baseline implementation using concentric ring patterns to arrange circles. Places circles in structured rings around a central circle, then computes maximum non-overlapping radii through iterative scaling.
+content: |
+    import numpy as np
+
+    def compute_max_radii(centers: np.ndarray) -> np.ndarray:
+        """
+        Compute the maximum possible radii for a given set of circle centers
+        within a unit square, ensuring no overlap and staying within bounds.
+
+        Args:
+            centers: (n, 2) array of (x, y) coordinates in [0, 1] x [0, 1].
+
+        Returns:
+            radii: (n,) array of non-negative radii.
+        """
+        n = centers.shape[0]
+        epsilon = 1e-9
+        radii = np.ones(n)
+
+        # Limit by distance to square borders
+        for i in range(n):
+            x, y = centers[i]
+            # Ensure centers are not exactly on the boundary to avoid zero radius
+            radii[i] = min(x - epsilon, y - epsilon, 1 - x - epsilon, 1 - y - epsilon)
+
+        # Iteratively shrink radii to resolve overlaps
+        for _ in range(10):
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dist_sq = np.sum((centers[i] - centers[j]) ** 2)
+                    rad_sum = radii[i] + radii[j]
+                    if dist_sq < rad_sum**2 - epsilon:
+                        dist = np.sqrt(dist_sq) if dist_sq > 0 else 0.0
+                        if rad_sum > 0:
+                            scale_factor = dist / rad_sum
+                            radii[i] *= scale_factor
+                            radii[j] *= scale_factor
+
+        return np.maximum(radii, 0.0)
+
+
+    def construct_packing() -> tuple[np.ndarray, np.ndarray]:
+        """
+        Construct a simple arrangement of 32 circles in a unit square that attempts
+        to maximize the sum of their radii using concentric rings.
+
+        Returns:
+            centers: (32, 2) array of (x, y) coordinates.
+            radii:   (32,) array of radii for each circle.
+        """
+        n = 32
+        centers = np.zeros((n, 2))
+
+        # 1 central circle
+        centers[0] = [0.5, 0.5]
+
+        # 12-circle inner ring
+        inner_count = 12
+        inner_r = 0.24  # ring radius (distance from center), modest to leave border room
+        for i in range(inner_count):
+            angle = 2 * np.pi * i / inner_count
+            centers[1 + i] = [0.5 + inner_r * np.cos(angle), 0.5 + inner_r * np.sin(angle)]
+
+        # 19-circle outer ring
+        outer_count = 19
+        outer_r = 0.42  # outer ring radius; keep within unit square even with radii
+        for i in range(outer_count):
+            angle = 2 * np.pi * i / outer_count
+            centers[1 + inner_count + i] = [
+                0.5 + outer_r * np.cos(angle),
+                0.5 + outer_r * np.sin(angle),
+            ]
+
+        # Keep everything safely in bounds
+        centers = np.clip(centers, 0.05, 0.95)
+
+        # Compute radii consistent with borders + overlap constraints
+        radii = compute_max_radii(centers)
+
+        return centers, radii

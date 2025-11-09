@@ -1,0 +1,54 @@
+{
+  "asw_batch": {
+    "min": 0.53352897,
+    "max": 0.98400116
+  },
+  "asw_label": {
+    "min": 0.41144148,
+    "max": 0.9896984
+  },
+  "ari": {
+    "min": -0.00013567,
+    "max": 1.0
+  },
+  "nmi": {
+    "min": 0.0002826,
+    "max": 1.0
+  },
+  "graph_connectivity": {
+    "min": 0.01696175,
+    "max": 1.0
+  },
+  "isolated_label_asw": {
+    "min": 0.32464749,
+    "max": 0.98996818
+  },
+  "isolated_label_f1": {
+    "min": 0.00140121,
+    "max": 1.0
+  },
+  "kbet": {
+    "min": 0.01134695,
+    "max": 0.95113473
+  },
+  "ilisi": {
+    "min": 0.0,
+    "max": 1.0
+  },
+  "clisi": {
+    "min": 0.70869329,
+    "max": 1.0
+  },
+  "pcr": {
+    "min": 0.0,
+    "max": 0.99999995
+  },
+  "cell_cycle_conservation": {
+    "min": 0.00922029,
+    "max": 0.86094651
+  },
+  "hvg_overlap": {
+    "min": 0.49213793,
+    "max": 1.0
+  }
+}

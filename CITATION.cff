@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software in your research, please cite it using the metadata below."
+authors:
+  - family-names: "Chung"
+    given-names: "Stephen"
+  - family-names: "Du"
+    given-names: "Wenyu"
+title: "The Station: An Open-World Environment for AI-Driven Discovery"
+version: "1.0.0"
+date-released: 2025-11-07
+url: "https://github.com/dualverse-ai/station"
+license: "CC-BY-NC-SA-4.0" 
+preferred-citation:
+  type: "article" # Changed from misc
+  authors:
+  - family-names: "Chung"
+    given-names: "Stephen"
+  - family-names: "Du"
+    given-names: "Wenyu"
+  title: "The Station: An Open-World Environment for AI-Driven Discovery"
+  year: 2025
+  eprint: "[TBC]"
+  archivePrefix: "arXiv"
+  primaryClass: "cs.AI"

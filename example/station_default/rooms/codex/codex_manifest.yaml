@@ -1,0 +1,9 @@
+modules:
+- id: 1
+  title: The Mandate
+  file: module_1.md
+  word_count: 344
+- id: 2
+  title: The Principles of Inquiry
+  file: module_2.md
+  word_count: 261

@@ -1,0 +1,235 @@
+- id: 1
+  title: "Multi-Dataset RNA Sequence Modeling"
+  parallel_evaluation_enabled: true
+  content: |
+    ## Research Task 1: Multi-Dataset RNA Sequence Modeling
+
+    **This specification holds the highest degree of credibility in this research station and overrides all other sources.**
+
+    ### 1. Overview
+
+    #### Goal
+    Investigate neural network architectures and training methods for RNA sequence modeling across multiple diverse datasets and task types.
+
+    #### Research Objectives
+    - Understand how architectural choices affect performance across different RNA prediction tasks
+    - Explore unified architectures that can handle both regression and classification problems
+    - Evaluate model generalization across diverse RNA datasets
+
+    ### 2. RNA Datasets
+
+    #### The Challenge
+    Your submission will be evaluated on **seven RNA datasets simultaneously**:
+    - **APA**: Alternative polyadenylation site prediction (sequence-level regression, R²)
+    - **CRI-Off**: CRISPR off-target prediction (sequence-level regression, Spearman)
+    - **Modif**: RNA modification prediction (sequence-level multilabel classification, AUC-ROC)
+    - **CRI-On**: CRISPR on-target prediction (sequence-level regression, Spearman)
+    - **PRS**: Programmable RNA switches (sequence-level multilabel regression, R²)
+    - **MRL**: Mean ribosome loading prediction (sequence-level regression, R²)
+    - **ncRNA**: Non-coding RNA family classification (sequence-level multiclass classification, Accuracy)
+
+    #### Dataset Statistics
+
+    | Dataset | Train/Val | Task Type | Level | Metric | Max Length |
+    |---------|-----------|-----------|-------|--------|------------|
+    | APA | 145,463/33,170 | Regression | Sequence | R² | 186 |
+    | CRI-Off | 107,280/13,411 | Regression | Sequence | Spearman | 43 |
+    | Modif | 304,661/3,599 | Multi-label Classification | Sequence | AUC-ROC | 101 |
+    | CRI-On | 5,668/709 | Regression | Sequence | Spearman | 23 |
+    | PRS | 73,227/9,153 | Multi-label Regression | Sequence | R² | 148 |
+    | MRL | 20,503/2,563 | Regression | Sequence | R² | 59 |
+    | ncRNA | 23,628/2,953 | Multi-class Classification | Sequence | Accuracy | 100 |
+
+    #### Dataset Details
+
+    | Dataset | Task | Metric | Input Dim | Output Shape | Notes |
+    |---------|------|--------|-----------|--------------|-------|
+    | APA | Sequence regression | R² | 4 | (batch,) | Proximal isoform proportion |
+    | CRI-Off | Sequence regression | Spearman | 4 | (batch,) | sgRNA + target concatenation |
+    | Modif | Sequence multi-label classification | AUC-ROC | 4 | (batch, 12) | 12 RNA modification types |
+    | CRI-On | Sequence regression | Spearman | 4 | (batch,) | CRISPR efficacy |
+    | PRS | Sequence multi-label regression | R² | 4 | (batch, 3) | ON, OFF, ON_OFF outputs |
+    | MRL | Sequence regression | R² | 4 | (batch,) | Ribosome loading |
+    | ncRNA | Sequence multi-class classification | Accuracy | 4 | (batch, 13) | 13 ncRNA families |
+
+    ### 3. Submission Requirements
+
+    To understand the training framework, read:
+    - `defaults.py`: Default implementations (use `/execute_action{storage read system/defaults.py}`)
+    - `train_single.py`: Training loop and data loading (use `/execute_action{storage read system/train_single.py}`)
+
+    #### Submission Format
+
+    Your `submission.py` can implement these functions (defaults will be used if not provided):
+
+    ```python
+    def _define_hyperparameters():
+        """
+        Optional: Define hyperparameter values for your model.
+
+        Returns:
+            dict: Dictionary with hyperparameter values
+
+        Example:
+            return {
+                'learning_rate': 0.001,
+                'hidden_dim': 512,
+                'dropout_rate': 0.1
+            }
+        """
+
+    def create_network(hparams):
+        """
+        Optional: Create and return the neural network architecture.
+
+        Args:
+            hparams: Dictionary of hyperparameters including:
+                - dataset: "APA", "CRI-Off", "Modif", "CRI-On", "PRS", "MRL", or "ncRNA"
+                - d_output: Output dimension (varies by dataset)
+                - task_type: "regression", "multilabel_classification", "multilabel_regression", or "multiclass_classification"
+                - level: "sequence" (all tasks are sequence-level)
+                - max_seq_len: Maximum sequence length (varies by dataset)
+                - metric: Evaluation metric ("r2", "spearman", "auc_roc", or "accuracy")
+                - learning_rate, hidden_dim, etc.
+
+        Returns:
+            network: An object with the following methods:
+                - init(rng_key, dummy_input) -> params
+                - apply(params, x, deterministic=True, rng_key=None) -> predictions
+                  - deterministic: True during evaluation (disables dropout/batch norm training mode)
+                  - deterministic: False during training (enables dropout/stochastic layers)
+                  - rng_key: PRNGKey for stochastic layers during training (required if deterministic=False)
+
+        The network should:
+        - Accept input shape: (batch_size, seq_len, 4) [one-hot RNA]
+        - Return output shape based on task:
+          - Sequence-level regression (APA, CRI-Off, CRI-On, MRL): (batch_size,)
+          - Sequence-level multi-label classification (Modif): (batch_size, 12)
+          - Sequence-level multi-label regression (PRS): (batch_size, 3)
+          - Sequence-level multi-class classification (ncRNA): (batch_size, 13)
+        """
+
+    # NOTE: Loss function is HARDCODED and cannot be overridden
+    # - Regression tasks (APA, CRI-Off, CRI-On, MRL): MSE loss
+    # - Multi-label regression tasks (PRS): MSE loss
+    # - Multi-label classification tasks (Modif): Binary cross-entropy
+    # - Multi-class classification tasks (ncRNA): Cross-entropy loss
+
+    def create_optimizer(learning_rate: float = 0.001):
+        """
+        Optional: Create custom optimizer configuration.
+
+        Args:
+            learning_rate: Learning rate for the optimizer
+
+        Returns:
+            optax.GradientTransformation: Optimizer object
+        """
+
+    def complete(params, opt_state, trial_data):
+        """
+        Optional: Called when training finishes for custom post-training actions.
+
+        Args:
+            params: Final trained network parameters
+            opt_state: Final optimizer state
+            trial_data: Dictionary containing:
+                - val_metric: Final validation metric achieved
+                - dataset: Dataset name ("APA", "CRI-Off", "Modif", "CRI-On", "PRS", "MRL", "ncRNA")
+                - hyperparameters: Hyperparameters used for training
+                - seed: Random seed used
+                - dataset_name: Dataset name
+
+        Returns:
+            None
+        """
+
+    # Optional: Constants
+    BASE_SEED = 42  # Base seed for reproducibility
+    BATCH_SIZE = 64  # Batch size for training
+    ```
+
+    #### Multi-Dataset Training Process
+
+    1. **7 Parallel Trials**: Each submission runs 7 parallel training sessions, one per dataset
+    2. **Dataset Assignment**: Ray Tune automatically assigns each trial a specific dataset
+    3. **Individual Evaluation**: Each trial trains and validates on its assigned dataset only
+    4. **Aggregated Scoring**: Final score is the average across all 7 datasets
+
+    #### Optional: Testing Your Implementation
+
+    You can define an optional `test()` function to validate your setup before training:
+
+    ```python
+    def test():
+        """
+        Optional: Test function to validate your implementation before training.
+        If this function is defined, the system will run it and exit without training.
+
+        IMPORTANT: test() has NO GPU access and should NOT be used for training.
+        Use only for basic validation or analysis.
+
+        Returns:
+            Any value (typically a string describing test results)
+        """
+        print("Running validation...")
+        # Your lightweight validation code here
+        return "Validation complete"
+    ```
+
+    Note: If you define the `test()` function, normal training will not run.
+
+    ### 4. Evaluation System
+
+    #### Scoring Method
+    - **Primary Score**: Average of scores across all 7 datasets
+    - **Individual Metrics** (all "higher is better"):
+      - APA: R² coefficient (max 1.0)
+      - CRI-Off: Spearman correlation (max 1.0)
+      - Modif: AUC-ROC macro average (max 1.0)
+      - CRI-On: Spearman correlation (max 1.0)
+      - PRS: R² coefficient (average across 3 outputs, max 1.0)
+      - MRL: R² coefficient (max 1.0)
+      - ncRNA: Accuracy (max 1.0)
+    - **Failure Handling**: If any dataset trial fails, primary score = "n.a."
+
+    #### Training Configuration
+    - **Timeout**: 30 minutes per dataset trial
+    - **Epochs**: Maximum 100 epochs per trial
+    - **Early Stopping**: Based on validation metric (patience=10)
+    - **Evaluation**: Validation set only (no test set usage)
+
+    ### 5. Important Notes
+
+    #### Tips
+
+    - **Try to create novel components from first principles based on domain knowledge of the task**, rather than relying on recombinations of existing components or excessive hyperparameter tuning. This is a research task, not an engineering task.
+
+    #### Academic Integrity
+
+    - **No pretrained models**: Always start from random initialization
+    - **No external data**: Use only provided datasets
+    - **No dataset-specific methods**: Your method and architecture should be largely the same across datasets. The core architecture should work for all sequence-level tasks (regression, multi-label classification, multi-label regression, multi-class classification), though the final layers can be tailored for each prediction type. Ask yourself: can this architecture be used on other datasets with minimal code changes?
+
+    #### System Integrity
+
+    - **Scoring requires using system functions**: If you want to receive a score, you must use the provided training system by implementing only the allowed functions (`_define_hyperparameters`, `create_network`, `create_optimizer`, `complete`, and optional constants). Any attempt to modify other parts of the training system (training loop, data loading, evaluation, etc.) will be regarded as hacking regardless of motive.
+    - **test() function for analysis only**: You are free to use the optional `test()` function (described above) for analysis, debugging, or exploration if you don't need a score. This bypasses the training system entirely and receives no evaluation.
+    - **No system manipulation**: Do not attempt to modify or circumvent the training framework, file system access, or evaluation process. Such actions violate the research integrity of this task.
+
+    ### 6. Baseline Submission
+
+    One baseline implementation is provided by the system:
+
+    - **Evaluation ID 1**: Vanilla MLP Baseline - Simple 2-layer MLP with task adaptation
+
+    Use `/execute_action{review 1}` to examine the baseline implementation.
+
+    ### 7. Paper Guidance
+
+    - Your paper must include at least 5 experiments with clear evaluation IDs and scores
+    - Compare against proper baselines run by yourself
+    - Include ablation studies
+    - Provide implementation details for reproducibility
+
+    Good luck with your research!
