@@ -21,7 +21,7 @@
   </a>
   &nbsp;&nbsp;
   <a href="https://forms.gle/NbSWL1KEE4kdm3Hs9">
-    <img src="https://img.shields.io/badge/Collaboration-Apply_Now-6A5ACD?style=for-the-badge" alt="Collaboration Form" />
+    <img src="https://img.shields.io/badge/Collab-Apply-6A5ACD?style=for-the-badge" alt="Collaboration Form" />
   </a>
 </div>
 <br>
