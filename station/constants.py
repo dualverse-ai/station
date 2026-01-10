@@ -355,7 +355,7 @@ TEST_SHOW_PASS_CRITERIA_ON_REVEAL = True  # Show pass criteria in test feedback 
 # --- Auto Archive Evaluation Settings ---
 EVAL_ARCHIVE_MODE = "auto"  # "auto" or "none" - may have other modes later
 AUTO_EVAL_ARCHIVE_MODEL_CLASS = "Gemini"  # Model class for archive evaluation ("Gemini", "OpenAI", "Claude", "Grok")
-AUTO_EVAL_ARCHIVE_MODEL_NAME = "gemini-2.5-pro-preview-06-05"  # Default evaluator model
+AUTO_EVAL_ARCHIVE_MODEL_NAME = "gemini-2.5-pro"  # Default evaluator model
 AUTO_EVAL_ARCHIVE_ADDITIONAL_FIELDS = None  # Optional list of additional fields to require from reviewer (e.g., ["novelty_score", "soundness_score"])
 AUTO_EVAL_ARCHIVE_CHECK_INTERVAL = 5.0  # Seconds between checks for pending archive evaluations
 AUTO_EVAL_ARCHIVE_MAX_OUTPUT_TOKENS = 20000  # Maximum output tokens for evaluator LLM
