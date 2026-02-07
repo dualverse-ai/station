@@ -50,7 +50,6 @@ class AutoTestEvaluator:
         
         self.station = station_instance
         self.enabled = enabled if enabled is not None else constants.AUTO_EVAL_TEST
-        # Priority: explicit args > constants/defaults (from constant_config.yaml overrides).
         self.model_class = model_class or constants.AUTO_EVAL_TEST_MODEL_CLASS
         self.model_name = model_name or constants.AUTO_EVAL_MODEL_NAME
         self.check_interval = constants.AUTO_EVAL_CHECK_INTERVAL
