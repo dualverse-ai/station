@@ -72,4 +72,11 @@ const MODEL_PRESETS = [
         "initial_tokens_max": 270000,
         "llm_system_prompt": ""
     },
+    {
+        "display_name": "Ollama: gpt-oss:20b",
+        "model_provider_class": "Ollama",
+        "model_name": "gpt-oss:20b",
+        "initial_tokens_max": 128000,
+        "llm_system_prompt": ""
+    },
 ];

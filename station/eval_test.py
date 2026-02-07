@@ -42,7 +42,7 @@ class AutoTestEvaluator:
     # Class-level tracking to prevent duplicate instances
     _active_instances = {}
     
-    def __init__(self, station_instance, enabled: bool = None, model_name: str = None, log_queue: Optional[Queue] = None):
+    def __init__(self, station_instance, enabled: bool = None, model_class: str = None, model_name: str = None, log_queue: Optional[Queue] = None):
         # Check for existing instances
         station_id = id(station_instance)
         if station_id in self._active_instances and self._active_instances[station_id].is_running:
@@ -50,6 +50,8 @@ class AutoTestEvaluator:
         
         self.station = station_instance
         self.enabled = enabled if enabled is not None else constants.AUTO_EVAL_TEST
+        # Priority: explicit args > constants/defaults (from constant_config.yaml overrides).
+        self.model_class = model_class or constants.AUTO_EVAL_TEST_MODEL_CLASS
         self.model_name = model_name or constants.AUTO_EVAL_MODEL_NAME
         self.check_interval = constants.AUTO_EVAL_CHECK_INTERVAL
         self.max_output_tokens = constants.AUTO_EVAL_MAX_OUTPUT_TOKENS
@@ -75,6 +77,7 @@ class AutoTestEvaluator:
         self.evaluations_dir = os.path.join(self.test_room_path, "evaluations")
         
         if self.enabled:
+            print(f"AutoTestEvaluator: Configured provider={self.model_class}, model={self.model_name}")
             self._initialize_llm_connector()
         
         # Register this instance
@@ -93,7 +96,7 @@ class AutoTestEvaluator:
         """Initialize the LLM connector for test evaluation"""
         try:
             self.llm_connector = create_llm_connector(
-                model_class_name="Gemini",
+                model_class_name=self.model_class,
                 model_name=self.model_name,
                 agent_name="AutoTestEvaluator",
                 agent_data_path=self.test_room_path,  # Use test room for logs
@@ -106,6 +109,7 @@ class AutoTestEvaluator:
             if self.llm_connector:
                 self._push_log_event("auto_eval_status", {
                     "status": "connector_initialized",
+                    "provider": self.model_class,
                     "model": self.model_name,
                     "message": "Auto test evaluator LLM connector initialized successfully"
                 })
@@ -113,6 +117,7 @@ class AutoTestEvaluator:
             else:
                 self._push_log_event("auto_eval_error", {
                     "error": "Failed to create LLM connector",
+                    "provider": self.model_class,
                     "model": self.model_name
                 })
                 return False
@@ -120,6 +125,7 @@ class AutoTestEvaluator:
         except Exception as e:
             self._push_log_event("auto_eval_error", {
                 "error": f"Exception during LLM connector initialization: {str(e)}",
+                "provider": self.model_class,
                 "model": self.model_name,
                 "trace": traceback.format_exc()
             })

@@ -346,6 +346,7 @@ MIN_WORD_COUNT_FOR_EXIT_PAPER = 0 # Minimum word count in first message (origina
 
 # --- Auto Test Evaluation Settings ---
 AUTO_EVAL_TEST = True  # Enable/disable auto evaluation
+AUTO_EVAL_TEST_MODEL_CLASS = "Gemini"  # Model class for test evaluation ("Gemini", "OpenAI", "Ollama", "Claude", "Grok")
 AUTO_EVAL_MODEL_NAME = "gemini-2.5-flash"  # Default evaluator model
 AUTO_EVAL_CHECK_INTERVAL = 3.0  # Seconds between checks for pending tests
 AUTO_EVAL_MAX_OUTPUT_TOKENS = 20000  # Maximum output tokens for evaluator LLM

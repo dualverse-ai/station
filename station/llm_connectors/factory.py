@@ -17,6 +17,7 @@ from .base import BaseLLMConnector
 from .gemini import GoogleGeminiConnector
 from .claude import ClaudeConnector
 from .openai import OpenAIConnector
+from .ollama import OllamaConnector
 from .grok import GrokConnector
 
 
@@ -36,7 +37,7 @@ def create_llm_connector(
     Factory function to create LLM connectors based on model class name.
 
     Args:
-        model_class_name: The type of LLM connector ("gemini", "claude", "openai", "grok")
+        model_class_name: The type of LLM connector ("gemini", "claude", "openai", "ollama", "grok")
         model_name: The specific model to use (e.g. "gpt-4o", "o4-mini", "claude-3-5-sonnet", "grok-4")
         agent_name: Name of the agent using this connector
         agent_data_path: Path to agent's data directory for history storage
@@ -74,6 +75,17 @@ def create_llm_connector(
         )
     elif normalized_class_name == "openai":
         return OpenAIConnector(
+            model_name=model_name,
+            agent_name=agent_name,
+            agent_data_path=agent_data_path,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            custom_api_params=custom_api_params,
+        )
+    elif normalized_class_name == "ollama":
+        return OllamaConnector(
             model_name=model_name,
             agent_name=agent_name,
             agent_data_path=agent_data_path,
