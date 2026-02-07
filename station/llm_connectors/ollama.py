@@ -60,6 +60,7 @@ class OllamaConnector(OpenAIConnector):
             or "http://127.0.0.1:11434/v1"
         )
         params["base_url"] = base_url.rstrip("/")
+        self._enable_station_action_tools = bool(params.pop("enable_station_action_tools", False))
 
         super().__init__(
             model_name=model_name,
@@ -207,9 +208,10 @@ class OllamaConnector(OpenAIConnector):
                 "model": self.model_name,
                 "messages": self.chat_history,
                 "temperature": self.temperature,
-                "tools": self._tool_schema(),
-                "tool_choice": "auto",
             }
+            if self._enable_station_action_tools:
+                api_params["tools"] = self._tool_schema()
+                api_params["tool_choice"] = "auto"
             if self.max_output_tokens:
                 api_params["max_tokens"] = self.max_output_tokens
 
@@ -257,14 +259,22 @@ class OllamaConnector(OpenAIConnector):
             return llm_text_response, thinking_text, token_info
 
         except openai.APIConnectionError as e:
+            self._rollback_last_user_turn()
             raise LLMTransientAPIError(f"OpenAI API Connection Error for {self.agent_name}: {str(e)}", original_exception=e)
         except openai.RateLimitError as e:
+            self._rollback_last_user_turn()
             raise LLMTransientAPIError(f"OpenAI API Rate Limit Error for {self.agent_name}: {str(e)}", original_exception=e)
         except openai.APIStatusError as e:
+            self._rollback_last_user_turn()
             if self._is_context_overflow_error(e):
                 raise LLMContextOverflowError(f"Context window overflow for {self.agent_name}: {str(e)}", original_exception=e)
             if e.status_code >= 500:
                 raise LLMTransientAPIError(f"OpenAI API Server Error for {self.agent_name}: {str(e)}", original_exception=e)
             raise LLMPermanentAPIError(f"OpenAI API Client Error for {self.agent_name}: {str(e)}", original_exception=e)
         except Exception as e:
+            self._rollback_last_user_turn()
             raise LLMConnectorError(f"Unexpected OpenAI API call failure for {self.agent_name}. Details: {str(e)}", original_exception=e)
+
+    def _rollback_last_user_turn(self) -> None:
+        if self.chat_history and self.chat_history[-1].get("role") == "user":
+            self.chat_history.pop()
