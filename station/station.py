@@ -1512,6 +1512,7 @@ class Station:
                 self.auto_evaluator = AutoTestEvaluator(
                     station_instance=self,
                     enabled=constants.AUTO_EVAL_TEST,
+                    model_class=constants.AUTO_EVAL_TEST_MODEL_CLASS,
                     model_name=constants.AUTO_EVAL_MODEL_NAME,
                     log_queue=log_queue
                 )
