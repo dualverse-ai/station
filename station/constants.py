@@ -84,8 +84,11 @@ AGENT_LLM_SYSTEM_PROMPT_KEY = "llm_system_prompt" # Optional, agent-specific
 AGENT_LLM_CUSTOM_API_PARAMS_KEY = "llm_custom_api_params" # Optional, provider-specific params dict
 
 # LLM Connector Settings
-LLM_MAX_RETRIES = 10  # Maximum retry attempts for LLM API calls
-LLM_RETRY_DELAY_SECONDS = 60  # Delay between retry attempts in seconds
+LLM_MAX_RETRIES = 50  # Maximum retry attempts for LLM API calls
+LLM_RETRY_DELAY_SECONDS = 60  # Initial delay for retry attempts in seconds
+
+# Gemini-specific settings
+GEMINI_TIMEOUT = 600  # Timeout for Gemini API calls in seconds (set to None to disable)
 
 # LLM Proxy Settings
 LLM_HTTP_PROXY = None  # e.g., "socks5://127.0.0.1:1080" or "http://proxy.example.com:8080"

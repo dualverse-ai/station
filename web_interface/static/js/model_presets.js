@@ -17,66 +17,94 @@
 // web_interface/static/js/model_presets.js
 const MODEL_PRESETS = [
     {
-        "display_name": "Gemini 3 Pro (300k)",
+        "display_name": "Gemini 3.1 Pro",
         "model_provider_class": "Gemini",
-        "model_name": "gemini-3-pro-preview",
-        "initial_tokens_max": 300000,
+        "model_name": "gemini-3.1-pro-preview",
+        "initial_tokens_max": 250000,
         "llm_system_prompt": "",
-    },    
+    },
     {
-        "display_name": "Gemini 2.5 Pro (300k)",
+        "display_name": "Gemini 3 Flash",
+        "model_provider_class": "Gemini",
+        "model_name": "gemini-3-flash-preview",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "Gemini 2.5 Pro",
         "model_provider_class": "Gemini",
         "model_name": "gemini-2.5-pro",
         "initial_tokens_max": 300000,
         "llm_system_prompt": "",
     },
     {
-        "display_name": "Gemini 2.5 Flash (600k)",
+        "display_name": "Gemini 2.5 Flash",
         "model_provider_class": "Gemini",
         "model_name": "gemini-2.5-flash",
-        "initial_tokens_max": 600000,
+        "initial_tokens_max": 300000,
         "llm_system_prompt": "",
     },
     {
-        "display_name": "Claude Opus 4.1 (200k)",
+        "display_name": "Claude Opus 4.1",
         "model_provider_class": "Claude",
         "model_name": "claude-opus-4-1-20250805",
         "initial_tokens_max": 200000,
-        "llm_system_prompt": ""
+        "llm_system_prompt": "",
     },
     {
-        "display_name": "Grok 4 (200k)",
+        "display_name": "Claude Opus 4.6",
+        "model_provider_class": "Claude",
+        "model_name": "claude-opus-4-6",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "Claude Opus 4.7",
+        "model_provider_class": "Claude",
+        "model_name": "claude-opus-4-7",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "Grok 4",
         "model_provider_class": "Grok",
         "model_name": "grok-4",
         "initial_tokens_max": 200000,
-        "llm_system_prompt": ""
+        "llm_system_prompt": "",
     },
     {
-        "display_name": "GPT-5.2 (270k)",
+        "display_name": "GPT-5.5",
+        "model_provider_class": "OpenAI",
+        "model_name": "gpt-5.5",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "GPT-5.4",
+        "model_provider_class": "OpenAI",
+        "model_name": "gpt-5.4",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "GPT-5.3-codex",
+        "model_provider_class": "OpenAI",
+        "model_name": "gpt-5.3-codex",
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
+    },
+    {
+        "display_name": "GPT-5.2",
         "model_provider_class": "OpenAI",
         "model_name": "gpt-5.2",
-        "initial_tokens_max": 270000,
-        "llm_system_prompt": ""
-    },        
-    {
-        "display_name": "GPT-5.1 (270k)",
-        "model_provider_class": "OpenAI",
-        "model_name": "gpt-5.1",
-        "initial_tokens_max": 270000,
-        "llm_system_prompt": ""
-    },    
-    {
-        "display_name": "GPT-5 (270k)",
-        "model_provider_class": "OpenAI",
-        "model_name": "gpt-5",
-        "initial_tokens_max": 270000,
-        "llm_system_prompt": ""
+        "initial_tokens_max": 250000,
+        "llm_system_prompt": "",
     },
     {
         "display_name": "Ollama: gpt-oss:20b",
         "model_provider_class": "Ollama",
         "model_name": "gpt-oss:20b",
         "initial_tokens_max": 128000,
-        "llm_system_prompt": ""
+        "llm_system_prompt": "",
     },
 ];

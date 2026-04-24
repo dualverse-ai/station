@@ -16,7 +16,8 @@ import os
 import time
 import abc
 import copy
-from typing import Dict, Any, Optional, List, Tuple
+import json
+from typing import Dict, Any, Optional, List, Tuple, Set
 
 from station import file_io_utils
 from station import constants
@@ -82,6 +83,10 @@ class BaseLLMConnector(abc.ABC):
 
         self.max_retries = max_retries
         self.retry_delay_seconds = retry_delay_seconds
+
+        # When False, the connector must not write anything to station_data (history files, agent YAML, etc).
+        # Temporal chat uses this mode to avoid leaving any records.
+        self.persist_to_disk: bool = True
         
         # Set proxy environment variables if configured in constants
         if constants.LLM_HTTP_PROXY:
@@ -98,6 +103,43 @@ class BaseLLMConnector(abc.ABC):
         # Load pruning blocks and store a copy to detect changes
         self.agent_prune_blocks: List[Dict[str, Any]] = self._load_prune_blocks_from_agent_data()
         self._last_known_prune_blocks: List[Dict[str, Any]] = copy.deepcopy(self.agent_prune_blocks)
+        self._last_known_system_prompt: Optional[str] = self.system_prompt
+        self._debug_station_id: Optional[str] = None
+
+    def _debug_api_enabled(self) -> bool:
+        raw_value = str(os.getenv("DEBUG_API", "")).strip().lower()
+        return raw_value in {"1", "true", "yes", "on"}
+
+    def _get_debug_api_dir(self) -> str:
+        if self._debug_station_id is None:
+            station_id = "unknown_station"
+            try:
+                station_config_path = os.path.join(
+                    os.getcwd(),
+                    constants.BASE_STATION_DATA_PATH,
+                    constants.STATION_CONFIG_FILENAME,
+                )
+                station_config = file_io_utils.load_yaml(station_config_path)
+                if isinstance(station_config, dict):
+                    candidate = station_config.get(constants.STATION_ID_KEY)
+                    if isinstance(candidate, str) and candidate.strip():
+                        station_id = candidate.strip()
+            except Exception as e:
+                print(f"Warning ({self.agent_name}): Failed to resolve station_id for DEBUG_API path: {e}")
+            self._debug_station_id = station_id
+        return os.path.join(os.getcwd(), "tests", self._debug_station_id)
+
+    def _write_debug_api_snapshot(self, filename: str, payload: Dict[str, Any]) -> None:
+        if not self._debug_api_enabled():
+            return
+        try:
+            snapshot_dir = self._get_debug_api_dir()
+            file_io_utils.ensure_dir_exists(snapshot_dir)
+            path = os.path.join(snapshot_dir, filename)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Warning ({self.agent_name}): Failed to write DEBUG_API snapshot '{filename}': {e}")
 
 
     def _load_prune_blocks_from_agent_data(self) -> List[Dict[str, Any]]:
@@ -111,13 +153,45 @@ class BaseLLMConnector(abc.ABC):
             print(f"Error ({self.agent_name}): Failed to load prune blocks: {e}")
             return []
 
+    def _bypass_agent_data_system_prompt_reload(self) -> bool:
+        """
+        Return True when the connector should keep its constructor-provided system prompt.
+
+        Most Station agents reload their runtime system prompt from agent YAML.
+        System services such as the archive reviewer are different: they use an
+        explicit connector-level system prompt plus separate task/context user
+        messages, so they should keep the constructor-provided prompt.
+        """
+        return self.agent_name == "AutoArchiveEvaluator"
+
+    def _load_system_prompt_from_agent_data(self) -> Optional[str]:
+        """Loads current system prompt from public-branch agent data."""
+        try:
+            if self._bypass_agent_data_system_prompt_reload():
+                return self._last_known_system_prompt
+            agent_full_data = agent_module.load_agent_data(self.agent_name, include_ended=True, include_ascended=True)
+            if agent_full_data is None:
+                return self._last_known_system_prompt
+            return agent_full_data.get(constants.AGENT_LLM_SYSTEM_PROMPT_KEY, self._last_known_system_prompt)
+        except Exception as e:
+            print(f"Error ({self.agent_name}): Failed to load system prompt: {e}")
+            return self._last_known_system_prompt
+
     @abc.abstractmethod
     def _load_history_from_file(self) -> List[Dict[str, Any]]:
         """Loads chat history... {'tick': int, 'role': str, 'text_content': str}"""
         pass
 
     @abc.abstractmethod
-    def _append_turn_to_history_file(self, tick: int, role: str, text: str, thinking_text: Optional[str] = None, token_info: Optional[Dict[str, Optional[int]]] = None) -> None:
+    def _append_turn_to_history_file(
+        self,
+        tick: int,
+        role: str,
+        text: str,
+        thinking_text: Optional[str] = None,
+        token_info: Optional[Dict[str, Optional[int]]] = None,
+        api_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Appends a single turn with optional thinking text and token info."""
         pass
 
@@ -167,13 +241,21 @@ class BaseLLMConnector(abc.ABC):
 
             # Always include protected ticks
             if tick in protected_ticks:
-                filtered_entries.append({'tick': tick, 'role': role, 'text_content': text_content})
+                preserved_entry = dict(entry)
+                preserved_entry['tick'] = tick
+                preserved_entry['role'] = role
+                preserved_entry['text_content'] = text_content
+                filtered_entries.append(preserved_entry)
                 continue
 
             # Check if this tick is in any pruned range
             is_pruned = any(start <= tick <= end for start, end, _ in pruned_ranges)
             if not is_pruned:
-                filtered_entries.append({'tick': tick, 'role': role, 'text_content': text_content})
+                preserved_entry = dict(entry)
+                preserved_entry['tick'] = tick
+                preserved_entry['role'] = role
+                preserved_entry['text_content'] = text_content
+                filtered_entries.append(preserved_entry)
 
         # Insert summary replacements at chronological positions
         final_entries = []
@@ -184,7 +266,9 @@ class BaseLLMConnector(abc.ABC):
             while (current_entry_index < len(filtered_entries) and
                    filtered_entries[current_entry_index].get('tick', 0) < start_tick):
                 entry = filtered_entries[current_entry_index]
-                final_entries.append({'role': entry['role'], 'text_content': entry['text_content']})
+                out_entry = dict(entry)
+                out_entry.pop('tick', None)
+                final_entries.append(out_entry)
                 current_entry_index += 1
 
             # Insert summary replacement only if non-empty summary
@@ -201,11 +285,131 @@ class BaseLLMConnector(abc.ABC):
         # Add remaining entries after all pruned ranges
         while current_entry_index < len(filtered_entries):
             entry = filtered_entries[current_entry_index]
-            final_entries.append({'role': entry['role'], 'text_content': entry['text_content']})
+            out_entry = dict(entry)
+            out_entry.pop('tick', None)
+            final_entries.append(out_entry)
             current_entry_index += 1
 
         print(f"Before pruning, raw history length: {len(raw_history_entries)}, after pruning: {len(final_entries)} for {self.agent_name}.")
         return final_entries
+
+    def _calculate_retry_delay(self, attempt_number: int) -> int:
+        """
+        Calculate incremental retry delay based on attempt number.
+        Pattern: 60, 60, 120, 120, 240, 240, 480, 480, 960, 960, ...
+        - Each delay repeats twice
+        - After 2 repetitions, double the delay
+        - Maximum of 4 doublings (max delay = base_delay * 16)
+
+        Args:
+            attempt_number: Current attempt number (1-indexed)
+
+        Returns:
+            Delay in seconds
+        """
+        if attempt_number < 1:
+            return self.retry_delay_seconds
+
+        # Calculate doubling level: 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, ...
+        # Max doubling level is 4
+        doubling_level = min((attempt_number - 1) // 2, 4)
+
+        # Calculate delay: base * 2^level
+        delay = self.retry_delay_seconds * (2 ** doubling_level)
+
+        return delay
+
+    def _compact_persisted_value(self, value: Any) -> Any:
+        """Recursively drop None and empty containers before writing metadata to disk."""
+        if isinstance(value, dict):
+            compacted: Dict[str, Any] = {}
+            for key, item in value.items():
+                compacted_item = self._compact_persisted_value(item)
+                if compacted_item is None:
+                    continue
+                if isinstance(compacted_item, (dict, list)) and not compacted_item:
+                    continue
+                compacted[str(key)] = compacted_item
+            return compacted
+
+        if isinstance(value, list):
+            compacted_list = []
+            for item in value:
+                compacted_item = self._compact_persisted_value(item)
+                if compacted_item is None:
+                    continue
+                if isinstance(compacted_item, (dict, list)) and not compacted_item:
+                    continue
+                compacted_list.append(compacted_item)
+            return compacted_list
+
+        return value
+
+    def _prepare_api_metadata_for_persistence(self, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not metadata:
+            return None
+        compacted = self._compact_persisted_value(metadata)
+        if isinstance(compacted, dict) and compacted:
+            return compacted
+        return None
+
+    def _sanitize_api_return_payload(
+        self,
+        value: Any,
+        drop_keys: Optional[Set[str]] = None,
+        max_string_length: int = 2000,
+    ) -> Any:
+        """
+        Remove generated text fields from raw API payloads while preserving structured metadata.
+        """
+        effective_drop_keys = drop_keys or {
+            "arguments",
+            "content",
+            "delta",
+            "output_text",
+            "reasoning_content",
+            "summary",
+            "text",
+            "thinking",
+            "thinking_content",
+        }
+
+        if isinstance(value, dict):
+            sanitized: Dict[str, Any] = {}
+            for key, item in value.items():
+                if str(key) in effective_drop_keys:
+                    continue
+                sanitized[str(key)] = self._sanitize_api_return_payload(
+                    item,
+                    drop_keys=effective_drop_keys,
+                    max_string_length=max_string_length,
+                )
+            return sanitized
+
+        if isinstance(value, list):
+            return [
+                self._sanitize_api_return_payload(
+                    item,
+                    drop_keys=effective_drop_keys,
+                    max_string_length=max_string_length,
+                )
+                for item in value
+            ]
+
+        if isinstance(value, tuple):
+            return [
+                self._sanitize_api_return_payload(
+                    item,
+                    drop_keys=effective_drop_keys,
+                    max_string_length=max_string_length,
+                )
+                for item in value
+            ]
+
+        if isinstance(value, str) and len(value) > max_string_length:
+            return f"{value[:max_string_length]}...[truncated]"
+
+        return value
 
     def _parse_ticks_for_filtering(self, ticks_input) -> set:
         """Parse ticks input for filtering (simplified version without error handling)."""
@@ -271,29 +475,79 @@ class BaseLLMConnector(abc.ABC):
     def _send_message_implementation(self, user_prompt: str, current_tick: int, attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
         pass
 
-    def send_message(self, user_prompt: str, current_tick: int) -> Tuple[str, Dict[str, Optional[int]]]:
-        # --- Check for pruning updates before sending ---
-        current_prune_blocks_on_disk = self._load_prune_blocks_from_agent_data()
+    def _handle_system_prompt_update(self) -> None:
+        """Hook for connectors that need to rebuild internal config when system prompt changes."""
+        return None
 
-        if current_prune_blocks_on_disk != self._last_known_prune_blocks:
-            print(f"Info ({self.agent_name}): Pruning blocks changed. Re-initializing chat session.")
-            self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
-            self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
+    def _before_send_message(self, current_tick: int) -> None:
+        """Hook for connectors that need to adjust client state before a send."""
+        return None
+
+    def _handle_send_error(self, error: Exception, current_tick: int) -> bool:
+        """
+        Hook for connectors that want to react to send errors.
+
+        Returns True to retry immediately without the normal backoff sleep.
+        """
+        return False
+
+    def sync_state(self) -> None:
+        """
+        Synchronize connector state with agent data on disk.
+
+        Checks if pruning blocks have changed and re-initializes the chat session
+        or system prompt if needed, then recounts tokens. This method is idempotent - calling it
+        multiple times with unchanged state has no effect (no wasted computation).
+
+        Called before generating observations and before sending messages to ensure
+        token counts are accurate.
+        """
+        current_prune_blocks_on_disk = self._load_prune_blocks_from_agent_data()
+        current_system_prompt = self._load_system_prompt_from_agent_data()
+
+        # Idempotent check - if pruning blocks unchanged, this is a no-op
+        prune_changed = current_prune_blocks_on_disk != self._last_known_prune_blocks
+        prompt_changed = current_system_prompt != self._last_known_system_prompt
+
+        if prune_changed or prompt_changed:
+            if prune_changed:
+                print(f"Info ({self.agent_name}): Pruning blocks changed. Re-initializing chat session.")
+                self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
+                self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
+            if prompt_changed:
+                print(f"Info ({self.agent_name}): System prompt changed. Re-initializing chat session.")
+                self.system_prompt = current_system_prompt
+                self._last_known_system_prompt = current_system_prompt
+                self._handle_system_prompt_update()
             try:
                 self._initialize_chat_session() # Re-initialize with new pruning rules
+
+                # Count tokens after re-initialization and update agent's budget
+                print(f"Info ({self.agent_name}): Counting tokens after re-initialization.")
+                new_token_count = self.get_current_total_session_tokens()
+                if new_token_count is not None:
+                    if self.persist_to_disk:
+                        # Update agent's token budget in the data file
+                        agent_data = agent_module.load_agent_data(self.agent_name)
+                        if agent_data:
+                            agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_KEY] = new_token_count
+                            agent_module.save_agent_data(self.agent_name, agent_data)
+                            print(f"Info ({self.agent_name}): Token budget updated to {new_token_count} after pruning.")
+                        else:
+                            print(f"Warning ({self.agent_name}): Could not load agent data to update token count after pruning.")
+                else:
+                    print(f"Warning ({self.agent_name}): Could not count tokens after pruning re-initialization.")
+
             except Exception as e_reinit:
-                # If re-initialization fails, we should probably not proceed with the send_message call
-                # or at least be aware that the history might be stale.
-                print(f"Error ({self.agent_name}): Failed to re-initialize chat session after pruning update: {e_reinit}. Message may use stale history.")
-                # Depending on desired behavior, could raise an error here or return an error tuple.
-                # For now, let it proceed, but this is a point of potential failure.
-                # Construct a default error token_info
-                error_token_info: Dict[str, Optional[int]] = {
-                    'total_tokens_in_session': None, 'last_exchange_prompt_tokens': None,
-                    'last_exchange_completion_tokens': None, 'last_exchange_cached_tokens': None,
-                    'last_exchange_thoughts_tokens': None
-                }
-                return f"SYSTEM_ERROR: Failed to update chat session with latest pruning rules. Error: {e_reinit}", None, error_token_info
+                print(f"Error ({self.agent_name}): Failed to re-initialize chat session after pruning update: {e_reinit}.")
+                # Note: We don't raise here to allow the caller to proceed, but state may be stale
+
+    def send_message(self, user_prompt: str, current_tick: int) -> Tuple[str, Dict[str, Optional[int]]]:
+        # Synchronize state (pruning blocks, token recount) before sending
+        # This is idempotent - if sync_state() was already called earlier (e.g., before request_status),
+        # this will be a no-op with no wasted computation
+        self.sync_state()
+        self._before_send_message(current_tick)
 
         # --- Original send_message retry logic ---
         last_exception: Optional[Exception] = None
@@ -328,9 +582,18 @@ class BaseLLMConnector(abc.ABC):
             except Exception as e:
                 last_exception = e
                 current_attempt += 1
+                retry_immediately = False
+                try:
+                    retry_immediately = self._handle_send_error(e, current_tick)
+                except Exception as hook_error:
+                    print(f"Warning ({self.agent_name}): send error hook failed: {hook_error}")
+
                 if current_attempt > self.max_retries:
                     print(f"LLMConnector ({self.agent_name}): Max retries ({self.max_retries}) exhausted. Last error: {e}")
-                    raise 
+                    raise
+                if retry_immediately:
+                    print(f"LLMConnector ({self.agent_name}): Retrying immediately after transient error handling.")
+                    continue
                 
                 # Print detailed error information for debugging
                 error_details = str(e)
@@ -345,8 +608,11 @@ class BaseLLMConnector(abc.ABC):
                     if error_attrs:
                         raw_error_info = f" | Error Attributes: {error_attrs}"
                 
-                print(f"LLMConnector ({self.agent_name}): API error (Attempt {current_attempt}/{self.max_retries}): {error_details}{raw_error_info}. Retrying in {self.retry_delay_seconds}s...")
-                time.sleep(self.retry_delay_seconds)
+                # Calculate incremental retry delay
+                retry_delay = self._calculate_retry_delay(current_attempt)
+
+                print(f"LLMConnector ({self.agent_name}): API error (Attempt {current_attempt}/{self.max_retries}): {error_details}{raw_error_info}. Retrying in {retry_delay}s...")
+                time.sleep(retry_delay)
         
         if last_exception: 
             raise last_exception 
@@ -390,6 +656,17 @@ class BaseLLMConnector(abc.ABC):
             print(f"Info ({self.agent_name}): Pruning blocks unchanged. Proceeding to get current token count.")
 
         return self.get_current_total_session_tokens()
+
+    def reload_session_from_disk(self) -> None:
+        """
+        Rebuild provider-specific in-memory chat state from the canonical history file.
+        """
+        self.agent_prune_blocks = self._load_prune_blocks_from_agent_data()
+        self._last_known_prune_blocks = copy.deepcopy(self.agent_prune_blocks)
+        self.system_prompt = self._load_system_prompt_from_agent_data()
+        self._last_known_system_prompt = self.system_prompt
+        self._handle_system_prompt_update()
+        self._initialize_chat_session()
 
     def end_session_and_cleanup(self) -> None:
         """Optional: Perform any cleanup."""

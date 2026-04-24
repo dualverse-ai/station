@@ -92,7 +92,17 @@ class GrokConnector(BaseLLMConnector):
             print(f"Error loading raw chat history for Grok from {self.history_file_path} for {self.agent_name}: {e}.")
         return history_for_filtering
 
-    def _append_turn_to_history_file(self, tick: int, role: str, text: str, thinking_text: Optional[str] = None, token_info: Optional[Dict[str, Optional[int]]] = None) -> None:
+    def _append_turn_to_history_file(
+        self,
+        tick: int,
+        role: str,
+        text: str,
+        thinking_text: Optional[str] = None,
+        token_info: Optional[Dict[str, Optional[int]]] = None,
+        api_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not getattr(self, "persist_to_disk", True):
+            return
         if not text.strip() and not (thinking_text and thinking_text.strip()):
             return
         try:
@@ -106,9 +116,81 @@ class GrokConnector(BaseLLMConnector):
             # Only add token_info for model responses (not user prompts) and if it's provided
             if role == 'model' and token_info:
                 turn_data['token_info'] = token_info
+            if role == 'model':
+                persisted_api_metadata = self._prepare_api_metadata_for_persistence(api_metadata)
+                if persisted_api_metadata:
+                    turn_data['api_metadata'] = persisted_api_metadata
             file_io_utils.append_yaml_line(turn_data, self.history_file_path)
         except Exception as e:
             print(f"Error appending turn to history file {self.history_file_path} for Grok {self.agent_name}: {e}")
+
+    def _to_jsonable(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_jsonable(v) for v in value]
+        if hasattr(value, "__dict__"):
+            try:
+                return self._to_jsonable(vars(value))
+            except Exception:
+                pass
+        return repr(value)
+
+    def _build_grok_api_metadata(self, response: Any) -> Optional[Dict[str, Any]]:
+        usage_obj = getattr(response, "usage", None)
+        metadata = {
+            "provider": "grok",
+            "streaming": False,
+            "model_name": self.model_name,
+            "response_id": getattr(response, "id", None),
+            "usage_raw": self._sanitize_api_return_payload(self._to_jsonable(usage_obj)) if usage_obj is not None else None,
+            "raw_return": self._sanitize_api_return_payload(self._to_jsonable(response)),
+        }
+        return self._prepare_api_metadata_for_persistence(metadata)
+
+    def _dump_send_payload_snapshot(
+        self,
+        user_prompt: str,
+        current_tick: int,
+        attempt_number: int,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        if not self._debug_api_enabled():
+            return
+        safe_agent_name = "".join(c if c.isalnum() or c in ["_", "-"] else "_" for c in self.agent_name)
+        ts_ms = int(time.time() * 1000)
+        filename = f"grok_send_{safe_agent_name}_tick{current_tick}_attempt{attempt_number}_{ts_ms}.json"
+        snapshot = {
+            "agent_name": self.agent_name,
+            "tick": current_tick,
+            "attempt_number": attempt_number,
+            "model_name": self.model_name,
+            "system_prompt": self.system_prompt,
+            "messages": self._to_jsonable(messages),
+            "user_prompt": user_prompt,
+            "temperature": self.temperature,
+            "max_tokens": self.max_output_tokens,
+        }
+        self._write_debug_api_snapshot(filename, snapshot)
+
+    def _dump_response_snapshot(self, current_tick: int, attempt_number: int, response: Any) -> None:
+        if not self._debug_api_enabled():
+            return
+        safe_agent_name = "".join(c if c.isalnum() or c in ["_", "-"] else "_" for c in self.agent_name)
+        ts_ms = int(time.time() * 1000)
+        filename = f"grok_response_{safe_agent_name}_tick{current_tick}_attempt{attempt_number}_{ts_ms}.json"
+        snapshot = {
+            "agent_name": self.agent_name,
+            "tick": current_tick,
+            "attempt_number": attempt_number,
+            "model_name": self.model_name,
+            "response": self._to_jsonable(response),
+        }
+        self._write_debug_api_snapshot(filename, snapshot)
 
     def _initialize_chat_session(self) -> None:
         raw_history_with_ticks = self._load_history_from_file()
@@ -155,6 +237,7 @@ class GrokConnector(BaseLLMConnector):
         }
 
         messages = self.history_messages + [user(user_prompt)]
+        self._dump_send_payload_snapshot(user_prompt, current_tick, attempt_number, messages)
 
         try:
             # The xai-sdk does not use requests directly in a way that exposes the response object easily.
@@ -169,6 +252,7 @@ class GrokConnector(BaseLLMConnector):
                 max_tokens=self.max_output_tokens
             )
             response = chat.sample()
+            self._dump_response_snapshot(current_tick, attempt_number, response)
 
             llm_text_response = response.content
             thinking_text = response.reasoning_content
@@ -196,8 +280,9 @@ class GrokConnector(BaseLLMConnector):
             self.history_messages.append(user(user_prompt))
             self.history_messages.append(assistant(llm_text_response))
 
+            api_metadata = self._build_grok_api_metadata(response)
             self._append_turn_to_history_file(current_tick, 'user', user_prompt, None, None)
-            self._append_turn_to_history_file(current_tick, 'model', llm_text_response, thinking_text, token_info)
+            self._append_turn_to_history_file(current_tick, 'model', llm_text_response, thinking_text, token_info, api_metadata)
 
             return llm_text_response, thinking_text, token_info
 

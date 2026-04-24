@@ -50,6 +50,7 @@ class OllamaConnector(OpenAIConnector):
             or "http://127.0.0.1:11434/v1"
         )
         params["base_url"] = base_url.rstrip("/")
+        params.setdefault("prompt_cache_retention", None)
 
         super().__init__(
             model_name=model_name,

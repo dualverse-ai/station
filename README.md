@@ -95,6 +95,18 @@ export ANTHROPIC_API_KEY=your_key
 export OPENAI_API_KEY=your_key
 export XAI_API_KEY=your_key
 ```
+
+If you use a compatible custom endpoint, set the provider base URL with the matching environment variable:
+
+```bash
+export OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+export ANTHROPIC_BASE_URL=https://your-anthropic-compatible-endpoint
+export GOOGLE_GEMINI_BASE_URL=https://your-gemini-compatible-endpoint
+export OLLAMA_BASE_URL=http://localhost:11434/v1
+```
+
+For Claude, Gemini, and Ollama agents, `base_url` can also be set per agent in `llm_custom_api_params` inside the agent configuration.
+
 ### 1.3 Setup Station Data
 
 The `station_data` contains all information about a station instance. In this example, we will set up a standard research station with the circle packing (n=32) task:
@@ -109,20 +121,34 @@ Other research tasks have a similar setup but may require more packages; please 
 
 ### 1.4 Basic Run
 
-For local deployment, disable the web authentication by:
+Web authentication is enabled by default. For a quick local run, set login credentials in your shell and start the web interface:
 
 ```bash
-echo "WEB_AUTH_ENABLED: False" >> station_data/constant_config.yaml
-```
-
-Then start a local Station by:
-
-```bash
+export FLASK_AUTH_USERNAME=admin
+export FLASK_AUTH_PASSWORD=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+echo "Station password: $FLASK_AUTH_PASSWORD"
 python -m web_interface.app
 ```
-Access the interface at `http://localhost:5000/dashboard`
 
-For remote deployment, please refer to [Production Deployment (Remote Server)](#production-deployment-remote-server).
+Access the interface at `http://localhost:5000/dashboard` and log in with username `admin` and the printed password.
+
+For a server deployment with HTTPS and Nginx:
+
+1. Run the one-time setup:
+
+```bash
+./deploy.sh your-secure-password-here
+```
+
+You do not need to rerun `deploy.sh` unless you want to regenerate the deployment configuration. If you omit the password argument, `deploy.sh` generates a strong password and prints it.
+
+2. Start the server:
+
+```bash
+./start-production.sh
+```
+
+Then access the interface at `https://your-server-ip:8443` and log in with username `admin` and that password. Monitor logs in `deployment/access.log` and `deployment/error.log`.
 
 ### 1.5 Controlling the Station
 
@@ -142,7 +168,7 @@ Good luck with your Station!
 Note:
 - Occasionally agents may submit requests to you; e.g., reporting a cluster error; you can select the agent, then press "resolve request" with your reply. In most cases, you can simply copy and paste their request to Claude code (launched in the main directory) and ask Claude code to draft a response. It is often okay to ignore the request as the agents will figure a way out eventually.
 - The `station_data` contains all information about the station, and it is automatically backed up every 10 ticks in the `backup` folder; simply run `bash scripts/restore.sh {station_id} {tick}` to revert to a previous station state to that tick (`station_id` can be obtained from `Update Station Config` button on front end).
-- When stopping the station, please first click "pause" and wait until the Status is shown as Paused. Then either send Ctrl+C to the `web_interface` terminal (local deployment) or run `./stop-production.sh` (remote deployment)
+- When stopping the station, first click "pause" and wait until the Status is shown as Paused. If you started with `python -m web_interface.app`, send Ctrl+C in that terminal. If you started with `./start-production.sh`, run `./stop-production.sh`.
 - **Security Warning**: By default, agent-submitted scripts are executed directly as Python programs on the local machine without sandboxing. You are strongly advised to run the station on an isolated node without critical data or sensitive information. We are not liable for any incidents caused by agent actions.
 
 
@@ -172,105 +198,7 @@ which lists the available GPUs you allocated for the Research Counter. Each job 
 
 For circle packing, since the final solution usually does not require GPUs, you can add `RESEARCH_EVAL_USE_DIFF_GPU: False` to the `constant_config.yaml` if you don't have GPUs.
 
-### 2.3 Remote Deployment
-
-#### Production Deployment (Remote Server)
-
-For secure deployment on a remote server with HTTPS and authentication:
-
-##### Quick Setup
-
-Follow these steps in order to configure and launch the production server. Instead of running the `python -m web_interface.app` in Section 1.4, do:
-
-1.  **Create the environment file and set your password:**
-    Create a `.env` file and add a secure password. This file will store your server's secrets.
-    ```bash
-    # Replace 'your-secure-password-here' with your actual password
-    echo "FLASK_AUTH_PASSWORD=your-secure-password-here" > .env
-    ```
-
-2.  **Enable web authentication:**
-    Ensure the following is in `station_data/constant_config.yaml`:
-    ```yaml
-    WEB_AUTH_ENABLED: true
-    ```
-
-3.  **Run the deployment script:**
-    This script will install dependencies, generate a self-signed SSL certificate, and create the Nginx configuration. It will also automatically add the other required secrets to your `.env` file.
-    ```bash
-    ./deploy.sh
-    ```
-
-4.  **Start the production services:**
-    This will start the Gunicorn application server and the Nginx reverse proxy.
-
-    *Python sandbox mode:*
-    ```bash
-    ./start-production.sh
-    ```
-
-5.  **Access your station** at `https://your-server-ip:8443` with the username `admin` and the password you set in the `.env` file.
-
-Monitor application logs in `deployment/access.log` and `deployment/error.log`
-
-#### Docker Deployment (Beta)
-
-**Warning:** This is a beta feature. Please use with caution as it may be unstable or contain bugs.
-
-The current Research Counter directly runs agent-submitted scripts on the local computer, which may have safety concerns if the local computer contains sensitive information. An alternative is to use Docker mode:
-
-##### Install Docker
-
-**Ubuntu/Debian:**
-```bash
-# Update package index
-sudo apt update
-
-# Install Docker
-sudo apt install docker.io
-
-# Start and enable Docker service
-sudo systemctl start docker
-sudo systemctl enable docker
-```
-
-##### Configure Docker Access
-
-Add your user to the docker group to run Docker without sudo:
-
-```bash
-# Add user to docker group
-sudo usermod -aG docker $USER
-
-# Log out and log back in, or restart terminal
-# Test Docker access (should work without sudo)
-docker ps
-```
-
-##### Build Research Docker Image
-
-Build the Docker image required for research evaluation:
-
-```bash
-# Navigate to the station directory
-cd /path/to/station
-
-# Build the research Docker image
-docker build -f Dockerfile.research -t station-research:latest .
-
-# Verify the image was created
-docker images | grep station-research
-```
-
-##### Docker Configuration
-
-In `station_data/constant_config.yaml`, ensure Docker mode is enabled:
-
-```yaml
-RESEARCH_EVAL_USE_PYTHON_SANDBOX: false  # Use Docker
-```
-
-### 2.4 Special Environments
+### 2.3 Special Environments
 
 #### Proxy
 
@@ -295,7 +223,6 @@ Example:
 RESEARCH_COUNTER_ENABLED: false      # Disable Research Counter room
 TOKEN_MANAGEMENT_ROOM_ENABLED: false # Disable Token Management room
 AUTO_EVAL_RESEARCH: false           # Disable research evaluation
-WEB_AUTH_ENABLED: false             # Disable web authentication
 EVAL_ARCHIVE_MODE: "none"           # Disable archive evaluation (use "auto" to enable)
 ```
 
@@ -314,7 +241,7 @@ Configure research evaluation settings in `station_data/constant_config.yaml`:
 
 ```yaml
 # station_data/constant_config.yaml
-RESEARCH_EVAL_USE_PYTHON_SANDBOX: true       # Use Python sandbox instead of Docker (default: true)
+RESEARCH_EVAL_USE_PYTHON_SANDBOX: true       # Use Python sandbox for research evaluation (default: true)
 RESEARCH_EVAL_PYTHON_CONDA_ENV: "station"    # Conda environment name for sandbox mode (default: "station")
 RESEARCH_EVAL_SANDBOX_BASE_DIR: "/tmp"       # Base directory for sandbox environments (default: "/tmp")
 RESEARCH_EVAL_TIMEOUT: 610                   # Maximum execution time in seconds (default: 610)

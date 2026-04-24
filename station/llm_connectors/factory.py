@@ -62,6 +62,7 @@ def create_llm_connector(
             system_prompt=system_prompt,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            custom_api_params=custom_api_params,
         )
     elif normalized_class_name == "claude":
         return ClaudeConnector(
@@ -72,6 +73,7 @@ def create_llm_connector(
             system_prompt=system_prompt,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
+            custom_api_params=custom_api_params,
         )
     elif normalized_class_name == "openai":
         return OpenAIConnector(

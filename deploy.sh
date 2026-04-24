@@ -2,12 +2,21 @@
 # Deployment script for the Station
 
 echo "=== Station Deployment ==="
+if [ -n "$1" ] && [ "$1" = "-h" -o "$1" = "--help" ]; then
+    echo "Usage: ./deploy.sh [web-auth-password]"
+    echo ""
+    echo "If .env already contains FLASK_AUTH_PASSWORD, that value is kept."
+    echo "If a password argument is provided, it is saved to .env."
+    echo "If neither exists, a strong password is generated and printed once."
+    exit 0
+fi
 
 # --- Configuration ---
 DEPLOYMENT_DIR="deployment"
 ENV_FILE=".env"
 CERT_FILE="$DEPLOYMENT_DIR/cert.pem"
 KEY_FILE="$DEPLOYMENT_DIR/key.pem"
+AUTH_PASSWORD_ARG="${1:-}"
 
 # Get absolute path of current directory for unique identification
 STATION_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,6 +39,37 @@ install_package() {
     fi
 }
 
+get_env_value() {
+    local key=$1
+    if [ ! -f "$ENV_FILE" ]; then
+        return 0
+    fi
+    grep -E "^${key}=" "$ENV_FILE" | tail -n 1 | cut -d'=' -f2-
+}
+
+set_env_value() {
+    local key=$1
+    local value=$2
+    python - "$ENV_FILE" "$key" "$value" <<'PY'
+import pathlib
+import sys
+
+env_file = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+
+lines = env_file.read_text().splitlines() if env_file.exists() else []
+updated = False
+for i, line in enumerate(lines):
+    if line.startswith(f"{key}="):
+        lines[i] = f"{key}={value}"
+        updated = True
+if not updated:
+    lines.append(f"{key}={value}")
+env_file.write_text("\n".join(lines) + "\n")
+PY
+}
+
 # --- Main Script ---
 
 # 1. Create deployment directory
@@ -45,26 +85,37 @@ install_package "nginx"
 echo "Setting up environment file..."
 if [ ! -f "$ENV_FILE" ]; then
     touch "$ENV_FILE"
-    echo "Created $ENV_FILE. Please configure it."
+    echo "Created $ENV_FILE."
 fi
 
 # Check for FLASK_SECRET_KEY
-if ! grep -q "FLASK_SECRET_KEY" "$ENV_FILE"; then
+if [ -z "$(get_env_value FLASK_SECRET_KEY)" ]; then
     echo "Generating and saving FLASK_SECRET_KEY..."
     SECRET_KEY=$(python -c "import secrets; print(secrets.token_hex(32))")
-    echo "FLASK_SECRET_KEY=$SECRET_KEY" >> "$ENV_FILE"
+    set_env_value FLASK_SECRET_KEY "$SECRET_KEY"
 fi
 
 # Check for FLASK_AUTH_USERNAME and FLASK_AUTH_PASSWORD
-if ! grep -q "FLASK_AUTH_USERNAME" "$ENV_FILE"; then
-    echo "FLASK_AUTH_USERNAME=admin" >> "$ENV_FILE"
+AUTH_USERNAME="$(get_env_value FLASK_AUTH_USERNAME)"
+if [ -z "$AUTH_USERNAME" ]; then
+    AUTH_USERNAME="admin"
+    set_env_value FLASK_AUTH_USERNAME "$AUTH_USERNAME"
     echo "WARNING: FLASK_AUTH_USERNAME set to 'admin'. Change it in the .env file."
 fi
 
-if ! grep -q "FLASK_AUTH_PASSWORD" "$ENV_FILE"; then
-    echo "ERROR: FLASK_AUTH_PASSWORD is not set in $ENV_FILE."
-    echo "Please add 'FLASK_AUTH_PASSWORD=your-secure-password' to the .env file."
-    exit 1
+AUTH_PASSWORD="$(get_env_value FLASK_AUTH_PASSWORD)"
+GENERATED_AUTH_PASSWORD=0
+if [ -n "$AUTH_PASSWORD" ]; then
+    echo "✓ Using existing FLASK_AUTH_PASSWORD from $ENV_FILE."
+elif [ -n "$AUTH_PASSWORD_ARG" ]; then
+    AUTH_PASSWORD="$AUTH_PASSWORD_ARG"
+    set_env_value FLASK_AUTH_PASSWORD "$AUTH_PASSWORD"
+    echo "✓ Saved provided FLASK_AUTH_PASSWORD to $ENV_FILE."
+else
+    AUTH_PASSWORD=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+    set_env_value FLASK_AUTH_PASSWORD "$AUTH_PASSWORD"
+    GENERATED_AUTH_PASSWORD=1
+    echo "Generated and saved a strong FLASK_AUTH_PASSWORD."
 fi
 
 # 4. Find and save paths for Conda and Claude
@@ -231,24 +282,20 @@ EOF
 touch "$DEPLOYMENT_DIR/nginx_error.log" "$DEPLOYMENT_DIR/nginx_access.log"
 chmod 666 "$DEPLOYMENT_DIR/nginx_error.log" "$DEPLOYMENT_DIR/nginx_access.log"
 
-# 6. Check Docker permissions
-echo "Checking Docker permissions..."
-if ! docker ps >/dev/null 2>&1; then
-    if groups | grep -q docker; then
-        echo "WARNING: You're in the docker group but can't access Docker."
-        echo "  You may need to log out and back in for group changes to take effect."
-    else
-        echo "WARNING: You don't have Docker permissions. Research evaluation may not work."
-        echo "  To fix, run: sudo usermod -aG docker $USER"
-        echo "  Then log out and back in."
-    fi
-else
-    echo "✓ Docker permissions are configured correctly."
-fi
-
 echo "---"
 echo "Deployment setup complete!"
 echo "Please review the configuration in the '$ENV_FILE' file."
+echo ""
+echo "Web login:"
+echo "  Username: $AUTH_USERNAME"
+if [ "$GENERATED_AUTH_PASSWORD" -eq 1 ]; then
+    echo "  Password: $AUTH_PASSWORD"
+    echo "  Record this generated password now. It is also saved in $ENV_FILE."
+elif [ -n "$AUTH_PASSWORD_ARG" ]; then
+    echo "  Password: the password provided to ./deploy.sh"
+else
+    echo "  Password: existing FLASK_AUTH_PASSWORD from $ENV_FILE"
+fi
 echo ""
 echo "Next steps:"
 echo "1. Start production services: ./start-production.sh"

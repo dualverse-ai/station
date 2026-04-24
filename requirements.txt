@@ -1,8 +1,8 @@
 # Core dependencies
 PyYAML>=6.0
 google-genai>=1.54.0
-anthropic>=0.53.0
-openai>=1.86.0
+anthropic>=0.94.0
+openai>=2.14.0
 tiktoken>=0.9.0
 xai-sdk>=1.0.0
 Flask>=3.1.0
