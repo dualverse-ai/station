@@ -19,8 +19,12 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- DOM Elements ---
     let stationTickDashboard = document.getElementById('station-tick-dashboard');
     let stationVersionDashboard = document.getElementById('station-version-dashboard');
+    let stationSyncModeDashboard = document.getElementById('station-sync-mode-dashboard');
     let stationStatusDashboard = null; // Will be created dynamically in header
     let cachedStationStatus = "Unknown"; // Track current station status string value
+    let cachedSyncMode = "parallel";
+    let latestTickStartedTimestampMs = null;
+    let latestTickTimingTooltip = '';
     const orchestratorStatusDisplay = document.getElementById('orchestrator-status-display');
     const orchestratorStatusDot = document.getElementById('orchestrator-status-dot');
     const orchestratorPauseReasonDisplay = document.getElementById('orchestrator-pause-reason-display');
@@ -35,7 +39,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const agentSelectorDashboard = document.getElementById('agent-selector-dashboard');
     const createApiAgentModalButton = document.getElementById('create-api-agent-modal-button');
     const endApiAgentSessionButton = document.getElementById('end-api-agent-session-button');    
-    const cancelCreateApiAgentButton = document.getElementById('cancel-create-api-agent-button');
     
     const manualInteractionSidebarSection = document.getElementById('manual-interaction-sidebar-section');
     const manualInteractionTitle = document.getElementById('manual-interaction-title');
@@ -46,9 +49,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const directMessageModal = document.getElementById('direct-message-modal');
     const closeDirectMessageModalButton = document.getElementById('close-direct-message-modal-button');
-    const cancelDirectMessageButton = document.getElementById('cancel-direct-message-button');
     const directMessageModalTitle = document.getElementById('direct-message-modal-title');
-    const directMessageModalAgentName = document.getElementById('direct-message-modal-agent-name');
+    const directMessageAgentSelector = document.getElementById('direct-message-agent-selector');
     const directMessageModalDescription = document.getElementById('direct-message-modal-description');
     const directMessageInput = document.getElementById('direct-message-input');
     const confirmSendDirectMessageButton = document.getElementById('confirm-send-direct-message-button');
@@ -58,7 +60,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Human Request Resolution Modal Elements
     const resolveRequestModal = document.getElementById('resolve-request-modal');
     const closeResolveRequestModalButton = document.getElementById('close-resolve-request-modal-button');
-    const cancelResolveRequestButton = document.getElementById('cancel-resolve-request-button');
     const confirmResolveRequestButton = document.getElementById('confirm-resolve-request-button');
     const requestIdDisplay = document.getElementById('request-id-display');
     const requestTickDisplay = document.getElementById('request-tick-display');
@@ -66,21 +67,48 @@ document.addEventListener('DOMContentLoaded', () => {
     const requestModelDisplay = document.getElementById('request-model-display');
     const requestTitleDisplay = document.getElementById('request-title-display');
     const requestContentDisplay = document.getElementById('request-content-display');
+    const requestSelectorWrapper = document.getElementById('request-selector-wrapper');
+    const requestSelector = document.getElementById('request-selector');
     const resolveResponseInput = document.getElementById('resolve-response-input');
     const resolveRequestStatus = document.getElementById('resolve-request-status');
 
     const openSendSystemMessageModalButton = document.getElementById('open-send-system-message-modal-button');
     const sendSystemMessageModal = document.getElementById('send-system-message-modal');
     const closeSendSystemMessageModalButton = document.getElementById('close-send-system-message-modal-button');
-    const cancelSendSystemMessageButton = document.getElementById('cancel-send-system-message-button');
     const systemMessageAgentSelector = document.getElementById('system-message-agent-selector');
     const systemMessageContent = document.getElementById('system-message-content');
+    const systemMessageArchitectCheckbox = document.getElementById('system-message-architect-checkbox');
     const confirmSendSystemMessageButton = document.getElementById('confirm-send-system-message-button');
+
+    const openTemporalChatModalButton = document.getElementById('open-temporal-chat-modal-button');
+    const temporalChatModal = document.getElementById('temporal-chat-modal');
+    const closeTemporalChatModalButton = document.getElementById('close-temporal-chat-modal-button');
+    const branchTemporalChatButton = document.getElementById('branch-temporal-chat-button');
+    const copyTemporalChatButton = document.getElementById('copy-temporal-chat-button');
+    const copyTemporalChatWithoutThinkingButton = document.getElementById('copy-temporal-chat-without-thinking-button');
+    const temporalChatAgentSelector = document.getElementById('temporal-chat-agent-selector');
+    const temporalChatBranchTickInput = document.getElementById('temporal-chat-branch-tick-input');
+    const temporalChatBaseTick = document.getElementById('temporal-chat-base-tick');
+    const temporalChatTranscript = document.getElementById('temporal-chat-transcript');
+    const temporalChatInput = document.getElementById('temporal-chat-input');
+    const confirmTemporalChatSendButton = document.getElementById('confirm-temporal-chat-send-button');
+
+    const openArchivePapersModalButton = document.getElementById('open-archive-papers-modal-button');
+    const archivePapersModal = document.getElementById('archive-papers-modal');
+    const closeArchivePapersModalButton = document.getElementById('close-archive-papers-modal-button');
+    const copyAllArchiveAbstractsButton = document.getElementById('copy-all-archive-abstracts-button');
+    const archivePapersListView = document.getElementById('archive-papers-list-view');
+    const archivePaperDetailView = document.getElementById('archive-paper-detail-view');
+    const archivePapersTableBody = document.getElementById('archive-papers-table-body');
+    const archivePaperDetailTitle = document.getElementById('archive-paper-detail-title');
+    const archivePaperDetailMeta = document.getElementById('archive-paper-detail-meta');
+    const archivePaperMarkdownContainer = document.getElementById('archive-paper-markdown-container');
+    const backToArchivePapersListButton = document.getElementById('back-to-archive-papers-list-button');
+    const copyArchivePaperMarkdownButton = document.getElementById('copy-archive-paper-markdown-button');
 
     const openSpeakCommonRoomModalButton = document.getElementById('open-speak-common-room-modal-button');
     const speakCommonRoomModal = document.getElementById('speak-common-room-modal');
     const closeSpeakCommonRoomModalButton = document.getElementById('close-speak-common-room-modal-button');
-    const cancelSpeakCommonRoomButton = document.getElementById('cancel-speak-common-room-button');
     const commonRoomSpeakerName = document.getElementById('common-room-speaker-name');
     const commonRoomMessageContent = document.getElementById('common-room-message-content');
     const confirmSpeakCommonRoomButton = document.getElementById('confirm-speak-common-room-button');
@@ -88,9 +116,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const updateStationConfigButton = document.getElementById('update-station-config-button');
     const updateStationConfigModal = document.getElementById('update-station-config-modal');
     const closeUpdateStationConfigModalButton = document.getElementById('close-update-station-config-modal-button');
-    const cancelUpdateStationConfigButton = document.getElementById('cancel-update-station-config-button');
     const updateStationConfigForm = document.getElementById('update-station-config-form');
     const updateStationId = document.getElementById('update-station-id');
+    const updateStationSyncMode = document.getElementById('update-station-sync-mode');
     const updateStationStatus = document.getElementById('update-station-status');
     const updateStationName = document.getElementById('update-station-name');
     const updateStationDescription = document.getElementById('update-station-description');
@@ -98,13 +126,29 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentStationStatus = document.getElementById('current-station-status');
     const currentStationName = document.getElementById('current-station-name');
     const currentStationDescription = document.getElementById('current-station-description');
+    const openApiRuntimeConfigModalButton = document.getElementById('open-api-runtime-config-modal-button');
+    const apiRuntimeConfigModal = document.getElementById('api-runtime-config-modal');
+    const closeApiRuntimeConfigModalButton = document.getElementById('close-api-runtime-config-modal-button');
+    const apiRuntimeConfigForm = document.getElementById('api-runtime-config-form');
+    const apiRuntimeTargetSelect = document.getElementById('api-runtime-target-select');
+    const apiRuntimeConfigBody = document.getElementById('api-runtime-config-body');
+    const saveApiRuntimeConfigButton = document.getElementById('save-api-runtime-config-button');
+    const moreToolsButton = document.getElementById('more-tools-button');
+    const moreToolsPopover = document.getElementById('more-tools-popover');
 
     const globalNotificationBubbleLog = document.getElementById('global-notification-bubble-log');
     const agentSpecificBubbleLog = document.getElementById('agent-specific-bubble-log');
+    const dashboardMetricsGrid = document.querySelector('.dashboard-metrics-grid');
     const logViewTitle = document.getElementById('log-view-title');
+    const logModeFullButton = document.getElementById('log-mode-full-button');
+    const logModeCollapsedButton = document.getElementById('log-mode-collapsed-button');
+    const toggleAgentLogButton = document.getElementById('toggle-agent-log-button');
+    const toggleStationLogButton = document.getElementById('toggle-station-log-button');
+    const historyWindowSelector = document.getElementById('history-window-selector');
 
     const clearLogButton = document.getElementById('clear-log-button');
     const loadFullHistoryButton = document.getElementById('load-full-history-button');
+    const copySystemPromptButton = document.getElementById('copy-system-prompt-button');
     const dashboardStatusMessages = document.getElementById('dashboard-status-messages');
 
     const createApiAgentModal = document.getElementById('create-api-agent-modal');
@@ -113,20 +157,76 @@ document.addEventListener('DOMContentLoaded', () => {
     const apiAgentTypeSelect = document.getElementById('api-agent-type');
     const apiRecursiveFieldsDiv = document.getElementById('api-recursive-fields');
     const apiModelPreset = document.getElementById('api-model-preset');
+    const MODEL_PRESETS = (window.STATION_CONFIG && Array.isArray(window.STATION_CONFIG.modelPresets))
+        ? window.STATION_CONFIG.modelPresets
+        : [];
+
+    // Chat: persisted per-agent fork under station_data/temporal_chat.
+    const temporalChatByAgent = new Map(); // agent_name -> [{role:'user'|'assistant', content:string}]
+    const temporalChatBaseTickByAgent = new Map(); // agent_name -> station tick used for the frozen fork
+    const temporalChatExistsByAgent = new Map(); // agent_name -> boolean
+    const temporalChatQueueByAgent = new Map(); // agent_name -> [string]
+    const temporalChatProcessingByAgent = new Map(); // agent_name -> boolean
+    const temporalChatBranchingByAgent = new Map(); // agent_name -> boolean
+    let archivePapersCache = [];
+    let archiveAllAbstractsMarkdown = '';
+    let archiveSelectedPaper = null;
+    let archiveSortState = { key: 'numeric_id', direction: 'asc' };
 
     let sseSource = null;
+    let pollingFallbackInterval = null;
     let currentSelectedAgentForDialogueView = "all"; 
     let isLoadingHistoryForAgent = null;
     let orchestratorState = { is_prepared: false, is_running: false, is_paused: false, agents_awaiting_human: [], turn_order: [] };
+    let resolveRequestCache = new Map();
     let fullAgentListCache = [];
     let fullDialogueHistoryCache = {};
     let isDirectMessageInProgress = false; // Track if a direct message is currently being sent 
+    const LOG_DISPLAY_MODE_STORAGE_KEY = 'station.dashboard.logDisplayMode';
+    const HISTORY_WINDOW_STORAGE_KEY = 'station.dashboard.historyWindow';
+    const LOG_MODES = ['full', 'collapsed'];
+    let logDisplayMode = localStorage.getItem(LOG_DISPLAY_MODE_STORAGE_KEY) || 'full';
+    if (!LOG_MODES.includes(logDisplayMode)) {
+        logDisplayMode = 'full';
+    }
+    let historyWindowMode = localStorage.getItem(HISTORY_WINDOW_STORAGE_KEY) || 'recent';
+    if (!['recent', 'earliest'].includes(historyWindowMode)) {
+        historyWindowMode = 'recent';
+    }
+    let logMessageSequence = 0;
+    const expandedMessageIds = new Set();
+    const collapsedSourceKeys = new Set();
+    const backgroundHistoryLoads = new Map();
+    const HISTORY_WINDOW_TICKS = 50;
+    let activeFloatingTooltipTarget = null;
+    let dashboardFloatingTooltip = null;
+    let dashboardTooltipHideTimer = null;
+    let agentHistoryRenderFragment = null;
+    let dashboardStatusTimer = null;
 
     // --- Helper Functions ---
+    function hideDashboardStatus() {
+        if (!dashboardStatusMessages) return;
+        if (dashboardStatusTimer) {
+            clearTimeout(dashboardStatusTimer);
+            dashboardStatusTimer = null;
+        }
+        dashboardStatusMessages.classList.remove('opacity-100');
+        dashboardStatusMessages.classList.add('opacity-0', 'is-hidden');
+        dashboardStatusMessages.setAttribute('aria-hidden', 'true');
+        dashboardStatusMessages.tabIndex = -1;
+    }
+
     function showDashboardStatus(message, type = 'info', duration = 4000) {
         if (!dashboardStatusMessages) { console.error("dashboardStatusMessages element not found"); return; }
+        if (dashboardStatusTimer) {
+            clearTimeout(dashboardStatusTimer);
+            dashboardStatusTimer = null;
+        }
         dashboardStatusMessages.textContent = message;
-        dashboardStatusMessages.className = 'mt-auto p-3 rounded-md text-sm min-h-[50px] border transition-all duration-300 opacity-100'; 
+        dashboardStatusMessages.className = 'dashboard-status-overlay p-3 glass-surface rounded-md text-sm border transition-all duration-300 opacity-100';
+        dashboardStatusMessages.setAttribute('aria-hidden', 'false');
+        dashboardStatusMessages.tabIndex = 0;
         const typeClasses = {
             error: ['bg-red-700', 'text-red-100', 'border-red-600'],
             success: ['bg-emerald-700', 'text-emerald-100', 'border-emerald-600'],
@@ -134,10 +234,199 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         dashboardStatusMessages.classList.add(...(typeClasses[type] || typeClasses.info));
         if (duration > 0) {
-            setTimeout(() => { 
-                if (dashboardStatusMessages) dashboardStatusMessages.classList.add('opacity-0'); 
+            dashboardStatusTimer = setTimeout(() => {
+                hideDashboardStatus();
             }, duration);
         }
+    }
+
+    function getDashboardFloatingTooltip() {
+        if (!dashboardFloatingTooltip) {
+            dashboardFloatingTooltip = document.createElement('div');
+            dashboardFloatingTooltip.className = 'dashboard-floating-tooltip';
+            dashboardFloatingTooltip.setAttribute('role', 'tooltip');
+            dashboardFloatingTooltip.addEventListener('pointerover', () => {
+                if (dashboardTooltipHideTimer) {
+                    clearTimeout(dashboardTooltipHideTimer);
+                    dashboardTooltipHideTimer = null;
+                }
+            });
+            dashboardFloatingTooltip.addEventListener('pointerout', (event) => {
+                if (event.relatedTarget instanceof Node && dashboardFloatingTooltip.contains(event.relatedTarget)) return;
+                hideDashboardFloatingTooltip();
+            });
+            document.body.appendChild(dashboardFloatingTooltip);
+        }
+        return dashboardFloatingTooltip;
+    }
+
+    function positionDashboardFloatingTooltip(target) {
+        if (!target || !dashboardFloatingTooltip || !dashboardFloatingTooltip.classList.contains('is-visible')) return;
+
+        const targetRect = target.getBoundingClientRect();
+        const tooltipWidth = dashboardFloatingTooltip.offsetWidth || 320;
+        const tooltipHeight = dashboardFloatingTooltip.offsetHeight || 180;
+        const viewportPadding = 16;
+        const gap = 2;
+        const preferSidePlacement = window.innerWidth > 820;
+
+        let left = preferSidePlacement ? targetRect.right - gap : targetRect.left;
+        let top = preferSidePlacement
+            ? targetRect.top + (targetRect.height - tooltipHeight) / 2
+            : targetRect.bottom + 8;
+
+        if (preferSidePlacement && left + tooltipWidth > window.innerWidth - viewportPadding) {
+            left = targetRect.left - tooltipWidth - gap;
+        }
+        if (!preferSidePlacement && left + tooltipWidth > window.innerWidth - viewportPadding) {
+            left = window.innerWidth - tooltipWidth - viewportPadding;
+        }
+        if (top + tooltipHeight > window.innerHeight - viewportPadding) {
+            top = preferSidePlacement
+                ? window.innerHeight - tooltipHeight - viewportPadding
+                : targetRect.top - tooltipHeight - 8;
+        }
+
+        dashboardFloatingTooltip.style.left = `${Math.max(viewportPadding, left)}px`;
+        dashboardFloatingTooltip.style.top = `${Math.max(viewportPadding, top)}px`;
+    }
+
+    function showDashboardFloatingTooltip(target) {
+        if (!target) return;
+        const tooltipText = String(target.getAttribute('data-tooltip') || '').trim();
+        if (!tooltipText) return;
+        if (dashboardTooltipHideTimer) {
+            clearTimeout(dashboardTooltipHideTimer);
+            dashboardTooltipHideTimer = null;
+        }
+
+        activeFloatingTooltipTarget = target;
+        const tooltip = getDashboardFloatingTooltip();
+        tooltip.textContent = tooltipText;
+        tooltip.classList.add('is-visible');
+        positionDashboardFloatingTooltip(target);
+    }
+
+    function hideDashboardFloatingTooltip(target = null) {
+        if (target && target !== activeFloatingTooltipTarget) return;
+        if (dashboardTooltipHideTimer) clearTimeout(dashboardTooltipHideTimer);
+        dashboardTooltipHideTimer = setTimeout(() => {
+            if (dashboardFloatingTooltip && dashboardFloatingTooltip.matches(':hover')) return;
+            if (dashboardFloatingTooltip) {
+                dashboardFloatingTooltip.classList.remove('is-visible');
+            }
+            activeFloatingTooltipTarget = null;
+            dashboardTooltipHideTimer = null;
+        }, 180);
+    }
+
+    function findTooltipTarget(eventTarget) {
+        if (!(eventTarget instanceof Element)) return null;
+        const target = eventTarget.closest('.dashboard-metric-card[data-tooltip]');
+        if (!target || !String(target.getAttribute('data-tooltip') || '').trim()) return null;
+        return target;
+    }
+
+    if (dashboardMetricsGrid) {
+        dashboardMetricsGrid.addEventListener('pointerover', (event) => {
+            const target = findTooltipTarget(event.target);
+            if (!target) return;
+            showDashboardFloatingTooltip(target);
+        });
+
+        dashboardMetricsGrid.addEventListener('pointerout', (event) => {
+            const target = findTooltipTarget(event.target);
+            if (!target) return;
+            if (event.relatedTarget instanceof Node && target.contains(event.relatedTarget)) return;
+            hideDashboardFloatingTooltip(target);
+        });
+
+        dashboardMetricsGrid.addEventListener('focusin', (event) => {
+            const target = findTooltipTarget(event.target);
+            if (target) showDashboardFloatingTooltip(target);
+        });
+
+        dashboardMetricsGrid.addEventListener('focusout', (event) => {
+            const target = findTooltipTarget(event.target);
+            if (target) hideDashboardFloatingTooltip(target);
+        });
+    }
+
+    window.addEventListener('resize', () => {
+        positionDashboardFloatingTooltip(activeFloatingTooltipTarget);
+    });
+
+    function isMoreToolsOpen() {
+        return Boolean(moreToolsPopover && moreToolsPopover.classList.contains('is-open'));
+    }
+
+    function positionMoreToolsPopover() {
+        if (!moreToolsButton || !moreToolsPopover || !isMoreToolsOpen()) return;
+
+        const buttonRect = moreToolsButton.getBoundingClientRect();
+        const popoverWidth = moreToolsPopover.offsetWidth || 272;
+        const popoverHeight = moreToolsPopover.offsetHeight || 280;
+        const viewportPadding = 16;
+        const gap = 12;
+        const preferSidePlacement = window.innerWidth > 820;
+
+        let left = preferSidePlacement ? buttonRect.right + gap : buttonRect.left;
+        let top = preferSidePlacement ? buttonRect.top : buttonRect.bottom + 8;
+
+        if (preferSidePlacement && left + popoverWidth > window.innerWidth - viewportPadding) {
+            left = buttonRect.left - popoverWidth - gap;
+        }
+        if (!preferSidePlacement && left + popoverWidth > window.innerWidth - viewportPadding) {
+            left = window.innerWidth - popoverWidth - viewportPadding;
+        }
+        if (top + popoverHeight > window.innerHeight - viewportPadding) {
+            top = preferSidePlacement
+                ? window.innerHeight - popoverHeight - viewportPadding
+                : buttonRect.top - popoverHeight - 8;
+        }
+
+        moreToolsPopover.style.left = `${Math.max(viewportPadding, left)}px`;
+        moreToolsPopover.style.top = `${Math.max(viewportPadding, top)}px`;
+    }
+
+    function setMoreToolsOpen(open) {
+        if (!moreToolsButton || !moreToolsPopover) return;
+        moreToolsPopover.classList.toggle('is-open', open);
+        moreToolsButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+            positionMoreToolsPopover();
+        }
+    }
+
+    if (moreToolsButton && moreToolsPopover) {
+        document.body.appendChild(moreToolsPopover);
+
+        moreToolsButton.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            setMoreToolsOpen(!isMoreToolsOpen());
+        });
+
+        moreToolsPopover.addEventListener('click', (event) => {
+            if (event.target instanceof Element && event.target.closest('button')) {
+                setMoreToolsOpen(false);
+            }
+        });
+
+        document.addEventListener('click', (event) => {
+            if (!isMoreToolsOpen()) return;
+            if (moreToolsButton.contains(event.target) || moreToolsPopover.contains(event.target)) return;
+            setMoreToolsOpen(false);
+        });
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && isMoreToolsOpen()) {
+                setMoreToolsOpen(false);
+                moreToolsButton.focus();
+            }
+        });
+
+        window.addEventListener('resize', positionMoreToolsPopover);
     }
 
     function renderMarkdownForDashboard(markdownText) {
@@ -161,8 +450,522 @@ document.addEventListener('DOMContentLoaded', () => {
         return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
 
-    function formatAgentDisplayName(agent) {
+    function formatAgentListForStatus(agentNames, maxVisible = 5) {
+        if (!Array.isArray(agentNames) || agentNames.length === 0) return 'none';
+        const visibleNames = agentNames.slice(0, maxVisible).join(', ');
+        const hiddenCount = agentNames.length - maxVisible;
+        return hiddenCount > 0 ? `${visibleNames} +${hiddenCount} more` : visibleNames;
+    }
+
+    function formatParallelTickStatus(parallelTickStatus) {
+        if (!parallelTickStatus) return '';
+        if (parallelTickStatus.error) {
+            return `Parallel status unavailable: ${parallelTickStatus.error}`;
+        }
+        if (!parallelTickStatus.active) return '';
+
+        const counts = parallelTickStatus.counts || {};
+        const preparing = parallelTickStatus.preparing_station_response || [];
+        const waiting = parallelTickStatus.waiting_for_response || [];
+        const pendingCommit = parallelTickStatus.response_received_pending_commit || [];
+        const internalRunning = parallelTickStatus.internal_action_running || [];
+        const total = Number.isFinite(Number(counts.total)) ? Number(counts.total) : 0;
+        const prepared = Number.isFinite(Number(counts.observation_prepared)) ? Number(counts.observation_prepared) : 0;
+        const responsesReceived = Number.isFinite(Number(counts.response_received)) ? Number(counts.response_received) : 0;
+        const committed = Number.isFinite(Number(counts.committed)) ? Number(counts.committed) : 0;
+
+        if (preparing.length > 0) return `Preparing station responses (${prepared}/${total} ready)`;
+        if (waiting.length > 0) return `Waiting for ${formatAgentListForStatus(waiting, 4)} (${responsesReceived}/${total} done)`;
+        if (pendingCommit.length > 0) return `Committing ${pendingCommit.length} response(s) (${committed}/${total} done)`;
+        if (internalRunning.length > 0) return `Waiting for internal action: ${formatAgentListForStatus(internalRunning, 4)}`;
+        if (total > 0) return `Committed ${committed}/${total} responses`;
+        return 'No active agents';
+    }
+
+    function setTooltipIfPresent(elementId, text) {
+        const element = document.getElementById(elementId);
+        if (!element) return;
+        const tooltipText = String(text || '').trim();
+        if (tooltipText) {
+            element.setAttribute('data-tooltip', tooltipText);
+            element.setAttribute('tabindex', '0');
+        } else {
+            element.removeAttribute('data-tooltip');
+            element.removeAttribute('tabindex');
+        }
+    }
+
+    function formatMinutesFromSeconds(seconds) {
+        if (seconds === null || typeof seconds === 'undefined' || seconds === '') return 'N/A';
+        const numericSeconds = Number(seconds);
+        if (!Number.isFinite(numericSeconds)) return 'N/A';
+        if (numericSeconds > 0 && numericSeconds < 60) return '<1m';
+        return `${Math.round(Math.max(0, numericSeconds) / 60)}m`;
+    }
+
+    function formatElapsedTickMinutes(elapsedMs) {
+        if (!Number.isFinite(elapsedMs)) return 'N/A';
+        return `${Math.floor(Math.max(0, elapsedMs) / 60000)}m`;
+    }
+
+    function interpolateColor(start, end, ratio) {
+        const clamped = Math.max(0, Math.min(1, ratio));
+        const values = start.map((value, index) => Math.round(value + (end[index] - value) * clamped));
+        return `rgb(${values[0]}, ${values[1]}, ${values[2]})`;
+    }
+
+    function getTickAgeColor(elapsedMinutes) {
+        const green = [34, 197, 94];
+        const yellow = [234, 179, 8];
+        const red = [239, 68, 68];
+        if (!Number.isFinite(elapsedMinutes)) return '';
+        if (elapsedMinutes < 30) return `rgb(${green.join(', ')})`;
+        if (elapsedMinutes < 60) return interpolateColor(green, yellow, (elapsedMinutes - 30) / 30);
+        if (elapsedMinutes < 120) return interpolateColor(yellow, red, (elapsedMinutes - 60) / 60);
+        return `rgb(${red.join(', ')})`;
+    }
+
+    function getTopScoreAgeColor(tickAge) {
+        const green = [34, 197, 94];
+        const yellow = [234, 179, 8];
+        const red = [239, 68, 68];
+        if (!Number.isFinite(tickAge)) return '';
+        if (tickAge <= 300) return `rgb(${green.join(', ')})`;
+        if (tickAge < 600) return interpolateColor(green, yellow, (tickAge - 300) / 300);
+        if (tickAge < 900) return interpolateColor(yellow, red, (tickAge - 600) / 300);
+        return `rgb(${red.join(', ')})`;
+    }
+
+    function renderTimeSinceLastTick() {
+        const valueElement = document.getElementById('queued-experiments-count');
+        const detailsElement = document.getElementById('queued-experiments-details');
+        if (!valueElement) return;
+
+        if (!Number.isFinite(latestTickStartedTimestampMs)) {
+            valueElement.textContent = 'N/A';
+            valueElement.style.color = '';
+            valueElement.style.removeProperty('--tick-age-color');
+            valueElement.classList.remove('tick-age-colored');
+            if (detailsElement) detailsElement.classList.add('hidden');
+            setTooltipIfPresent('queued-experiments-metric-card', latestTickTimingTooltip || 'No tick timing record is available.');
+            return;
+        }
+
+        const elapsedMs = Math.max(0, Date.now() - latestTickStartedTimestampMs);
+        const elapsedMinutes = elapsedMs / 60000;
+        const color = getTickAgeColor(elapsedMinutes);
+        valueElement.textContent = formatElapsedTickMinutes(elapsedMs);
+        valueElement.style.setProperty('--tick-age-color', color);
+        valueElement.style.color = color;
+        valueElement.classList.add('tick-age-colored');
+        if (detailsElement) {
+            detailsElement.textContent = '';
+            detailsElement.classList.add('hidden');
+        }
+        setTooltipIfPresent('queued-experiments-metric-card', latestTickTimingTooltip);
+    }
+
+    function updateTickTimingFromStats(tickTiming) {
+        const timing = tickTiming || {};
+        const startedSeconds = Number(timing.latest_tick_started_timestamp);
+        if (Number.isFinite(startedSeconds) && startedSeconds > 0) {
+            latestTickStartedTimestampMs = startedSeconds * 1000;
+        } else {
+            latestTickStartedTimestampMs = null;
+        }
+
+        latestTickTimingTooltip = [
+            `Average time per last 10 ticks: ${formatMinutesFromSeconds(timing.average_last_10_tick_seconds)}`,
+            `Average time per last 50 ticks: ${formatMinutesFromSeconds(timing.average_last_50_tick_seconds)}`,
+            `Average time per last 100 ticks: ${formatMinutesFromSeconds(timing.average_last_100_tick_seconds)}`
+        ].join('\n');
+
+        renderTimeSinceLastTick();
+    }
+
+    function _getTemporalChatMessages(agentName) {
+        if (!temporalChatByAgent.has(agentName)) temporalChatByAgent.set(agentName, []);
+        return temporalChatByAgent.get(agentName);
+    }
+
+    function _getTemporalChatQueue(agentName) {
+        if (!temporalChatQueueByAgent.has(agentName)) temporalChatQueueByAgent.set(agentName, []);
+        return temporalChatQueueByAgent.get(agentName);
+    }
+
+    function _isTemporalChatProcessing(agentName) {
+        return !!temporalChatProcessingByAgent.get(agentName);
+    }
+
+    function _isTemporalChatBranching(agentName) {
+        return !!temporalChatBranchingByAgent.get(agentName);
+    }
+
+    function _updateCachedTemporalChatMeta(agentName, chatState) {
+        if (!agentName || !chatState) return;
+        const agentInfo = fullAgentListCache.find(a => a && a.name === agentName);
+        if (!agentInfo) return;
+        agentInfo.temporal_chat_exists = !!chatState.exists;
+        agentInfo.temporal_chat_base_tick = typeof chatState.base_tick === 'undefined' ? null : chatState.base_tick;
+        agentInfo.temporal_chat_updated_at = chatState.updated_at || null;
+        if (temporalChatAgentSelector) {
+            Array.from(temporalChatAgentSelector.options || []).forEach(option => {
+                if (option.value === agentName) {
+                    option.textContent = formatAgentDisplayName(agentInfo, { includeBranchMarker: true });
+                }
+            });
+        }
+    }
+
+    function _applyTemporalChatState(agentName, chatState) {
+        if (!agentName || !chatState) return;
+        const rawMessages = Array.isArray(chatState.messages) ? chatState.messages : [];
+        temporalChatByAgent.set(agentName, rawMessages
+            .filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'model'))
+            .map(m => ({
+                role: m.role === 'model' ? 'assistant' : m.role,
+                content: String(m.content || ''),
+                thinking_content: String(m.thinking_content || ''),
+                tick: m.tick
+            })));
+        temporalChatBaseTickByAgent.set(agentName, typeof chatState.base_tick === 'undefined' ? null : chatState.base_tick);
+        temporalChatExistsByAgent.set(agentName, !!chatState.exists);
+        _updateCachedTemporalChatMeta(agentName, chatState);
+    }
+
+    function _updateTemporalChatBaseTick(agentName) {
+        if (!temporalChatBaseTick) return;
+        if (!agentName) {
+            temporalChatBaseTick.textContent = 'Dialogue (not started):';
+            return;
+        }
+        const baseTick = temporalChatBaseTickByAgent.get(agentName);
+        const exists = !!temporalChatExistsByAgent.get(agentName);
+        temporalChatBaseTick.textContent = exists && baseTick !== null && typeof baseTick !== 'undefined'
+            ? `Dialogue (branched from tick ${baseTick}):`
+            : 'Dialogue (not started):';
+    }
+
+    function _getDashboardCurrentTick() {
+        if (!stationTickDashboard) return null;
+        const parsed = parseInt(String(stationTickDashboard.textContent || '').trim(), 10);
+        return Number.isFinite(parsed) ? parsed : null;
+    }
+
+    function _parseTemporalChatBranchTickInput() {
+        if (!temporalChatBranchTickInput) return { ok: true, value: null };
+        const raw = String(temporalChatBranchTickInput.value || '').trim();
+        if (!raw) return { ok: true, value: null };
+        if (!/^\d+$/.test(raw)) {
+            return { ok: false, error: 'Branch tick must be a whole non-negative number.' };
+        }
+        const branchTick = parseInt(raw, 10);
+        const currentTick = _getDashboardCurrentTick();
+        if (currentTick !== null && branchTick > currentTick) {
+            return { ok: false, error: `Branch tick cannot be in the future. Current station tick is ${currentTick}.` };
+        }
+        return { ok: true, value: branchTick };
+    }
+
+    async function _loadTemporalChatState(agentName) {
+        if (!agentName) return null;
+        const result = await fetchApi(`/api/agent/${encodeURIComponent(agentName)}/temporal_chat`, 'GET');
+        if (result && result.success && result.chat) {
+            _applyTemporalChatState(agentName, result.chat);
+            return result.chat;
+        }
+        throw new Error((result && (result.error || result.message)) || 'Failed to load chat.');
+    }
+
+    function _updateTemporalChatSendButtonState(agentName) {
+        if (confirmTemporalChatSendButton) {
+            const q = agentName ? _getTemporalChatQueue(agentName) : [];
+            const qLen = q ? q.length : 0;
+            const busy = agentName ? _isTemporalChatProcessing(agentName) : false;
+            const branching = agentName ? _isTemporalChatBranching(agentName) : false;
+            if (branching) {
+                confirmTemporalChatSendButton.textContent = 'Send';
+            } else if (qLen > 0) {
+                confirmTemporalChatSendButton.textContent = `Send (Queued: ${qLen})`;
+            } else if (busy) {
+                confirmTemporalChatSendButton.textContent = 'Sending...';
+            } else {
+                confirmTemporalChatSendButton.textContent = 'Send';
+            }
+            confirmTemporalChatSendButton.disabled = branching; // sending still allows enqueue
+        }
+
+        if (branchTemporalChatButton) {
+            const qLen = agentName ? _getTemporalChatQueue(agentName).length : 0;
+            const exists = agentName ? !!temporalChatExistsByAgent.get(agentName) : false;
+            const branching = agentName ? _isTemporalChatBranching(agentName) : false;
+            branchTemporalChatButton.textContent = branching ? 'Branching...' : (exists ? 'Branch Again' : 'Branch');
+            branchTemporalChatButton.disabled = !agentName || _isTemporalChatProcessing(agentName) || qLen > 0;
+        }
+
+        if (temporalChatBranchTickInput) {
+            const qLen = agentName ? _getTemporalChatQueue(agentName).length : 0;
+            temporalChatBranchTickInput.disabled = !agentName || _isTemporalChatProcessing(agentName) || qLen > 0;
+        }
+        _updateTemporalChatBaseTick(agentName);
+    }
+
+    function _renderTemporalChatTranscript(agentName) {
+        if (!temporalChatTranscript) return;
+        const msgs = agentName ? _getTemporalChatMessages(agentName) : [];
+        if (!msgs || msgs.length === 0) {
+            temporalChatTranscript.innerHTML = '<div class="text-slate-500 text-xs">No messages yet.</div>';
+            _updateTemporalChatSendButtonState(agentName);
+            return;
+        }
+
+        temporalChatTranscript.innerHTML = '';
+        msgs.forEach(m => {
+            const role = m.role === 'assistant' ? 'Agent' : 'You';
+            const tickText = typeof m.tick !== 'undefined' && m.tick !== null ? ` (Tick ${escapeHtml(String(m.tick))})` : '';
+            const headerHtml = `<strong>[${role}${tickText}]</strong>`;
+            const content = String(m.content || "");
+            const thinkingContent = String(m.thinking_content || "");
+            const thinkingHtml = thinkingContent.trim()
+                ? `<div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
+                    <strong class="text-sky-500 block mb-1">Agent Thinking:</strong>
+                    <div class="whitespace-pre-wrap">${escapeHtml(thinkingContent)}</div>
+                </div>`
+                : '';
+            const rendered = renderMarkdownForDashboard(content);
+            const bubbleContentHtml = `${headerHtml}${thinkingHtml}<div class="mt-1 text-sm markdown-content-host">${rendered}</div>`;
+            const rawTextForCopy = thinkingContent.trim()
+                ? `Thinking:\n${thinkingContent}\n\nResponse:\n${content}`
+                : content;
+            const bubbleStyle = m.role === 'assistant' ? 'chat-bubble-agent' : 'chat-bubble-station';
+            temporalChatTranscript.appendChild(createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle, {
+                isCollapsible: false,
+                sourceType: m.role === 'assistant' ? 'agent' : 'station'
+            }));
+        });
+        temporalChatTranscript.scrollTop = temporalChatTranscript.scrollHeight;
+        _updateTemporalChatSendButtonState(agentName);
+    }
+
+    function _formatTemporalChatForCopy(agentName, includeThinking = true) {
+        // Copy only the visible temporal fork, not the hidden frozen station dialogue context.
+        const msgs = agentName ? _getTemporalChatMessages(agentName).filter(m => m && (m.role === 'user' || m.role === 'assistant')) : [];
+        if (!msgs || msgs.length === 0) return '';
+        return msgs.map(m => {
+            const role = m.role === 'assistant' ? 'Agent' : 'You';
+            const thinkingContent = String(m.thinking_content || '').trim();
+            const thinkingText = includeThinking && thinkingContent ? `Thinking:\n${thinkingContent}\n\n` : '';
+            return `${role}:\n${thinkingText}${String(m.content || '').trim()}\n`;
+        }).join('\n');
+    }
+
+    function _closeTemporalChatModal() {
+        hideModalWithoutReset(temporalChatModal, true);
+    }
+
+    function formatArchiveScore(score) {
+        if (score === null || typeof score === 'undefined' || score === '') return 'N/A';
+        const numericScore = Number(score);
+        return Number.isFinite(numericScore) ? `${numericScore}/10` : 'N/A';
+    }
+
+    function formatTopResearchScore(score) {
+        if (score === null || typeof score === 'undefined') return 'N/A';
+        if (typeof score !== 'number' && typeof score !== 'string') return String(score);
+
+        const rawScore = String(score).trim();
+        if (!rawScore) return 'N/A';
+
+        const numericPattern = /^[+-]?(?:(?:\d+\.?\d*)|(?:\.\d+))(?:[eE][+-]?\d+)?$/;
+        if (!numericPattern.test(rawScore)) return rawScore;
+
+        const numericScore = Number(rawScore);
+        if (!Number.isFinite(numericScore)) return rawScore;
+        if (Number.isInteger(numericScore)) return rawScore;
+
+        const decimalPlaces = 8;
+        const factor = 10 ** decimalPlaces;
+        const truncatedScore = Math.trunc(numericScore * factor) / factor;
+        return truncatedScore.toFixed(decimalPlaces);
+    }
+
+    function getArchiveSortValue(paper, key) {
+        const value = paper ? paper[key] : null;
+        if (key === 'numeric_id' || key === 'accepted_tick' || key === 'word_count') {
+            const numericValue = Number(value);
+            return Number.isFinite(numericValue) ? numericValue : -Infinity;
+        }
+        if (key === 'reviewer_score') {
+            const numericValue = Number(value);
+            return Number.isFinite(numericValue) ? numericValue : -Infinity;
+        }
+        return String(value || '').toLowerCase();
+    }
+
+    function sortArchivePapers() {
+        const { key, direction } = archiveSortState;
+        const multiplier = direction === 'asc' ? 1 : -1;
+        archivePapersCache.sort((a, b) => {
+            const aValue = getArchiveSortValue(a, key);
+            const bValue = getArchiveSortValue(b, key);
+            if (aValue < bValue) return -1 * multiplier;
+            if (aValue > bValue) return 1 * multiplier;
+            return (Number(b.numeric_id) || 0) - (Number(a.numeric_id) || 0);
+        });
+    }
+
+    function updateArchiveSortButtons() {
+        document.querySelectorAll('.archive-sort-button').forEach(button => {
+            const key = button.getAttribute('data-sort-key');
+            const label = (button.textContent || '').replace(/\s[↑↓]$/, '');
+            if (key === archiveSortState.key) {
+                button.textContent = `${label} ${archiveSortState.direction === 'asc' ? '↑' : '↓'}`;
+            } else {
+                button.textContent = label;
+            }
+        });
+    }
+
+    function setArchiveListLoadingState(message) {
+        if (!archivePapersTableBody) return;
+        archivePapersTableBody.innerHTML = `<tr><td colspan="6" class="archive-empty-state">${escapeHtml(message)}</td></tr>`;
+    }
+
+    function renderArchivePapersTable() {
+        if (!archivePapersTableBody) return;
+        if (!Array.isArray(archivePapersCache) || archivePapersCache.length === 0) {
+            setArchiveListLoadingState('No archive papers available.');
+            updateArchiveSortButtons();
+            return;
+        }
+
+        sortArchivePapers();
+        updateArchiveSortButtons();
+
+        const rows = archivePapersCache.map(paper => {
+            const title = escapeHtml(paper.title || 'Untitled');
+            const author = escapeHtml(paper.author || 'Unknown');
+            const acceptedTick = escapeHtml(String(paper.accepted_tick ?? 'N/A'));
+            const reviewerScore = formatArchiveScore(paper.reviewer_score);
+            const abstract = escapeHtml(String(paper.abstract || ''));
+            const abstractPreview = abstract.length > 220 ? `${abstract.slice(0, 220)}...` : abstract;
+            const scoreClass = reviewerScore === 'N/A' ? 'archive-reviewer-score na' : 'archive-reviewer-score';
+            return `
+                <tr class="archive-papers-row" data-archive-id="${paper.numeric_id}">
+                    <td>${paper.numeric_id}</td>
+                    <td class="archive-paper-title-cell">
+                        <strong>${title}</strong>
+                        <span>${abstractPreview || 'No abstract available.'}</span>
+                    </td>
+                    <td>${author}</td>
+                    <td>${acceptedTick}</td>
+                    <td><span class="${scoreClass}">${escapeHtml(reviewerScore)}</span></td>
+                    <td>${escapeHtml(String(paper.word_count ?? 0))}</td>
+                </tr>
+            `;
+        });
+
+        archivePapersTableBody.innerHTML = rows.join('');
+        archivePapersTableBody.querySelectorAll('.archive-papers-row').forEach(row => {
+            row.addEventListener('click', () => {
+                const numericId = Number(row.getAttribute('data-archive-id'));
+                if (Number.isFinite(numericId)) {
+                    void openArchivePaperDetail(numericId);
+                }
+            });
+        });
+    }
+
+    function showArchiveListView() {
+        if (archivePapersListView) archivePapersListView.classList.remove('hidden');
+        if (archivePaperDetailView) archivePaperDetailView.classList.add('hidden');
+    }
+
+    function showArchiveDetailView() {
+        if (archivePapersListView) archivePapersListView.classList.add('hidden');
+        if (archivePaperDetailView) archivePaperDetailView.classList.remove('hidden');
+    }
+
+    async function copyTextToClipboard(text, successMessage) {
+        try {
+            await navigator.clipboard.writeText(text);
+            showDashboardStatus(successMessage, 'success');
+        } catch (e) {
+            showDashboardStatus('Failed to copy to clipboard.', 'error');
+        }
+    }
+
+    function updateCopySystemPromptButtonState() {
+        if (!copySystemPromptButton) return;
+        const selectedAgent = agentSelectorDashboard ? agentSelectorDashboard.value : 'all';
+        copySystemPromptButton.disabled = !selectedAgent || selectedAgent === 'all';
+    }
+
+    function updateHistoryWindowSelector() {
+        if (!historyWindowSelector) return;
+        historyWindowSelector.value = historyWindowMode;
+        historyWindowSelector.disabled = currentSelectedAgentForDialogueView !== "all" && !!isLoadingHistoryForAgent;
+    }
+
+    function showHistoryWindowSelector(show) {
+        if (!historyWindowSelector) return;
+        historyWindowSelector.classList.toggle('hidden', !show);
+    }
+
+    function showLoadFullHistoryButton(show, text = 'Load Full History') {
+        if (!loadFullHistoryButton) return;
+        loadFullHistoryButton.textContent = text;
+        loadFullHistoryButton.classList.toggle('hidden', !show);
+    }
+
+    async function loadArchivePapers() {
+        setArchiveListLoadingState('Loading archive papers...');
+        const result = await fetchApi('/api/archive/papers', 'GET');
+        archivePapersCache = Array.isArray(result.capsules) ? result.capsules : [];
+        archiveAllAbstractsMarkdown = String(result.all_abstracts_markdown || '');
+        renderArchivePapersTable();
+    }
+
+    async function openArchivePaperDetail(numericId) {
+        showDashboardStatus(`Loading archive paper #${numericId}...`, 'info', 2000);
+        const result = await fetchApi(`/api/archive/papers/${numericId}`, 'GET');
+        archiveSelectedPaper = result;
+        if (archivePaperDetailTitle) {
+            archivePaperDetailTitle.textContent = result.title || `Archive Paper #${numericId}`;
+        }
+        if (archivePaperDetailMeta) {
+            const metaParts = [
+                `Author: ${result.author || 'Unknown'}`,
+                `Accepted Tick: ${result.accepted_tick ?? 'N/A'}`,
+                `Reviewer Score: ${formatArchiveScore(result.reviewer_score)}`
+            ];
+            archivePaperDetailMeta.textContent = metaParts.join(' | ');
+        }
+        if (archivePaperMarkdownContainer) {
+            archivePaperMarkdownContainer.innerHTML = renderMarkdownForDashboard(String(result.paper_markdown || ''));
+            archivePaperMarkdownContainer.scrollTop = 0;
+        }
+        showArchiveDetailView();
+    }
+
+    async function openArchivePapersModal() {
+        if (!archivePapersModal) return;
+        archiveSelectedPaper = null;
+        showArchiveListView();
+        archivePapersModal.style.display = 'block';
+        try {
+            await loadArchivePapers();
+        } catch (error) {
+            setArchiveListLoadingState('Failed to load archive papers.');
+        }
+    }
+
+    function formatAgentDisplayName(agent, options = {}) {
         const modelName = agent.model_name || "Unknown Model";
+        const supervisorLabel = agent.is_supervisor ? " [Supervisor]" : "";
+        const branchLabel = options.includeBranchMarker && agent.temporal_chat_exists && agent.temporal_chat_base_tick !== null && typeof agent.temporal_chat_base_tick !== 'undefined'
+            ? `; Branched from Tick ${agent.temporal_chat_base_tick}`
+            : "";
         
         // Handle ended/ascended agents
         let suffix = '';
@@ -172,13 +975,171 @@ document.addEventListener('DOMContentLoaded', () => {
             suffix = '; ascended';
         }
         
-        return `${agent.name} (${modelName}${suffix})`;
+        return `${agent.name} (${modelName}${suffix}${branchLabel})${supervisorLabel}`;
     }
 
-    function createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle) {
+    function getCurrentLogContainer() {
+        return currentSelectedAgentForDialogueView === "all" ? globalNotificationBubbleLog : agentSpecificBubbleLog;
+    }
+
+    function getPlainTextPreview(rawText, maxChars = 220) {
+        const text = String(rawText || '')
+            .replace(/\r\n/g, '\n')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+        if (!text) return '';
+        if (text.length <= maxChars) return text;
+        return `${text.slice(0, maxChars).trimEnd()}...`;
+    }
+
+    function shouldMakeMessageCollapsible(eventType, rawTextForCopy, bubbleStyle) {
+        if (bubbleStyle && bubbleStyle.includes('chat-bubble-error')) return false;
+        if (['error', 'stream_error', 'connector_error'].includes(eventType)) return false;
+
+        const rawText = String(rawTextForCopy || '');
+        if (!rawText.trim()) return false;
+
+        const lineCount = rawText.split(/\r\n|\r|\n/).length;
+        return rawText.length > 700 || lineCount > 8;
+    }
+
+    function getSourceKey(sourceType) {
+        return `${currentSelectedAgentForDialogueView || 'all'}:${sourceType}`;
+    }
+
+    function updateLogModeButtons() {
+        const buttons = [logModeFullButton, logModeCollapsedButton].filter(Boolean);
+        buttons.forEach(button => {
+            const isActive = button.dataset.logMode === logDisplayMode;
+            button.classList.toggle('log-display-mode-button-active', isActive);
+        });
+    }
+
+    function applyLogDisplayMode() {
+        [globalNotificationBubbleLog, agentSpecificBubbleLog].filter(Boolean).forEach(container => {
+            container.classList.remove('log-mode-full', 'log-mode-collapsed');
+            container.classList.add(`log-mode-${logDisplayMode}`);
+        });
+        updateLogModeButtons();
+        updateSourceToggleButtons();
+    }
+
+    function setCurrentLogExpandedState(expanded) {
+        const container = getCurrentLogContainer();
+        if (!container) return;
+        container.querySelectorAll('.log-message-collapsible').forEach(bubble => {
+            setLogMessageExpanded(bubble, expanded);
+        });
+    }
+
+    function setLogDisplayMode(mode) {
+        if (!LOG_MODES.includes(mode)) return;
+        logDisplayMode = mode;
+        localStorage.setItem(LOG_DISPLAY_MODE_STORAGE_KEY, mode);
+        ['agent', 'station'].forEach(sourceType => {
+            const sourceKey = getSourceKey(sourceType);
+            if (mode === 'full') collapsedSourceKeys.delete(sourceKey);
+            else collapsedSourceKeys.add(sourceKey);
+        });
+        applyLogDisplayMode();
+        setCurrentLogExpandedState(mode === 'full');
+    }
+
+    function syncLogMessageToggleText(bubbleWrapper) {
+        if (!bubbleWrapper) return;
+        const toggle = bubbleWrapper.querySelector('.log-message-toggle');
+        if (!toggle) return;
+        const isExpanded = bubbleWrapper.classList.contains('log-message-expanded');
+        toggle.textContent = isExpanded ? 'Collapse' : 'Expand';
+        toggle.setAttribute('aria-expanded', isExpanded ? 'true' : 'false');
+    }
+
+    function setLogMessageExpanded(bubbleWrapper, expanded) {
+        if (!bubbleWrapper || !bubbleWrapper.classList.contains('log-message-collapsible')) return;
+        const messageId = bubbleWrapper.dataset.messageId;
+        bubbleWrapper.classList.toggle('log-message-expanded', expanded);
+        if (messageId) {
+            if (expanded) expandedMessageIds.add(messageId);
+            else expandedMessageIds.delete(messageId);
+        }
+        syncLogMessageToggleText(bubbleWrapper);
+    }
+
+    function setCurrentLogSourceCollapsed(sourceType, collapsed) {
+        const container = getCurrentLogContainer();
+        if (!container) return;
+        const sourceKey = getSourceKey(sourceType);
+        if (collapsed) collapsedSourceKeys.add(sourceKey);
+        else collapsedSourceKeys.delete(sourceKey);
+
+        container.querySelectorAll(`.log-message-collapsible[data-source-type="${sourceType}"]`).forEach(bubble => {
+            setLogMessageExpanded(bubble, !collapsed);
+        });
+        updateSourceToggleButtons();
+    }
+
+    function isCurrentLogSourceCollapsed(sourceType) {
+        return collapsedSourceKeys.has(getSourceKey(sourceType));
+    }
+
+    function updateSourceToggleButtons() {
+        if (toggleAgentLogButton) {
+            const collapsed = isCurrentLogSourceCollapsed('agent');
+            toggleAgentLogButton.textContent = collapsed ? 'Expand Agent' : 'Collapse Agent';
+        }
+        if (toggleStationLogButton) {
+            const collapsed = isCurrentLogSourceCollapsed('station');
+            toggleStationLogButton.textContent = collapsed ? 'Expand Station' : 'Collapse Station';
+        }
+    }
+
+    function createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle, options = {}) {
         const bubbleWrapper = document.createElement('div');
         bubbleWrapper.classList.add('chat-bubble', 'text-sm', ...bubbleStyle.split(' '));
-        bubbleWrapper.innerHTML = bubbleContentHtml;
+        bubbleWrapper.classList.add('log-message-shell');
+
+        const eventType = options.eventType || '';
+        const isCollapsible = options.isCollapsible !== undefined
+            ? options.isCollapsible
+            : shouldMakeMessageCollapsible(eventType, rawTextForCopy, bubbleStyle);
+        const messageId = options.messageId || `log-message-${++logMessageSequence}`;
+        bubbleWrapper.dataset.messageId = messageId;
+        const sourceType = options.sourceType || 'station';
+        bubbleWrapper.dataset.sourceType = sourceType;
+        if (options.historyKey) {
+            bubbleWrapper.dataset.historyKey = options.historyKey;
+        }
+
+        if (isCollapsible) {
+            bubbleWrapper.classList.add('log-message-collapsible');
+            const sourceCollapsed = collapsedSourceKeys.has(getSourceKey(sourceType));
+            if (expandedMessageIds.has(messageId) || (logDisplayMode === 'full' && !sourceCollapsed)) {
+                bubbleWrapper.classList.add('log-message-expanded');
+            }
+
+            const preview = getPlainTextPreview(options.previewText || rawTextForCopy, 220);
+            let headerHtml = options.headerHtml || '';
+            let bodyHtml = bubbleContentHtml;
+            if (!headerHtml) {
+                const leadingStrongMatch = String(bubbleContentHtml).match(/^\s*(<strong>[\s\S]*?<\/strong>)([\s\S]*)$/);
+                if (leadingStrongMatch) {
+                    headerHtml = leadingStrongMatch[1];
+                    bodyHtml = leadingStrongMatch[2].trimStart();
+                }
+            }
+            bubbleWrapper.innerHTML = `
+                <div class="log-message-header">
+                    <div class="log-message-title">${headerHtml}</div>
+                    <button type="button" class="log-message-toggle">Expand</button>
+                </div>
+                <div class="log-message-preview">${escapeHtml(preview || '(empty message)')}</div>
+                <div class="log-message-body">${bodyHtml}</div>
+            `;
+            syncLogMessageToggleText(bubbleWrapper);
+        } else {
+            bubbleWrapper.innerHTML = bubbleContentHtml;
+        }
 
         if (rawTextForCopy && typeof rawTextForCopy === 'string' && rawTextForCopy.trim()) {
             const copyButton = document.createElement('button');
@@ -341,7 +1302,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (displayThisEvent) {
-            const bubbleWrapper = createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle);
+            const bubbleWrapper = createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle, {
+                eventType,
+                messageId: `global:${eventType}:${timestamp || Date.now()}:${++logMessageSequence}`,
+                sourceType: 'station'
+            });
             
             const initialMsg = globalNotificationBubbleLog.querySelector('.initial-log-message');
             if (initialMsg) {
@@ -416,13 +1381,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const timeStr = new Date(timestamp * 1000).toLocaleTimeString();
         let titlePrefix = `<strong>[${eventType.replace(/_/g, ' ').toUpperCase()} @ ${timeStr}]</strong>`; 
         let bubbleStyle = 'chat-bubble-system text-xs';
+        let sourceType = 'station';
 
         let thinkingHtml = "";
         const thinkingContent = data.thinking_text || data.historical_thinking_text; 
         if (thinkingContent && thinkingContent.trim() !== "") {
             thinkingHtml = `
                 <div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
-                    <strong class="text-sky-500 block mb-1">Thinking:</strong>
+                    <strong class="text-sky-500 block mb-1">Agent Thinking:</strong>
                     <div class="whitespace-pre-wrap">${escapeHtml(thinkingContent)}</div>
                 </div>
             `;
@@ -463,7 +1429,15 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'final_message_to_agent':
             case 'final_agent_response_to_human':
             case 'historical_log':
-                let dialogueMarkdownContent = String(data.text_content || data.content || "N/A (Content missing for Markdown rendering)");
+                const hasFullDialogueContent =
+                    (data.text_content !== undefined && data.text_content !== null && String(data.text_content) !== "") ||
+                    (data.content !== undefined && data.content !== null && String(data.content) !== "");
+                let dialogueMarkdownContent = "N/A (Content missing for Markdown rendering)";
+                if (hasFullDialogueContent) {
+                    dialogueMarkdownContent = String(data.text_content || data.content);
+                } else if (data.content_omitted) {
+                    dialogueMarkdownContent = "Content omitted from this live stream. Reload this agent's history to view the saved message.";
+                }
                 if (!thinkingHtml) { 
                     rawTextForCopy = dialogueMarkdownContent;
                 }
@@ -494,14 +1468,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
 
                 let headerText = `<strong>[${escapeHtml(speaker)} @ ${timeStr}] (Tick ${escapeHtml(String(data.tick || 'N/A'))})</strong>`;
-                if (eventType === 'llm_event' && data.type && data.type !== 'response' && 
-                    (data.type === 'internal_prompt' || data.type === 'internal_response')) {
+                if (eventType === 'llm_event' && data.type === 'internal_prompt') {
                      headerText += ` - ${escapeHtml(data.type.replace(/_/g, ' '))}`;
                 }
                 
                 bubbleContentHtml = `${headerText}${thinkingHtml}<div class="mt-1 text-sm markdown-content-host">${renderMarkdownForDashboard(dialogueMarkdownContent)}</div>`;
                 
                 bubbleStyle = (direction === 'to_llm') ? 'chat-bubble-station' : 'chat-bubble-agent';
+                sourceType = (direction === 'to_llm') ? 'station' : 'agent';
                 break;
 
             case 'submission_outcome': 
@@ -533,7 +1507,7 @@ document.addEventListener('DOMContentLoaded', () => {
                  if (!isHistorical && data.thinking_text && data.thinking_text.trim() !== "") {
                     liveInternalThinkingHtml = `
                         <div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
-                            <strong class="text-sky-500 block mb-1">Thinking (Internal):</strong>
+                            <strong class="text-sky-500 block mb-1">Agent Thinking (Internal):</strong>
                             <div class="whitespace-pre-wrap">${escapeHtml(data.thinking_text)}</div>
                         </div>
                     `;
@@ -581,11 +1555,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 return; 
         }
         
-        const bubbleWrapper = createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle);
+        const bubbleWrapper = createLogBubble(bubbleContentHtml, rawTextForCopy, bubbleStyle, {
+            eventType,
+            messageId: `agent:${currentSelectedAgentForDialogueView}:${eventType}:${timestamp || Date.now()}:${++logMessageSequence}`,
+            sourceType,
+            historyKey: eventData.historyKey
+        });
         
-        agentSpecificBubbleLog.appendChild(bubbleWrapper);
+        const appendTarget = (isHistorical && agentHistoryRenderFragment) ? agentHistoryRenderFragment : agentSpecificBubbleLog;
+        appendTarget.appendChild(bubbleWrapper);
 
-        if (isHistorical && agentSpecificBubbleLog.lastChild === bubbleWrapper) {
+        if (isHistorical && appendTarget === agentSpecificBubbleLog && agentSpecificBubbleLog.lastChild === bubbleWrapper) {
             agentSpecificBubbleLog.scrollTop = agentSpecificBubbleLog.scrollHeight;
         } else if (!isHistorical) {
             if (agentSpecificBubbleLog.scrollHeight - agentSpecificBubbleLog.scrollTop < agentSpecificBubbleLog.clientHeight + 350) {
@@ -649,6 +1629,10 @@ document.addEventListener('DOMContentLoaded', () => {
         
         // Create agent can work anytime since it doesn't conflict with running orchestrator
         if(createApiAgentModalButton) createApiAgentModalButton.disabled = false;
+
+        if (openTemporalChatModalButton) {
+            openTemporalChatModalButton.disabled = false;
+        }
         
         // End agent session can be requested at any time, unless the agent's session has already ended.
         if (endApiAgentSessionButton) {
@@ -666,27 +1650,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 endApiAgentSessionButton.textContent = "End Requested";
             } else {
                 endApiAgentSessionButton.disabled = (selectedAgentName === "all") || isEnded;
-                endApiAgentSessionButton.textContent = "End Selected Agent";
+                endApiAgentSessionButton.textContent = "End Agent";
             }
         }
         
-        const selectedAgentName = agentSelectorDashboard ? agentSelectorDashboard.value : "all";
-        const selectedAgentData = fullAgentListCache.find(a => a.name === selectedAgentName)
-
-        // Update Direct Message button (unified for living and ended agents)
+        // Update Intervene tool. Target selection now happens inside the modal.
         if (openDirectMessageModalButton) {
-            const isSpecificAgentSelected = selectedAgentName && selectedAgentName !== "all" && selectedAgentData;
-            if (isSpecificAgentSelected && !isDirectMessageInProgress) {
-                const isAscended = selectedAgentData.status.startsWith("Ascended");
-                const canSendDirectMessage = !isAscended; // Can message any agent except ascended
-                openDirectMessageModalButton.disabled = !canSendDirectMessage;
-            } else {
-                openDirectMessageModalButton.disabled = true;
-            }
+            openDirectMessageModalButton.disabled = isDirectMessageInProgress || buildDirectMessageTargetOptions().length === 0;
         }
 
         // Update Resolve Request button visibility (only show when selected agent has pending request)
         if (resolveHumanInterventionButton) {
+            const selectedAgentName = agentSelectorDashboard ? agentSelectorDashboard.value : "all";
             const isSpecificAgentSelected = selectedAgentName && selectedAgentName !== "all";
             const selectedAgentHasPendingRequest = isSpecificAgentSelected && 
                 status.agents_awaiting_human && 
@@ -719,7 +1694,21 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await fetchApi('/api/station/statistics');
             if (data.success && data.statistics) {
                 const stats = data.statistics;
-                
+
+                const formatJobLine = (exp) => {
+                    const elapsedMin = Math.floor((exp.elapsed_seconds || 0) / 60);
+                    const elapsedSec = (exp.elapsed_seconds || 0) % 60;
+                    const status = exp.status || 'unknown';
+                    const executionSource = (exp.job_type === 'archive_survey')
+                        ? 'archive surveyor'
+                        : exp.system_baseline
+                        ? 'system baseline'
+                        : ((exp.execution_source || 'coder') === 'direct' ? 'direct evaluator' : 'coder');
+                    const idLabel = exp.job_type === 'archive_survey'
+                        ? exp.evaluation_id
+                        : `Eval ${exp.evaluation_id}`;
+                    return `${idLabel}: ${exp.title} (${exp.agent_name}, ${status}, ${executionSource}, ${elapsedMin}m${elapsedSec}s)`;
+                };
                 // Update pending human requests
                 const pendingRequests = stats.pending_human_requests;
                 const requestCount = pendingRequests.request_ids.length;
@@ -735,33 +1724,48 @@ document.addEventListener('DOMContentLoaded', () => {
                     const agents = pendingRequests.agents.join(', ');
                     detailsElement.innerHTML = `IDs: ${requestIds}<br>Agents: ${agents}`;
                     detailsElement.classList.remove('hidden');
+                    setTooltipIfPresent('pending-requests-metric-card', `IDs: ${requestIds}\nAgents: ${agents}`);
                 } else if (detailsElement) {
                     detailsElement.classList.add('hidden');
+                    setTooltipIfPresent('pending-requests-metric-card', '');
                 }
                 
-                // Update running experiments
-                const runningCount = stats.running_experiments_count || 0;
-                const runningExperiments = stats.running_experiments || [];
+                // Update jobs
+                const runningCount = stats.running_jobs_count ?? stats.running_experiments_count ?? 0;
+                const runningJobs = stats.running_jobs || stats.running_experiments || [];
+                const queuedCount = stats.queued_jobs_count ?? stats.queued_experiments_count ?? 0;
+                const queuedJobs = stats.queued_jobs || stats.queued_experiments || [];
+                const totalJobsCount = runningCount + queuedCount;
                 const countElementRunning = document.getElementById('running-experiments-count');
                 const detailsElementRunning = document.getElementById('running-experiments-details');
                 
                 if (countElementRunning) {
-                    countElementRunning.textContent = runningCount > 0 ? runningCount : '0';
+                    countElementRunning.textContent = totalJobsCount > 0 ? totalJobsCount : '0';
                 }
                 
-                if (detailsElementRunning && runningCount > 0) {
-                    let detailsHtml = '';
-                    runningExperiments.forEach((exp, index) => {
-                        if (index > 0) detailsHtml += '<br>';
-                        const elapsedMin = Math.floor(exp.elapsed_seconds / 60);
-                        const elapsedSec = exp.elapsed_seconds % 60;
-                        detailsHtml += `ID ${exp.evaluation_id}: ${exp.title} (${exp.agent_name}, ${elapsedMin}m${elapsedSec}s)`;
-                    });
+                if (detailsElementRunning && totalJobsCount > 0) {
+                    const detailSections = [];
+                    if (runningJobs.length > 0) {
+                        detailSections.push(`Running: ${runningJobs.map(formatJobLine).join('<br>')}`);
+                    }
+                    if (queuedJobs.length > 0) {
+                        detailSections.push(`Queued: ${queuedJobs.map(formatJobLine).join('<br>')}`);
+                    }
+                    const detailsHtml = detailSections.join('<br>');
                     detailsElementRunning.innerHTML = detailsHtml;
                     detailsElementRunning.classList.remove('hidden');
+                    const tooltipSections = [];
+                    tooltipSections.push(`Running Jobs (${runningCount})`);
+                    tooltipSections.push(runningJobs.length > 0 ? runningJobs.map(formatJobLine).join('\n') : 'None');
+                    tooltipSections.push(`Queued Jobs (${queuedCount})`);
+                    tooltipSections.push(queuedJobs.length > 0 ? queuedJobs.map(formatJobLine).join('\n') : 'None');
+                    setTooltipIfPresent('running-experiments-metric-card', tooltipSections.join('\n'));
                 } else if (detailsElementRunning) {
                     detailsElementRunning.classList.add('hidden');
+                    setTooltipIfPresent('running-experiments-metric-card', '');
                 }
+
+                updateTickTimingFromStats(stats.tick_timing);
                 
                 // Update top research submission
                 const topSubmission = stats.top_research_submission;
@@ -770,21 +1774,48 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Check for both undefined and null to handle no-score mode
                 if (scoreElement && topSubmission && topSubmission !== null) {
-                    scoreElement.textContent = `Score: ${topSubmission.score}`;
+                    scoreElement.textContent = formatTopResearchScore(topSubmission.score);
+                    const currentTick = Number(stats.current_tick);
+                    const topSubmittedTick = Number(topSubmission.submitted_tick);
+                    const topScoreTickAge = Number.isFinite(currentTick) && Number.isFinite(topSubmittedTick)
+                        ? Math.max(0, currentTick - topSubmittedTick)
+                        : null;
+                    const topScoreAgeColor = getTopScoreAgeColor(topScoreTickAge);
+                    if (topScoreAgeColor) {
+                        scoreElement.style.setProperty('--top-score-age-color', topScoreAgeColor);
+                        scoreElement.style.color = topScoreAgeColor;
+                        scoreElement.classList.add('top-score-age-colored');
+                    } else {
+                        scoreElement.style.removeProperty('--top-score-age-color');
+                        scoreElement.style.color = '';
+                        scoreElement.classList.remove('top-score-age-colored');
+                    }
                     if (detailsElementResearch) {
                         detailsElementResearch.innerHTML = 
                             `ID: ${topSubmission.evaluation_id}<br>` +
                             `Title: ${topSubmission.title}<br>` +
                             `Agent: ${topSubmission.agent_name}<br>` +
-                            `Task: ${topSubmission.task_id}<br>` +
                             `Tick: ${topSubmission.submitted_tick}`;
                         detailsElementResearch.classList.remove('hidden');
                     }
+                    setTooltipIfPresent(
+                        'top-research-metric-card',
+                        `Score: ${topSubmission.score}\n` +
+                        `ID: ${topSubmission.evaluation_id}\n` +
+                        `Title: ${topSubmission.title || ''}\n` +
+                        `Agent: ${topSubmission.agent_name || ''}\n` +
+                        `Tick: ${topSubmission.submitted_tick ?? ''}\n` +
+                        `Ticks since last top score: ${topScoreTickAge === null ? 'N/A' : topScoreTickAge}`
+                    );
                 } else if (scoreElement) {
-                    scoreElement.textContent = '-';
+                    scoreElement.textContent = 'N/A';
+                    scoreElement.style.removeProperty('--top-score-age-color');
+                    scoreElement.style.color = '';
+                    scoreElement.classList.remove('top-score-age-colored');
                     if (detailsElementResearch) {
                         detailsElementResearch.classList.add('hidden');
                     }
+                    setTooltipIfPresent('top-research-metric-card', 'No scored research submission is available.');
                 }
             }
         } catch (error) {
@@ -830,7 +1861,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Update next agent display
                 if(orchestratorNextAgentDisplay) {
-                    if (status.is_running && !status.is_paused && !status.is_waiting && status.next_agent_to_act !== "N/A") {
+                    const syncMode = String(status.sync_mode || cachedSyncMode || 'parallel').trim().toLowerCase();
+                    const parallelStatusText = syncMode === 'parallel' ? formatParallelTickStatus(status.parallel_tick_status) : '';
+                    if (syncMode === 'parallel' && status.is_running && !status.is_paused && parallelStatusText) {
+                        orchestratorNextAgentDisplay.textContent = parallelStatusText;
+                    } else if (syncMode === 'parallel' && status.is_running && !status.is_paused && !status.is_waiting) {
+                        orchestratorNextAgentDisplay.textContent = "Parallel mode: preparing tick status...";
+                    } else if (status.is_running && !status.is_paused && !status.is_waiting && status.next_agent_to_act !== "N/A") {
                         orchestratorNextAgentDisplay.textContent = `Next: ${status.next_agent_to_act} (Index: ${status.next_agent_index})`;
                     } else if (status.is_waiting) {
                         orchestratorNextAgentDisplay.textContent = "Waiting for conditions to resolve...";
@@ -921,8 +1958,185 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else { 
                     agentSelectorDashboard.value = "all"; 
                 }
+                updateCopySystemPromptButtonState();
             }
         } catch (error) { console.error("Error fetching and populating agents:", error); }
+    }
+
+    function buildHistoryApiUrl(agentName, options = {}) {
+        const params = new URLSearchParams();
+        if (options.full) {
+            params.set('full', 'true');
+        } else {
+            params.set('window', options.window || historyWindowMode);
+            params.set('ticks', String(options.ticks || HISTORY_WINDOW_TICKS));
+        }
+        const query = params.toString();
+        return `/api/agent_dialogue_history/${encodeURIComponent(agentName)}${query ? `?${query}` : ''}`;
+    }
+
+    function captureAgentLogScrollAnchor() {
+        if (!agentSpecificBubbleLog) return null;
+        const containerRect = agentSpecificBubbleLog.getBoundingClientRect();
+        const bubbles = Array.from(agentSpecificBubbleLog.querySelectorAll('.chat-bubble[data-history-key]'));
+        for (const bubble of bubbles) {
+            const rect = bubble.getBoundingClientRect();
+            if (rect.bottom >= containerRect.top) {
+                return {
+                    historyKey: bubble.dataset.historyKey,
+                    offsetTop: rect.top - containerRect.top,
+                    fallbackScrollTop: agentSpecificBubbleLog.scrollTop,
+                };
+            }
+        }
+        return { historyKey: null, offsetTop: 0, fallbackScrollTop: agentSpecificBubbleLog.scrollTop };
+    }
+
+    function restoreAgentLogScrollAnchor(anchor) {
+        if (!agentSpecificBubbleLog || !anchor) return;
+        if (!anchor.historyKey) {
+            agentSpecificBubbleLog.scrollTop = anchor.fallbackScrollTop || 0;
+            return;
+        }
+        const escapedKey = (window.CSS && typeof window.CSS.escape === 'function')
+            ? window.CSS.escape(anchor.historyKey)
+            : String(anchor.historyKey).replace(/["\\]/g, '\\$&');
+        const bubble = agentSpecificBubbleLog.querySelector(`.chat-bubble[data-history-key="${escapedKey}"]`);
+        if (!bubble) {
+            agentSpecificBubbleLog.scrollTop = anchor.fallbackScrollTop || 0;
+            return;
+        }
+        const containerRect = agentSpecificBubbleLog.getBoundingClientRect();
+        const rect = bubble.getBoundingClientRect();
+        agentSpecificBubbleLog.scrollTop += (rect.top - containerRect.top) - anchor.offsetTop;
+    }
+
+    function captureCurrentSourceCollapseState() {
+        return {
+            agent: isCurrentLogSourceCollapsed('agent'),
+            station: isCurrentLogSourceCollapsed('station'),
+        };
+    }
+
+    function restoreCurrentSourceCollapseState(state) {
+        if (!state) return;
+        setCurrentLogSourceCollapsed('agent', !!state.agent);
+        setCurrentLogSourceCollapsed('station', !!state.station);
+    }
+
+    function getHistoryEntryKey(logEntry) {
+        const stableParts = [
+            logEntry.tick ?? 'no_tick',
+            logEntry.type || 'historical_log',
+            logEntry.speaker || '',
+            logEntry.interaction_id || '',
+            logEntry.internal_step ?? '',
+            String(logEntry.content || logEntry.text_content || logEntry.next_prompt || logEntry.completion_message || '').slice(0, 80),
+        ];
+        return stableParts.join('|');
+    }
+
+    function isHistoricalThinkingEntry(entryType) {
+        return entryType === 'thinking_block' ||
+            entryType === 'thinking_block_internal' ||
+            entryType === 'manual_llm_thinking_for_human';
+    }
+
+    function isStationSpeaker(speaker) {
+        return !!speaker && (speaker === 'Station' || String(speaker).startsWith('Station'));
+    }
+
+    function isHistoricalThinkingTarget(logEntry, pendingThinking) {
+        if (!pendingThinking) return false;
+        const entryType = logEntry.type || 'historical_log';
+        const targetTypes = new Set([
+            'submission',
+            'internal_response',
+            'manual_llm_response_to_human',
+            'final_agent_response_to_human',
+        ]);
+        if (!targetTypes.has(entryType)) return false;
+        if (isStationSpeaker(logEntry.speaker)) return false;
+
+        if (pendingThinking.tick !== undefined && pendingThinking.tick !== null &&
+            logEntry.tick !== undefined && logEntry.tick !== null &&
+            String(pendingThinking.tick) !== String(logEntry.tick)) {
+            return false;
+        }
+
+        const pendingAgent = pendingThinking.agent_name || currentSelectedAgentForDialogueView;
+        const entryAgent = logEntry.agent_name || currentSelectedAgentForDialogueView;
+        return !pendingAgent || !entryAgent || pendingAgent === entryAgent;
+    }
+
+    function renderHistoryEntries(historyToDisplay) {
+        let pendingHistoricalThinking = null;
+        const previousHistoryRenderFragment = agentHistoryRenderFragment;
+        agentHistoryRenderFragment = document.createDocumentFragment();
+
+        try {
+            historyToDisplay.forEach((logEntry) => {
+                const entryType = logEntry.type || 'historical_log';
+
+                if (isHistoricalThinkingEntry(entryType)) {
+                    pendingHistoricalThinking = {
+                        text: String(logEntry.content || ""),
+                        tick: logEntry.tick,
+                        agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
+                    };
+                    return;
+                }
+
+                const attachedHistoricalThinking = isHistoricalThinkingTarget(logEntry, pendingHistoricalThinking)
+                    ? pendingHistoricalThinking.text
+                    : null;
+                pendingHistoricalThinking = null;
+
+                const sseLikeEventData = {
+                    event: entryType,
+                    historyKey: getHistoryEntryKey(logEntry),
+                    data: {
+                        agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
+                        tick: logEntry.tick,
+                        speaker: logEntry.speaker,
+                        text_content: logEntry.text_content || logEntry.content,
+                        content: logEntry.content,
+                        actions_executed_summary: logEntry.actions_executed_summary,
+                        error: logEntry.error,
+                        internal_action_initiated: logEntry.internal_action_initiated,
+                        status: logEntry.status,
+                        handler: logEntry.handler,
+                        direction: logEntry.direction,
+                        type: logEntry.type,
+                        snippet: logEntry.snippet,
+                        full_length: logEntry.full_length,
+                        interaction_id: logEntry.interaction_id,
+                        next_prompt: logEntry.next_prompt,
+                        actions_executed_in_step: logEntry.actions_executed_in_step,
+                        completion_message: logEntry.completion_message,
+                        token_info: logEntry.token_info,
+                        historical_thinking_text: attachedHistoricalThinking,
+                        ...(logEntry.data && typeof logEntry.data === 'object' ? logEntry.data : {})
+                    },
+                    timestamp: logEntry.timestamp || (logEntry.tick !== undefined ? (Date.now()/1000 - (200000 - logEntry.tick*1000 - (logEntry.internal_step || 0)*10 )) : Date.now()/1000)
+                };
+
+                if(logEntry.content && !sseLikeEventData.data.text_content) {
+                    sseLikeEventData.data.text_content = logEntry.content;
+                }
+                if(logEntry.next_prompt && (entryType === 'internal_outcome') && !sseLikeEventData.data.text_content) {
+                    sseLikeEventData.data.text_content = logEntry.next_prompt;
+                }
+                addMessageToAgentBubbleLog(sseLikeEventData, true);
+            });
+
+            if (agentSpecificBubbleLog && agentHistoryRenderFragment.childNodes.length > 0) {
+                agentSpecificBubbleLog.appendChild(agentHistoryRenderFragment);
+                agentSpecificBubbleLog.scrollTop = agentSpecificBubbleLog.scrollHeight;
+            }
+        } finally {
+            agentHistoryRenderFragment = previousHistoryRenderFragment;
+        }
     }
 
     async function handleAgentDialogueViewChange(loadFullHistory = false) {
@@ -935,17 +2149,16 @@ document.addEventListener('DOMContentLoaded', () => {
         const wasLoadingAgent = isLoadingHistoryForAgent;
         isLoadingHistoryForAgent = (newSelectedAgent !== "all") ? newSelectedAgent : null; 
         currentSelectedAgentForDialogueView = newSelectedAgent;
-        let pendingHistoricalThinking = null;
+        updateHistoryWindowSelector();
 
-        if (loadFullHistoryButton) {
-            loadFullHistoryButton.classList.add('hidden');
-        }
+        showLoadFullHistoryButton(false);
 
         if (currentSelectedAgentForDialogueView === "all") {
             globalNotificationBubbleLog.style.display = "flex";
             agentSpecificBubbleLog.style.display = "none";
             logViewTitle.textContent = "Global Notifications";
             isLoadingHistoryForAgent = null; 
+            showHistoryWindowSelector(true);
         } else {
             globalNotificationBubbleLog.style.display = "none";
             agentSpecificBubbleLog.style.display = "flex"; 
@@ -959,9 +2172,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 agentSpecificBubbleLog.appendChild(initialMessageDiv);
             }
 
-            showDashboardStatus(`Loading history for ${currentSelectedAgentForDialogueView}...`, 'info', 0); 
+            showDashboardStatus(`Loading ${historyWindowMode} ${HISTORY_WINDOW_TICKS} tick history for ${currentSelectedAgentForDialogueView}...`, 'info', 0);
             try {
-                const apiUrl = `/api/agent_dialogue_history/${currentSelectedAgentForDialogueView}${loadFullHistory ? '?full=true' : ''}`;
+                const apiUrl = buildHistoryApiUrl(currentSelectedAgentForDialogueView, { full: loadFullHistory });
                 const apiData = await fetchApi(apiUrl);
                 
                 if (currentSelectedAgentForDialogueView !== newSelectedAgent) {
@@ -976,86 +2189,36 @@ document.addEventListener('DOMContentLoaded', () => {
                 let historyToDisplay = [];
                 
                 if (apiData.success && apiData.history) {
-                    fullDialogueHistoryCache[currentSelectedAgentForDialogueView] = apiData.history;
+                    if (loadFullHistory) {
+                        fullDialogueHistoryCache[currentSelectedAgentForDialogueView] = apiData.history;
+                    } else {
+                        delete fullDialogueHistoryCache[currentSelectedAgentForDialogueView];
+                    }
                     historyToDisplay = apiData.history;
                     
                     if (apiData.history.length === 0) {
                         addMessageToAgentBubbleLog({event: "system_message", data: {message: `No dialogue history found for ${currentSelectedAgentForDialogueView}. New live messages for this agent will be appended.`}, timestamp: Date.now()/1000}, true);
                     } else {
-                        if (apiData.is_truncated) {
-                             if (loadFullHistoryButton) {
-                                loadFullHistoryButton.classList.remove('hidden');
-                            }
+                        const isPartialWindow = !!(apiData.range && apiData.range.is_partial);
+                        if (apiData.is_truncated || isPartialWindow) {
+                            showHistoryWindowSelector(false);
+                            showLoadFullHistoryButton(true, 'Load Full History');
                             addMessageToAgentBubbleLog({
                                 event: "system_message", 
-                                data: { message: `Showing recent dialogue history. Click 'Load Full History' to see all entries.` }, 
+                                data: { message: `Showing ${historyWindowMode} ${HISTORY_WINDOW_TICKS} tick dialogue history. Click 'Load Full History' to load the full history in the background.` },
                                 timestamp: Date.now()/1000
                             }, true);
                         }
                         
-                        historyToDisplay.forEach(logEntry => {
-                            const entryType = logEntry.type || 'historical_log';
-                            
-                            if (entryType === 'thinking_block' || entryType === 'thinking_block_internal' || entryType === 'manual_llm_thinking_for_human') {
-                                pendingHistoricalThinking = String(logEntry.content || "");
-                                return;
-                            }
-
-                            const sseLikeEventData = { 
-                                event: entryType, 
-                                data: { 
-                                    agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView, 
-                                    tick: logEntry.tick,
-                                    speaker: logEntry.speaker, 
-                                    text_content: logEntry.text_content || logEntry.content, 
-                                    content: logEntry.content,
-                                    actions_executed_summary: logEntry.actions_executed_summary,
-                                    error: logEntry.error, 
-                                    internal_action_initiated: logEntry.internal_action_initiated,
-                                    status: logEntry.status, 
-                                    handler: logEntry.handler,
-                                    direction: logEntry.direction, 
-                                    type: logEntry.type,
-                                    snippet: logEntry.snippet, 
-                                    full_length: logEntry.full_length,
-                                    interaction_id: logEntry.interaction_id,
-                                    next_prompt: logEntry.next_prompt, 
-                                    actions_executed_in_step: logEntry.actions_executed_in_step, 
-                                    completion_message: logEntry.completion_message,
-                                    token_info: logEntry.token_info,
-                                    historical_thinking_text: pendingHistoricalThinking,
-                                    ...(logEntry.data && typeof logEntry.data === 'object' ? logEntry.data : {})
-                                },
-                                timestamp: logEntry.timestamp || (logEntry.tick !== undefined ? (Date.now()/1000 - (200000 - logEntry.tick*1000 - (logEntry.internal_step || 0)*10 )) : Date.now()/1000) 
-                            };
-                            
-                            pendingHistoricalThinking = null; 
-
-                            if(logEntry.content && !sseLikeEventData.data.text_content) {
-                                sseLikeEventData.data.text_content = logEntry.content;
-                            }
-                            if(logEntry.next_prompt && (entryType === 'internal_outcome') && !sseLikeEventData.data.text_content) {
-                                sseLikeEventData.data.text_content = logEntry.next_prompt;
-                            }
-                            addMessageToAgentBubbleLog(sseLikeEventData, true);
-                        });
-
-                        if (pendingHistoricalThinking) {
-                             addMessageToAgentBubbleLog({
-                                event: "thinking_block",
-                                data: {
-                                    agent_name: currentSelectedAgentForDialogueView,
-                                    tick: "N/A",
-                                    speaker: "AgentLLM (Orphaned Thinking)",
-                                    content: pendingHistoricalThinking,
-                                    historical_thinking_text: pendingHistoricalThinking
-                                },
-                                timestamp: Date.now()/1000
-                            }, true);
-                            pendingHistoricalThinking = null;
+                        renderHistoryEntries(historyToDisplay);
+                        if (!loadFullHistory && historyWindowMode === 'earliest') {
+                            agentSpecificBubbleLog.scrollTop = 0;
                         }
                     }
-                    showDashboardStatus(`History loaded for ${currentSelectedAgentForDialogueView} (${historyToDisplay.length} entries).`, 'success');
+                    const rangeText = apiData.range && apiData.range.mode !== 'full'
+                        ? ` (${apiData.range.mode} ${apiData.range.ticks} ticks)`
+                        : '';
+                    showDashboardStatus(`History loaded for ${currentSelectedAgentForDialogueView}${rangeText} (${historyToDisplay.length} entries).`, 'success');
                 } else {
                     showDashboardStatus(apiData.error || `Failed to load history for ${currentSelectedAgentForDialogueView}.`, 'error');
                      addMessageToAgentBubbleLog({event: "error", data: {message: `Failed to load history for ${currentSelectedAgentForDialogueView}. ${apiData.error || ''}`}, timestamp: Date.now()/1000}, true);
@@ -1069,30 +2232,84 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
         }
+        updateSourceToggleButtons();
         getOrchestratorStatus(); 
+    }
+
+    async function loadFullHistoryInBackground() {
+        if (!currentSelectedAgentForDialogueView || currentSelectedAgentForDialogueView === "all") return;
+        const agentName = currentSelectedAgentForDialogueView;
+        const cachedFullHistory = fullDialogueHistoryCache[agentName];
+        if (Array.isArray(cachedFullHistory) && cachedFullHistory.length > 0) {
+            const scrollAnchor = captureAgentLogScrollAnchor();
+            const sourceCollapseState = captureCurrentSourceCollapseState();
+            agentSpecificBubbleLog.innerHTML = '';
+            renderHistoryEntries(cachedFullHistory);
+            restoreCurrentSourceCollapseState(sourceCollapseState);
+            restoreAgentLogScrollAnchor(scrollAnchor);
+            showLoadFullHistoryButton(false, 'Load Full History');
+            showHistoryWindowSelector(false);
+            showDashboardStatus(`Showing full history for ${agentName} (${cachedFullHistory.length} entries).`, 'success');
+            return;
+        }
+        if (backgroundHistoryLoads.get(agentName)) {
+            showDashboardStatus(`Full history is already loading for ${agentName}.`, 'info');
+            return;
+        }
+
+        backgroundHistoryLoads.set(agentName, true);
+        if (loadFullHistoryButton) {
+            loadFullHistoryButton.disabled = true;
+            loadFullHistoryButton.textContent = 'Loading Full...';
+        }
+        showDashboardStatus(`Loading full history for ${agentName} in the background...`, 'info', 0);
+
+        try {
+            const apiData = await fetchApi(buildHistoryApiUrl(agentName, { full: true }));
+            if (!apiData.success || !apiData.history) {
+                showDashboardStatus(apiData.error || `Failed to load full history for ${agentName}.`, 'error');
+                return;
+            }
+
+            fullDialogueHistoryCache[agentName] = apiData.history;
+            if (currentSelectedAgentForDialogueView === agentName) {
+                const scrollAnchor = captureAgentLogScrollAnchor();
+                const sourceCollapseState = captureCurrentSourceCollapseState();
+                agentSpecificBubbleLog.innerHTML = '';
+                renderHistoryEntries(apiData.history);
+                restoreCurrentSourceCollapseState(sourceCollapseState);
+                restoreAgentLogScrollAnchor(scrollAnchor);
+                showLoadFullHistoryButton(false, 'Load Full History');
+                showHistoryWindowSelector(false);
+            }
+            showDashboardStatus(`Full history loaded for ${agentName} (${apiData.history.length} entries).`, 'success');
+        } catch (error) {
+            console.error(`Error loading full history for ${agentName}:`, error);
+        } finally {
+            backgroundHistoryLoads.delete(agentName);
+            if (loadFullHistoryButton) {
+                loadFullHistoryButton.disabled = false;
+                if (!loadFullHistoryButton.classList.contains('hidden')) {
+                    loadFullHistoryButton.textContent = 'Load Full History';
+                }
+            }
+        }
     }
     
     // Fetch recent events for polling mode (fallback when SSE fails)
     async function fetchRecentEvents() {
         try {
-            const data = await fetchApi('/api/orchestrator/recent_events');
+            const data = await fetchApi(buildRecentEventsEndpoint());
             if (data.success && data.events) {
-                // Process each event EXACTLY like SSE onmessage would
                 data.events.forEach(eventData => {
                     const { event: topLevelEventType, data: ssePayload, timestamp } = eventData;
-                    
-                    // Debug: Log what types of events we're getting
-                    console.log(`DASHBOARD.JS DEBUG: Processing event type: ${topLevelEventType}`, eventData);
-                    
-                    // Always log to global notifications (EXACT COPY from SSE)
+
                     addMessageToGlobalNotificationBubbleLog(eventData); 
 
-                    // Conditional logging to agent-specific bubble log (EXACT COPY from SSE)
                     if (currentSelectedAgentForDialogueView !== "all" && 
                         ssePayload.agent_name === currentSelectedAgentForDialogueView &&
                         !isLoadingHistoryForAgent) { 
                         
-                        // --- EXACT COPY from SSE: Handle new SSE event types for manual/final chat ---
                         if (topLevelEventType === 'human_assist_event') {
                             if (ssePayload.type === 'manual_message_human_part_sent') {
                                 const humanMessageEvent = {
@@ -1153,43 +2370,72 @@ document.addEventListener('DOMContentLoaded', () => {
                             }
                             // Errors in final_chat_event are handled by global log or if status indicates error
                         } else {
-                            // For other existing events like 'llm_event', 'observation', etc. (EXACT COPY from SSE)
-                            console.log(`DASHBOARD.JS DEBUG: Adding agent-specific event for ${ssePayload.agent_name}:`, eventData);
                             addMessageToAgentBubbleLog(eventData, false);
                         }
-                        // --- END EXACT COPY ---
                     }
                 });
-                
-                console.log(`DASHBOARD.JS DEBUG: Processed ${data.events.length} events in polling mode`);
-                console.log(`DASHBOARD.JS DEBUG: Current selected agent: ${currentSelectedAgentForDialogueView}`);
             }
         } catch (error) {
-            console.error("DASHBOARD.JS DEBUG: Error fetching recent events:", error);
+            console.error("Error fetching recent events:", error);
         }
+    }
+
+    function selectedAgentStreamParam() {
+        return encodeURIComponent(currentSelectedAgentForDialogueView || 'all');
+    }
+
+    function buildLiveLogStreamEndpoint() {
+        return `/api/orchestrator/live_log_stream?agent_name=${selectedAgentStreamParam()}`;
+    }
+
+    function buildRecentEventsEndpoint() {
+        return `/api/orchestrator/recent_events?agent_name=${selectedAgentStreamParam()}`;
+    }
+
+    function stopPollingFallback() {
+        if (pollingFallbackInterval) {
+            clearInterval(pollingFallbackInterval);
+            pollingFallbackInterval = null;
+        }
+    }
+
+    function startPollingFallback() {
+        if (pollingFallbackInterval) {
+            return;
+        }
+        getOrchestratorStatus();
+        fetchRecentEvents();
+        pollingFallbackInterval = setInterval(() => {
+            getOrchestratorStatus();
+            fetchRecentEvents();
+        }, 3000);
     }
     
     function connectSseLogStream() {
         if (sseSource) { sseSource.close(); }
+        stopPollingFallback();
 
-        const sseEndpoint = '/api/orchestrator/live_log_stream';
-        console.log("DASHBOARD.JS DEBUG: Attempting to connect to SSE stream:", sseEndpoint);
+        const sseEndpoint = buildLiveLogStreamEndpoint();
         
         try {
             sseSource = new EventSource(sseEndpoint);
         } catch (error) {
-            console.error("DASHBOARD.JS DEBUG: Failed to create EventSource:", error);
+            console.error("Failed to create EventSource:", error);
             addMessageToGlobalNotificationBubbleLog({
                 event: "stream_status",
                 data: { message: "Failed to create SSE connection" },
                 timestamp: Date.now() / 1000
             });
+            startPollingFallback();
             return;
         }
+        const activeSource = sseSource;
         
         // Set a timeout for SSE connection
         const connectionTimeout = setTimeout(() => {
-            console.log("DASHBOARD.JS DEBUG: SSE connection timeout, falling back to polling");
+            if (sseSource !== activeSource) {
+                return;
+            }
             if (sseSource) {
                 sseSource.close();
                 sseSource = null;
@@ -1199,14 +2445,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 data: { message: "SSE connection timeout, switching to polling mode" },
                 timestamp: Date.now() / 1000
             });
-            setInterval(() => {
-                getOrchestratorStatus();
-            }, 3000);
+            startPollingFallback();
         }, 5000); // 5 second timeout
-        
+
         sseSource.onopen = function(event) {
+            if (sseSource !== activeSource) {
+                return;
+            }
             clearTimeout(connectionTimeout); // Cancel timeout if connection succeeds
-            console.log("DASHBOARD.JS DEBUG: SSE connection opened");
+            stopPollingFallback();
             addMessageToGlobalNotificationBubbleLog({
                 event: "stream_status", 
                 data: {message: "SSE live log stream connected."}, 
@@ -1215,6 +2462,9 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         sseSource.onmessage = function(event) {
+            if (sseSource !== activeSource) {
+                return;
+            }
             try {
                 const eventData = JSON.parse(event.data); 
                 const { event: topLevelEventType, data: ssePayload, timestamp } = eventData; 
@@ -1227,7 +2477,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     ssePayload.agent_name === currentSelectedAgentForDialogueView &&
                     !isLoadingHistoryForAgent) { 
                     
-                    // --- MODIFICATION START: Handle new SSE event types for manual/final chat ---
                     if (topLevelEventType === 'human_assist_event') {
                         if (ssePayload.type === 'manual_message_human_part_sent') {
                             const humanMessageEvent = {
@@ -1291,7 +2540,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         // For other existing events like 'llm_event', 'observation', etc.
                         addMessageToAgentBubbleLog(eventData, false);
                     }
-                    // --- MODIFICATION END ---
                 }
 
                 // UI updates for orchestrator status, agent list, etc. (as before)
@@ -1316,7 +2564,11 @@ document.addEventListener('DOMContentLoaded', () => {
         }; // End of sseSource.onmessage
 
         sseSource.onerror = function(error) {
-            console.error("DASHBOARD.JS DEBUG: SSE connection error:", error);
+            if (sseSource !== activeSource) {
+                return;
+            }
+            clearTimeout(connectionTimeout);
+            console.error("SSE connection error:", error);
             const errorMessage = "Live log stream connection error. Falling back to polling mode.";
 
             const errorData = {event: "error", data: {message: errorMessage}, timestamp: Date.now()/1000};
@@ -1331,16 +2583,50 @@ document.addEventListener('DOMContentLoaded', () => {
             if(sseSource) { sseSource.close(); sseSource = null; }
             
             // Fallback to polling for ANY SSE error.
-            console.log("DASHBOARD.JS DEBUG: Falling back to polling mode due to SSE error.");
-            setInterval(() => {
-                getOrchestratorStatus();
-                fetchRecentEvents(); 
-            }, 3000);
+            startPollingFallback();
         };
     }
 
 
     // --- Event Listeners Setup ---
+
+    if (dashboardStatusMessages) {
+        dashboardStatusMessages.addEventListener('click', hideDashboardStatus);
+        dashboardStatusMessages.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === 'Escape' || event.key === ' ') {
+                event.preventDefault();
+                hideDashboardStatus();
+            }
+        });
+    }
+
+    [logModeFullButton, logModeCollapsedButton].filter(Boolean).forEach(button => {
+        button.addEventListener('click', () => setLogDisplayMode(button.dataset.logMode));
+    });
+
+    [globalNotificationBubbleLog, agentSpecificBubbleLog].filter(Boolean).forEach(container => {
+        container.addEventListener('click', (event) => {
+            const toggle = event.target.closest('.log-message-toggle');
+            if (!toggle) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const bubble = toggle.closest('.log-message-collapsible');
+            if (!bubble) return;
+            setLogMessageExpanded(bubble, !bubble.classList.contains('log-message-expanded'));
+        });
+    });
+
+    if (toggleAgentLogButton) {
+        toggleAgentLogButton.addEventListener('click', () => {
+            setCurrentLogSourceCollapsed('agent', !isCurrentLogSourceCollapsed('agent'));
+        });
+    }
+
+    if (toggleStationLogButton) {
+        toggleStationLogButton.addEventListener('click', () => {
+            setCurrentLogSourceCollapsed('station', !isCurrentLogSourceCollapsed('station'));
+        });
+    }
     
     if (startLoopButton) startLoopButton.addEventListener('click', async () => { 
         showDashboardStatus('Launching station...', 'info');
@@ -1375,7 +2661,36 @@ document.addEventListener('DOMContentLoaded', () => {
         try { const data = await fetchApi('/api/orchestrator/stop', 'POST'); showDashboardStatus(data.message, data.success ? 'success' : 'error'); getOrchestratorStatus(); } catch (error) {}
     });
 
-    if (agentSelectorDashboard) agentSelectorDashboard.addEventListener('change', () => handleAgentDialogueViewChange());
+    if (agentSelectorDashboard) agentSelectorDashboard.addEventListener('change', () => {
+        handleAgentDialogueViewChange();
+        connectSseLogStream();
+    });
+    if (agentSelectorDashboard) agentSelectorDashboard.addEventListener('change', updateCopySystemPromptButtonState);
+
+    if (copySystemPromptButton) {
+        copySystemPromptButton.addEventListener('click', async () => {
+            const selectedAgent = agentSelectorDashboard ? agentSelectorDashboard.value : null;
+            if (!selectedAgent || selectedAgent === 'all') {
+                showDashboardStatus('Select a specific agent to copy its system prompt.', 'error');
+                updateCopySystemPromptButtonState();
+                return;
+            }
+
+            try {
+                const result = await fetchApi(`/api/agent/${encodeURIComponent(selectedAgent)}/system_prompt`, 'GET');
+                const systemPrompt = String(result.system_prompt || '');
+                if (!systemPrompt.trim()) {
+                    showDashboardStatus(`No system prompt available for ${selectedAgent}.`, 'info');
+                    return;
+                }
+                const promptLabel = selectedAgent === 'Reviewer' ? 'Reviewer Prompt' : `System Prompt for ${selectedAgent}`;
+                const labeledSystemPrompt = `${promptLabel}:\n\n${systemPrompt}`;
+                await copyTextToClipboard(labeledSystemPrompt, `${promptLabel} copied.`);
+            } catch (error) {
+                // fetchApi already surfaced the error
+            }
+        });
+    }
     
     if (clearLogButton) clearLogButton.addEventListener('click', () => {
         if (currentSelectedAgentForDialogueView === "all") {
@@ -1390,18 +2705,31 @@ document.addEventListener('DOMContentLoaded', () => {
     
     if (loadFullHistoryButton) loadFullHistoryButton.addEventListener('click', () => {
         if (currentSelectedAgentForDialogueView && currentSelectedAgentForDialogueView !== "all") {
-            showDashboardStatus("Loading full dialogue history...", 'info');
-            handleAgentDialogueViewChange(true); // Pass true to load full history
+            loadFullHistoryInBackground();
         }
     });
+
+    if (historyWindowSelector) {
+        historyWindowSelector.value = historyWindowMode;
+        historyWindowSelector.addEventListener('change', () => {
+            const nextMode = historyWindowSelector.value;
+            if (!['recent', 'earliest'].includes(nextMode)) return;
+            historyWindowMode = nextMode;
+            localStorage.setItem(HISTORY_WINDOW_STORAGE_KEY, historyWindowMode);
+            if (currentSelectedAgentForDialogueView && currentSelectedAgentForDialogueView !== "all") {
+                handleAgentDialogueViewChange(false);
+            }
+        });
+    }
     
     if (createApiAgentModalButton) createApiAgentModalButton.addEventListener('click', () => {
+        const restoreDraft = consumeBackdropDraftFlag(createApiAgentModal);
         if(createApiAgentModal) createApiAgentModal.style.display = "block";
         const modelNameInput = document.getElementById('api-model-name');
         if(modelNameInput) modelNameInput.focus();
 
         // Populate presets
-        if (apiModelPreset && typeof MODEL_PRESETS !== 'undefined') {
+        if (!restoreDraft && apiModelPreset && typeof MODEL_PRESETS !== 'undefined') {
             apiModelPreset.innerHTML = '<option value="">-- Select a Preset --</option>';
             MODEL_PRESETS.forEach((preset, index) => {
                 const option = document.createElement('option');
@@ -1427,7 +2755,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     form.querySelector('[name="model_provider_class"]').value = preset.model_provider_class || '';
                     form.querySelector('[name="model_name"]').value = preset.model_name || '';
                     form.querySelector('[name="initial_tokens_max"]').value = preset.initial_tokens_max || '';
-                    form.querySelector('[name="llm_system_prompt"]').value = preset.llm_system_prompt || '';
+                    form.querySelector('[name="llm_system_prompt"]').value =
+                        preset.role_definition || preset.llm_system_prompt || '';
 
                     // Update OpenAI params visibility after preset changes provider
                     if (updateOpenAIParamsVisibility) {
@@ -1438,7 +2767,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
     
-    if (closeApiModalButton) closeApiModalButton.addEventListener('click', () => { if(createApiAgentModal) createApiAgentModal.style.display = "none"; });
+    if (closeApiModalButton) closeApiModalButton.addEventListener('click', () => { hideModalWithoutReset(createApiAgentModal, true); });
     if (apiAgentTypeSelect) apiAgentTypeSelect.addEventListener('change', (e) => {
         if(apiRecursiveFieldsDiv) apiRecursiveFieldsDiv.classList.toggle('hidden', e.target.value !== "Recursive Agent");
     });
@@ -1465,6 +2794,12 @@ document.addEventListener('DOMContentLoaded', () => {
         event.preventDefault();
         const formData = new FormData(createApiAgentForm);
         const data = Object.fromEntries(formData.entries());
+        const agentCountRaw = data.agent_count;
+        let agentCount = parseInt(agentCountRaw, 10);
+        if (!Number.isInteger(agentCount) || agentCount < 1) {
+            agentCount = 1;
+        }
+        delete data.agent_count;
         if (data.generation) data.generation = parseInt(data.generation, 10); else delete data.generation;
         if (data.llm_temperature) data.llm_temperature = parseFloat(data.llm_temperature); else delete data.llm_temperature;
         if (data.llm_max_tokens) data.llm_max_tokens = parseInt(data.llm_max_tokens, 10); else delete data.llm_max_tokens;
@@ -1487,85 +2822,74 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (data.agent_type !== "Recursive Agent") { delete data.lineage; delete data.generation; }
-        else { if (!data.agent_name && (!data.lineage || (data.generation === null || data.generation === undefined || isNaN(data.generation)))) {
-                 showDashboardStatus("For Recursive type with auto-name, Lineage and Generation are required.", "error"); return; }}
-        
-        showDashboardStatus('Creating API agent...', 'info');
+        else {
+            if (!data.agent_name && (!data.lineage || (data.generation === null || data.generation === undefined || isNaN(data.generation)))) {
+                showDashboardStatus("For Recursive type with auto-name, Lineage and Generation are required.", "error"); return;
+            }
+            if (agentCount > 1 && !data.agent_name) {
+                showDashboardStatus("For multiple recursive agents, please provide an Agent Name base.", "error"); return;
+            }
+        }
+
+        const agentLabel = agentCount === 1 ? "agent" : "agents";
+        showDashboardStatus(`Creating ${agentCount} ${agentLabel}...`, 'info');
         try {
-            const result = await fetchApi('/api/orchestrator/add_agent', 'POST', data); 
-            showDashboardStatus(result.message, result.success ? 'success' : 'error');
-            if (result.success) {
-                if(createApiAgentModal) createApiAgentModal.style.display = "none";
-                createApiAgentForm.reset();
-                if(apiRecursiveFieldsDiv) apiRecursiveFieldsDiv.classList.add('hidden');
-                await fetchAgentsForDashboard(); 
-                await getOrchestratorStatus(); 
+            let successCount = 0;
+            let failureCount = 0;
+            let lastError = null;
+            for (let i = 0; i < agentCount; i += 1) {
+                const payload = { ...data };
+                if (agentCount > 1 && data.agent_name) {
+                    payload.agent_name = `${data.agent_name}-${i + 1}`;
+                }
+                const result = await fetchApi('/api/orchestrator/add_agent', 'POST', payload);
+                if (result.success) {
+                    successCount += 1;
+                } else {
+                    failureCount += 1;
+                    lastError = result.message;
+                }
+            }
+
+            const summaryParts = [`${successCount} ${successCount === 1 ? 'agent' : 'agents'} created`];
+            if (failureCount > 0) summaryParts.push(`${failureCount} failed`);
+            let summaryMessage = `${summaryParts.join(', ')}.`;
+            if (lastError && failureCount > 0) {
+                summaryMessage += ` Last error: ${lastError}`;
+            }
+            showDashboardStatus(summaryMessage, failureCount > 0 ? 'error' : 'success');
+
+            if (successCount > 0) {
+                if (failureCount === 0) {
+                    if (createApiAgentModal) createApiAgentModal.style.display = "none";
+                    createApiAgentForm.reset();
+                    if (apiRecursiveFieldsDiv) apiRecursiveFieldsDiv.classList.add('hidden');
+                }
+                await fetchAgentsForDashboard();
+                await getOrchestratorStatus();
             }
         } catch (error) { /* Handled by fetchApi */ }
     });
 
-    // Helper function to check if modal has unsaved content
-    function hasUnsavedContent(modalId) {
-        if (modalId === 'createApiAgentModal') {
-            const form = document.getElementById('create-api-agent-form');
-            if (!form) return false;
-            const formData = new FormData(form);
-            // Check if any required fields have content
-            return formData.get('model_name') || formData.get('agent_name') || 
-                   formData.get('llm_system_prompt') || formData.get('internal_note');
-        }
-        if (modalId === 'directMessageModal') {
-            const messageInput = document.getElementById('direct-message-input');
-            return messageInput && messageInput.value.trim() !== '';
-        }
-        if (modalId === 'sendSystemMessageModal') {
-            const messageContent = document.getElementById('system-message-content');
-            return messageContent && messageContent.value.trim() !== '';
-        }
-        if (modalId === 'speakCommonRoomModal') {
-            const speakerName = document.getElementById('common-room-speaker-name');
-            const messageContent = document.getElementById('common-room-message-content');
-            return (speakerName && speakerName.value.trim() !== '') || 
-                   (messageContent && messageContent.value.trim() !== '');
-        }
-        if (modalId === 'updateStationConfigModal') {
-            const stationStatus = document.getElementById('update-station-status');
-            const stationName = document.getElementById('update-station-name');
-            const stationDescription = document.getElementById('update-station-description');
-            return (stationStatus && stationStatus.value.trim() !== '') ||
-                   (stationName && stationName.value.trim() !== '') || 
-                   (stationDescription && stationDescription.value.trim() !== '');
-        }
-        return false;
+    function hideModalWithoutReset(modal, preserveDraft = false) {
+        if (!modal) return;
+        if (preserveDraft) modal.dataset.reopenWithDraft = 'true';
+        modal.style.display = "none";
     }
 
-    function closeModalSafely(modal, modalId) {
-        if (hasUnsavedContent(modalId)) {
-            if (confirm("You have unsaved changes. Are you sure you want to close this modal? Your changes will be lost.")) {
-                modal.style.display = "none";
+    function consumeBackdropDraftFlag(modal) {
+        if (!modal || modal.dataset.reopenWithDraft !== 'true') return false;
+        delete modal.dataset.reopenWithDraft;
+        return true;
+    }
+
+    document.querySelectorAll('.modal').forEach((modal) => {
+        modal.addEventListener('click', (event) => {
+            if (event.target === modal) {
+                hideModalWithoutReset(modal, true);
             }
-        } else {
-            modal.style.display = "none";
-        }
-    }
-
-    window.onclick = function(event) {
-        if (createApiAgentModal && event.target == createApiAgentModal) { 
-            closeModalSafely(createApiAgentModal, 'createApiAgentModal');
-        }
-        if (directMessageModal && event.target == directMessageModal) { 
-            closeModalSafely(directMessageModal, 'directMessageModal');
-        }
-        if (sendSystemMessageModal && event.target == sendSystemMessageModal) { 
-            closeModalSafely(sendSystemMessageModal, 'sendSystemMessageModal');
-        }        
-        if (speakCommonRoomModal && event.target == speakCommonRoomModal) { 
-            closeModalSafely(speakCommonRoomModal, 'speakCommonRoomModal');
-        }
-        if (updateStationConfigModal && event.target == updateStationConfigModal) { 
-            closeModalSafely(updateStationConfigModal, 'updateStationConfigModal');
-        }
-    };
+        });
+    });
 
     if(endApiAgentSessionButton) endApiAgentSessionButton.addEventListener('click', async () => {
         const agentToEnd = agentSelectorDashboard ? agentSelectorDashboard.value : null;
@@ -1590,6 +2914,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (openSendSystemMessageModalButton) {
         openSendSystemMessageModalButton.addEventListener('click', () => {
+            const restoreDraft = consumeBackdropDraftFlag(sendSystemMessageModal);
+            const previousSelectedAgents = systemMessageAgentSelector
+                ? Array.from(systemMessageAgentSelector.selectedOptions).map(option => option.value)
+                : [];
             // Check if orchestrator is at least prepared, or if active agents can be fetched otherwise
             // For now, relies on orchestratorState.turn_order which is populated by getOrchestratorStatus
             if (!orchestratorState.is_prepared && !orchestratorState.is_running && orchestratorState.turn_order.length === 0) {
@@ -1611,14 +2939,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     activeAgents.forEach(agentName => {
                         const option = document.createElement('option');
+                        const agentInfo = fullAgentListCache.find(agent => agent.name === agentName);
                         option.value = agentName;
-                        option.textContent = agentName;
+                        option.textContent = agentInfo ? formatAgentDisplayName(agentInfo) : agentName;
+                        if (restoreDraft && previousSelectedAgents.includes(agentName)) {
+                            option.selected = true;
+                        }
                         systemMessageAgentSelector.appendChild(option);
                     });
                     if (confirmSendSystemMessageButton) confirmSendSystemMessageButton.disabled = false;
                 }
             }
-            if (systemMessageContent) systemMessageContent.value = "";
+            if (!restoreDraft && systemMessageContent) systemMessageContent.value = "";
+            if (!restoreDraft && systemMessageArchitectCheckbox) systemMessageArchitectCheckbox.checked = false;
             if (sendSystemMessageModal) sendSystemMessageModal.style.display = "block";
             if (systemMessageContent) systemMessageContent.focus();
         });
@@ -1626,12 +2959,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (closeSendSystemMessageModalButton) {
         closeSendSystemMessageModalButton.addEventListener('click', () => {
-            if (sendSystemMessageModal) sendSystemMessageModal.style.display = "none";
-        });
-    }
-    if (cancelSendSystemMessageButton) {
-        cancelSendSystemMessageButton.addEventListener('click', () => {
-            if (sendSystemMessageModal) sendSystemMessageModal.style.display = "none";
+            hideModalWithoutReset(sendSystemMessageModal, true);
         });
     }
 
@@ -1640,6 +2968,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const selectedAgentOptions = systemMessageAgentSelector ? Array.from(systemMessageAgentSelector.selectedOptions) : [];
             const targetAgents = selectedAgentOptions.map(option => option.value);
             const message = systemMessageContent ? systemMessageContent.value.trim() : "";
+            const messageToSend = systemMessageArchitectCheckbox && systemMessageArchitectCheckbox.checked
+                ? `**Architect Message**\n${message}`
+                : message;
 
             if (targetAgents.length === 0) {
                 showDashboardStatus("Please select at least one target agent.", "error");
@@ -1655,10 +2986,12 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const result = await fetchApi('/api/station/send_system_message', 'POST', {
                     target_agents: targetAgents,
-                    message_content: message
+                    message_content: messageToSend
                 });
                 showDashboardStatus(result.message, result.success ? 'success' : 'error');
                 if (result.success) {
+                    if (systemMessageContent) systemMessageContent.value = "";
+                    if (systemMessageArchitectCheckbox) systemMessageArchitectCheckbox.checked = false;
                     if (sendSystemMessageModal) sendSystemMessageModal.style.display = "none";
                 }
             } catch (error) {
@@ -1670,24 +3003,307 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // --- Chat ---
+    if (openArchivePapersModalButton) {
+        openArchivePapersModalButton.addEventListener('click', () => {
+            void openArchivePapersModal();
+        });
+    }
+
+    if (closeArchivePapersModalButton) {
+        closeArchivePapersModalButton.addEventListener('click', () => {
+            hideModalWithoutReset(archivePapersModal);
+        });
+    }
+
+    if (copyAllArchiveAbstractsButton) {
+        copyAllArchiveAbstractsButton.addEventListener('click', () => {
+            if (!archiveAllAbstractsMarkdown.trim()) {
+                showDashboardStatus('No archive abstracts to copy.', 'info');
+                return;
+            }
+            void copyTextToClipboard(archiveAllAbstractsMarkdown, 'All archive abstracts copied to clipboard.');
+        });
+    }
+
+    if (backToArchivePapersListButton) {
+        backToArchivePapersListButton.addEventListener('click', () => {
+            showArchiveListView();
+        });
+    }
+
+    if (copyArchivePaperMarkdownButton) {
+        copyArchivePaperMarkdownButton.addEventListener('click', () => {
+            if (!archiveSelectedPaper || !archiveSelectedPaper.paper_markdown) {
+                showDashboardStatus('No archive paper is currently open.', 'error');
+                return;
+            }
+            void copyTextToClipboard(String(archiveSelectedPaper.paper_markdown), 'Archive paper markdown copied to clipboard.');
+        });
+    }
+
+    document.querySelectorAll('.archive-sort-button').forEach(button => {
+        button.addEventListener('click', () => {
+            const key = button.getAttribute('data-sort-key');
+            if (!key) return;
+            if (archiveSortState.key === key) {
+                archiveSortState.direction = archiveSortState.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                archiveSortState = {
+                    key,
+                    direction: key === 'title' || key === 'author' ? 'asc' : 'desc'
+                };
+            }
+            renderArchivePapersTable();
+        });
+    });
+
+    if (openTemporalChatModalButton) {
+        openTemporalChatModalButton.addEventListener('click', async () => {
+            if (!temporalChatAgentSelector) return;
+            const restoreDraft = consumeBackdropDraftFlag(temporalChatModal);
+            const previousTemporalAgent = temporalChatAgentSelector.value;
+            temporalChatAgentSelector.innerHTML = '';
+
+            const selectableAgents = (fullAgentListCache || [])
+                .filter(a => a && a.name && !String(a.status || '').startsWith("Ascended"))
+                .sort((a, b) => {
+                    const aBranched = !!a.temporal_chat_exists;
+                    const bBranched = !!b.temporal_chat_exists;
+                    if (aBranched !== bBranched) return aBranched ? -1 : 1;
+                    if (aBranched && bBranched) {
+                        const aUpdated = String(a.temporal_chat_updated_at || '');
+                        const bUpdated = String(b.temporal_chat_updated_at || '');
+                        if (aUpdated !== bUpdated) return bUpdated.localeCompare(aUpdated);
+                    }
+                    return String(a.name || '').localeCompare(String(b.name || ''));
+                });
+
+            if (selectableAgents.length === 0) {
+                const option = document.createElement('option');
+                option.value = "";
+                option.textContent = "No agents available.";
+                option.disabled = true;
+                temporalChatAgentSelector.appendChild(option);
+            } else {
+                selectableAgents.forEach(agent => {
+                    const option = document.createElement('option');
+                    option.value = agent.name;
+                    option.textContent = formatAgentDisplayName(agent, { includeBranchMarker: true });
+                    temporalChatAgentSelector.appendChild(option);
+                });
+
+                // Default selection: current dashboard selection if valid, else first.
+                const selectedAgentName = agentSelectorDashboard ? agentSelectorDashboard.value : null;
+                if (restoreDraft && previousTemporalAgent && selectableAgents.some(agent => agent.name === previousTemporalAgent)) {
+                    temporalChatAgentSelector.value = previousTemporalAgent;
+                } else if (selectedAgentName && selectedAgentName !== "all") {
+                    const selectedAgentData = fullAgentListCache.find(a => a.name === selectedAgentName);
+                    const isAscended = selectedAgentData && String(selectedAgentData.status || '').startsWith("Ascended");
+                    if (selectedAgentData && !isAscended) {
+                        temporalChatAgentSelector.value = selectedAgentName;
+                    }
+                }
+            }
+
+            if (!restoreDraft && temporalChatInput) temporalChatInput.value = "";
+            if (!restoreDraft && temporalChatBranchTickInput) temporalChatBranchTickInput.value = "";
+            if (temporalChatModal) temporalChatModal.style.display = "block";
+            _renderTemporalChatTranscript(temporalChatAgentSelector.value);
+            if (temporalChatAgentSelector.value) {
+                try {
+                    await _loadTemporalChatState(temporalChatAgentSelector.value);
+                    _renderTemporalChatTranscript(temporalChatAgentSelector.value);
+                } catch (e) {
+                    showDashboardStatus(`Failed to load chat: ${e.message || e}`, "error");
+                }
+            }
+            if (temporalChatInput) temporalChatInput.focus();
+        });
+    }
+
+    if (closeTemporalChatModalButton) {
+        closeTemporalChatModalButton.addEventListener('click', () => {
+            _closeTemporalChatModal();
+        });
+    }
+    if (temporalChatAgentSelector) {
+        temporalChatAgentSelector.addEventListener('change', async () => {
+            _renderTemporalChatTranscript(temporalChatAgentSelector.value);
+            if (!temporalChatAgentSelector.value) return;
+            try {
+                await _loadTemporalChatState(temporalChatAgentSelector.value);
+                _renderTemporalChatTranscript(temporalChatAgentSelector.value);
+            } catch (e) {
+                showDashboardStatus(`Failed to load chat: ${e.message || e}`, "error");
+            }
+        });
+    }
+
+    if (branchTemporalChatButton) {
+        branchTemporalChatButton.addEventListener('click', async () => {
+            const agentName = temporalChatAgentSelector ? temporalChatAgentSelector.value : null;
+            if (!agentName) return;
+            if (_isTemporalChatProcessing(agentName) || (_getTemporalChatQueue(agentName).length > 0)) {
+                showDashboardStatus("Please wait until all queued messages finish before branching chat.", "info");
+                return;
+            }
+            const parsedBranchTick = _parseTemporalChatBranchTickInput();
+            if (!parsedBranchTick.ok) {
+                showDashboardStatus(parsedBranchTick.error, "error");
+                return;
+            }
+            const existingMessages = _getTemporalChatMessages(agentName);
+            if (existingMessages.length > 0 && !confirm("Branch again? This will clear the current chat for this agent.")) {
+                return;
+            }
+
+            temporalChatBranchingByAgent.set(agentName, true);
+            temporalChatProcessingByAgent.set(agentName, true);
+            _updateTemporalChatSendButtonState(agentName);
+            try {
+                const payload = {};
+                if (parsedBranchTick.value !== null) payload.base_tick = parsedBranchTick.value;
+                const result = await fetchApi(`/api/agent/${encodeURIComponent(agentName)}/temporal_chat/refresh`, 'POST', payload);
+                if (!result || !result.success || !result.chat) {
+                    throw new Error((result && (result.error || result.message)) || 'Failed to branch chat.');
+                }
+                _applyTemporalChatState(agentName, result.chat);
+                temporalChatQueueByAgent.set(agentName, []);
+                _renderTemporalChatTranscript(agentName);
+                if (temporalChatInput) temporalChatInput.value = "";
+                const baseTick = result.chat && typeof result.chat.base_tick !== 'undefined' ? result.chat.base_tick : 'current';
+                showDashboardStatus(`Chat branched from tick ${baseTick}.`, "success");
+            } catch (e) {
+                showDashboardStatus(`Failed to branch chat: ${e.message || e}`, "error");
+            } finally {
+                temporalChatBranchingByAgent.set(agentName, false);
+                temporalChatProcessingByAgent.set(agentName, false);
+                _updateTemporalChatSendButtonState(agentName);
+            }
+        });
+    }
+
+    if (copyTemporalChatButton) {
+        copyTemporalChatButton.addEventListener('click', async () => {
+            const agentName = temporalChatAgentSelector ? temporalChatAgentSelector.value : null;
+            if (!agentName) {
+                showDashboardStatus("Please select a target agent to copy the dialogue.", "error");
+                return;
+            }
+            const text = _formatTemporalChatForCopy(agentName, true);
+            if (!text.trim()) {
+                showDashboardStatus("No dialogue to copy.", "info");
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(text);
+                showDashboardStatus("Chat copied to clipboard.", "success");
+            } catch (e) {
+                showDashboardStatus("Failed to copy to clipboard.", "error");
+            }
+        });
+    }
+
+    if (copyTemporalChatWithoutThinkingButton) {
+        copyTemporalChatWithoutThinkingButton.addEventListener('click', async () => {
+            const agentName = temporalChatAgentSelector ? temporalChatAgentSelector.value : null;
+            if (!agentName) {
+                showDashboardStatus("Please select a target agent to copy the dialogue.", "error");
+                return;
+            }
+            const text = _formatTemporalChatForCopy(agentName, false);
+            if (!text.trim()) {
+                showDashboardStatus("No dialogue to copy.", "info");
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(text);
+                showDashboardStatus("Chat copied without thinking.", "success");
+            } catch (e) {
+                showDashboardStatus("Failed to copy to clipboard.", "error");
+            }
+        });
+    }
+
+    if (confirmTemporalChatSendButton) {
+        confirmTemporalChatSendButton.addEventListener('click', async () => {
+            if (!temporalChatAgentSelector) return;
+            const agentName = temporalChatAgentSelector.value;
+            const msg = temporalChatInput ? temporalChatInput.value.trim() : "";
+
+            if (!agentName) {
+                showDashboardStatus("Please select a target agent.", "error");
+                return;
+            }
+            if (!msg) {
+                showDashboardStatus("Message cannot be empty.", "error");
+                return;
+            }
+
+            const q = _getTemporalChatQueue(agentName);
+
+            // Queue immediately; append user message only when it is actually sent, for Q1 A1 Q2 A2 ordering.
+            q.push(msg);
+            if (temporalChatInput) temporalChatInput.value = "";
+            _updateTemporalChatSendButtonState(agentName);
+
+            // If already processing, we're done (message is queued).
+            if (_isTemporalChatProcessing(agentName)) return;
+
+            temporalChatProcessingByAgent.set(agentName, true);
+            _updateTemporalChatSendButtonState(agentName);
+            try {
+                while (q.length > 0) {
+                    const nextMsg = q.shift();
+                    if (!nextMsg) continue;
+
+                    _getTemporalChatMessages(agentName).push({ role: 'user', content: nextMsg });
+                    _renderTemporalChatTranscript(agentName);
+
+                    const result = await fetchApi(`/api/agent/${encodeURIComponent(agentName)}/temporal_chat`, 'POST', {
+                        user_message: nextMsg
+                    });
+
+                    if (result && result.success) {
+                        if (result.chat) {
+                            _applyTemporalChatState(agentName, result.chat);
+                        } else {
+                            _getTemporalChatMessages(agentName).push({ role: 'assistant', content: String(result.agent_response || "") });
+                        }
+                    } else {
+                        if (result && result.chat) _applyTemporalChatState(agentName, result.chat);
+                        _getTemporalChatMessages(agentName).push({ role: 'assistant', content: String((result && (result.error || result.message)) || "Chat failed.") });
+                        q.length = 0;
+                    }
+                    _renderTemporalChatTranscript(agentName);
+                }
+            } catch (error) {
+                _getTemporalChatMessages(agentName).push({ role: 'assistant', content: `Error: ${error.message || 'Chat request failed.'}` });
+                _renderTemporalChatTranscript(agentName);
+                q.length = 0;
+            } finally {
+                temporalChatProcessingByAgent.set(agentName, false);
+                _updateTemporalChatSendButtonState(agentName);
+                updateOrchestratorControlButtons(orchestratorState);
+            }
+        });
+    }
+
     if (openSpeakCommonRoomModalButton) {
         openSpeakCommonRoomModalButton.addEventListener('click', () => {
+            const restoreDraft = consumeBackdropDraftFlag(speakCommonRoomModal);
             // This tool can be used regardless of orchestrator state, as it's a direct room interaction.
             // However, ensure station_instance is available on backend.
-            if (commonRoomSpeakerName) commonRoomSpeakerName.value = "";
-            if (commonRoomMessageContent) commonRoomMessageContent.value = "";
+            if (!restoreDraft && commonRoomSpeakerName) commonRoomSpeakerName.value = "";
+            if (!restoreDraft && commonRoomMessageContent) commonRoomMessageContent.value = "";
             if (speakCommonRoomModal) speakCommonRoomModal.style.display = "block";
             if (commonRoomSpeakerName) commonRoomSpeakerName.focus();
         });
     }
     if (closeSpeakCommonRoomModalButton) {
         closeSpeakCommonRoomModalButton.addEventListener('click', () => {
-            if (speakCommonRoomModal) speakCommonRoomModal.style.display = "none";
-        });
-    }
-    if (cancelSpeakCommonRoomButton) {
-        cancelSpeakCommonRoomButton.addEventListener('click', () => {
-            if (speakCommonRoomModal) speakCommonRoomModal.style.display = "none";
+            hideModalWithoutReset(speakCommonRoomModal, true);
         });
     }
 
@@ -1714,6 +3330,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 });
                 showDashboardStatus(result.message, result.success ? 'success' : 'error');
                 if (result.success) {
+                    if (commonRoomSpeakerName) commonRoomSpeakerName.value = "";
+                    if (commonRoomMessageContent) commonRoomMessageContent.value = "";
                     if (speakCommonRoomModal) speakCommonRoomModal.style.display = "none";
                 }
             } catch (error) {
@@ -1724,72 +3342,157 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }    
 
-    if (openDirectMessageModalButton) {
-        openDirectMessageModalButton.addEventListener('click', () => {
-            const selectedAgent = agentSelectorDashboard.value;
-            if (!selectedAgent || selectedAgent === "all") {
-                showDashboardStatus("Please select a specific agent to message.", "error"); return;
-            }
-            
-            
-            const agentData = fullAgentListCache.find(a => a.name === selectedAgent);
-            if (!agentData) {
-                showDashboardStatus("Selected agent not found.", "error"); return;
-            }
-            
-            const isEnded = agentData.status.startsWith("Session Ended");
-            const isAscended = agentData.status.startsWith("Ascended");
-            
-            if (isAscended) {
-                showDashboardStatus("Cannot send messages to ascended agents.", "error"); return;
-            }
-            
-            // Set modal content based on agent status
-            if (directMessageModalAgentName) directMessageModalAgentName.textContent = selectedAgent;
+    function directMessageAgentStatusStartsWith(agentData, prefix) {
+        return Boolean(agentData && String(agentData.status || "").startsWith(prefix));
+    }
+
+    function buildDirectMessageTargetOptions() {
+        const options = [{ name: "Reviewer", label: "Reviewer" }];
+        const added = new Set(["Reviewer"]);
+        const turnOrder = Array.isArray(orchestratorState.turn_order) ? orchestratorState.turn_order : [];
+
+        const addAgentOption = (agent) => {
+            if (!agent || !agent.name || added.has(agent.name)) return;
+            if (directMessageAgentStatusStartsWith(agent, "Ascended")) return;
+            added.add(agent.name);
+            options.push({
+                name: agent.name,
+                label: formatAgentDisplayName(agent),
+            });
+        };
+
+        turnOrder.forEach(agentName => {
+            const agent = fullAgentListCache.find(a => a.name === agentName);
+            addAgentOption(agent);
+        });
+
+        const otherAgents = (fullAgentListCache || [])
+            .filter(agent => agent && agent.name && !added.has(agent.name))
+            .sort((a, b) => {
+                const aEnded = directMessageAgentStatusStartsWith(a, "Session Ended");
+                const bEnded = directMessageAgentStatusStartsWith(b, "Session Ended");
+                if (aEnded !== bEnded) return aEnded ? 1 : -1;
+                return String(a.name || "").localeCompare(String(b.name || ""));
+            });
+        otherAgents.forEach(addAgentOption);
+
+        return options;
+    }
+
+    function populateDirectMessageAgentSelector(preferredAgentName) {
+        if (!directMessageAgentSelector) return null;
+        const options = buildDirectMessageTargetOptions();
+        directMessageAgentSelector.innerHTML = "";
+
+        if (options.length === 0) {
+            const option = document.createElement('option');
+            option.textContent = "No agents available.";
+            option.disabled = true;
+            directMessageAgentSelector.appendChild(option);
+            if (confirmSendDirectMessageButton) confirmSendDirectMessageButton.disabled = true;
+            return null;
+        }
+
+        options.forEach(target => {
+            const option = document.createElement('option');
+            option.value = target.name;
+            option.textContent = target.label;
+            directMessageAgentSelector.appendChild(option);
+        });
+
+        const preferredTarget = options.find(target => target.name === preferredAgentName);
+        directMessageAgentSelector.value = preferredTarget ? preferredTarget.name : options[0].name;
+        return directMessageAgentSelector.value;
+    }
+
+    function updateDirectMessageModalForTarget(agentName, clearDraft = false) {
+        const isReviewer = agentName === "Reviewer";
+        const agentData = isReviewer ? null : fullAgentListCache.find(a => a.name === agentName);
+        const isEnded = directMessageAgentStatusStartsWith(agentData, "Session Ended");
+        const isAscended = directMessageAgentStatusStartsWith(agentData, "Ascended");
+        const isValidTarget = isReviewer || (!!agentData && !isAscended);
+
+        if (clearDraft) {
             if (directMessageInput) directMessageInput.value = "";
             if (directMessageResponseArea) directMessageResponseArea.classList.add('hidden');
             if (directMessageLlmResponseContent) directMessageLlmResponseContent.innerHTML = "";
-            
-            if (isEnded) {
-                if (directMessageModalTitle) directMessageModalTitle.textContent = "Send Message to Ended Agent";
-                if (directMessageModalDescription) directMessageModalDescription.textContent = "This agent's session has ended. Your message will be logged.";
-            } else {
-                if (directMessageModalTitle) directMessageModalTitle.textContent = "Send Message to Agent";
-                if (directMessageModalDescription) directMessageModalDescription.textContent = "Your message will be sent directly to the agent. System will wait for safe timing.";
+        }
+
+        if (!isValidTarget) {
+            if (directMessageModalTitle) directMessageModalTitle.textContent = "Intervene With Agent";
+            if (directMessageModalDescription) directMessageModalDescription.textContent = "Selected agent is unavailable for intervention.";
+            if (confirmSendDirectMessageButton) confirmSendDirectMessageButton.disabled = true;
+            return false;
+        }
+
+        if (isReviewer) {
+            if (directMessageModalTitle) directMessageModalTitle.textContent = "Intervene With Reviewer";
+            if (directMessageModalDescription) directMessageModalDescription.textContent = "Your intervention below will be sent to the Reviewer system. Responses will appear in the Reviewer log.";
+        } else if (isEnded) {
+            if (directMessageModalTitle) directMessageModalTitle.textContent = "Intervene With Ended Agent";
+            if (directMessageModalDescription) directMessageModalDescription.textContent = "This agent's session has ended, so this will not disrupt station workflow. Your message will be logged.";
+        } else {
+            if (directMessageModalTitle) directMessageModalTitle.textContent = "Intervene With Agent";
+            if (directMessageModalDescription) directMessageModalDescription.textContent = "Your message below will be sent directly to the agent. This is highly discouraged because it can disrupt the agent's normal station workflow. Ended agents are usually fine.";
+        }
+
+        if (confirmSendDirectMessageButton) confirmSendDirectMessageButton.disabled = isDirectMessageInProgress;
+        return true;
+    }
+
+    if (openDirectMessageModalButton) {
+        openDirectMessageModalButton.addEventListener('click', () => {
+            const restoreDraft = consumeBackdropDraftFlag(directMessageModal);
+            const previousAgentName = directMessageAgentSelector ? directMessageAgentSelector.value : null;
+            const selectedDashboardAgent = agentSelectorDashboard ? agentSelectorDashboard.value : null;
+            const preferredAgent = restoreDraft
+                ? previousAgentName
+                : (selectedDashboardAgent && selectedDashboardAgent !== "all" ? selectedDashboardAgent : null);
+            const selectedAgent = populateDirectMessageAgentSelector(preferredAgent);
+
+            if (!selectedAgent) {
+                showDashboardStatus("No agents are available for intervention.", "error");
+                return;
             }
-            
+
+            updateDirectMessageModalForTarget(selectedAgent, !restoreDraft || previousAgentName !== selectedAgent);
             if (directMessageModal) directMessageModal.style.display = "block";
             if (directMessageInput) directMessageInput.focus();
         });
     }
-    if (closeDirectMessageModalButton) closeDirectMessageModalButton.addEventListener('click', () => { if (directMessageModal) directMessageModal.style.display = "none"; });
-    if (cancelDirectMessageButton) cancelDirectMessageButton.addEventListener('click', () => { if (directMessageModal) directMessageModal.style.display = "none"; });
+    if (directMessageAgentSelector) {
+        directMessageAgentSelector.addEventListener('change', () => {
+            updateDirectMessageModalForTarget(directMessageAgentSelector.value, true);
+        });
+    }
+    if (closeDirectMessageModalButton) closeDirectMessageModalButton.addEventListener('click', () => { hideModalWithoutReset(directMessageModal, true); });
 
     if (confirmSendDirectMessageButton) {
         confirmSendDirectMessageButton.addEventListener('click', async () => {
-            const agentToMessage = directMessageModalAgentName ? directMessageModalAgentName.textContent : null;
+            const agentToMessage = directMessageAgentSelector ? directMessageAgentSelector.value : null;
             const messageText = directMessageInput ? directMessageInput.value.trim() : "";
+            const isReviewer = agentToMessage === "Reviewer";
 
-            if (!agentToMessage || agentToMessage === "N/A") { 
-                showDashboardStatus("Error: Agent name missing in modal.", "error"); return; 
+            if (!agentToMessage) {
+                showDashboardStatus("Please select a target agent.", "error"); return;
             }
             if (!messageText) { 
-                showDashboardStatus("Message cannot be empty.", "error"); return; 
+                showDashboardStatus("Intervention cannot be empty.", "error"); return;
             }
 
-            const agentData = fullAgentListCache.find(a => a.name === agentToMessage);
-            if (!agentData) {
+            const agentData = isReviewer ? null : fullAgentListCache.find(a => a.name === agentToMessage);
+            if (!isReviewer && !agentData) {
                 showDashboardStatus("Selected agent not found.", "error"); return;
             }
 
-            const isEnded = agentData.status.startsWith("Session Ended");
-            const isAscended = agentData.status.startsWith("Ascended");
+            const isEnded = directMessageAgentStatusStartsWith(agentData, "Session Ended");
+            const isAscended = directMessageAgentStatusStartsWith(agentData, "Ascended");
 
             if (isAscended) {
-                showDashboardStatus("Cannot send messages to ascended agents.", "error"); return;
+                showDashboardStatus("Cannot intervene with ascended agents.", "error"); return;
             }
 
-            showDashboardStatus(`Sending message to ${agentToMessage}...`, 'info');
+            showDashboardStatus(`Sending intervention to ${agentToMessage}...`, 'info');
             confirmSendDirectMessageButton.disabled = true;
             if (openDirectMessageModalButton) openDirectMessageModalButton.disabled = true;
             isDirectMessageInProgress = true;
@@ -1799,16 +3502,28 @@ document.addEventListener('DOMContentLoaded', () => {
             
             try {
                 let result;
-                if (isEnded) {
+                if (isReviewer) {
+                    result = await fetchApi('/api/reviewer/manual_message', 'POST', {
+                        message_text: messageText
+                    });
+
+                    if (result.success) {
+                        showDashboardStatus(`Intervention sent. Reviewer replied. See log.`, 'success');
+                        if (directMessageInput) directMessageInput.value = "";
+                    } else {
+                        showDashboardStatus(result.error || "Failed to send intervention to reviewer.", "error");
+                    }
+                } else if (isEnded) {
                     // Send to ended agent using final chat API
-                    result = await fetchApi(`/api/agent/${agentToMessage}/final_chat`, 'POST', { 
+                    result = await fetchApi(`/api/agent/${encodeURIComponent(agentToMessage)}/final_chat`, 'POST', {
                         human_message: messageText 
                     });
                     
                     if (result.success) {
-                        showDashboardStatus(`Message sent. Agent ${agentToMessage} replied.`, 'success');
+                        showDashboardStatus(`Intervention sent. Agent ${agentToMessage} replied.`, 'success');
+                        if (directMessageInput) directMessageInput.value = "";
                     } else {
-                        showDashboardStatus(result.error || "Failed to send final message.", "error");
+                        showDashboardStatus(result.error || "Failed to message ended agent.", "error");
                     }
                 } else {
                     // Send to living agent using manual message API
@@ -1819,9 +3534,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     });
                     
                     if (result.success) {
-                        showDashboardStatus(`Message sent. Agent ${agentToMessage} replied. See log.`, 'success');
+                        showDashboardStatus(`Intervention sent. Agent ${agentToMessage} replied. See log.`, 'success');
+                        if (directMessageInput) directMessageInput.value = "";
                     } else {
-                        showDashboardStatus(result.error || "Failed to send manual message.", "error");
+                        showDashboardStatus(result.error || "Failed to send intervention.", "error");
                     }
                 }
                 
@@ -1830,19 +3546,53 @@ document.addEventListener('DOMContentLoaded', () => {
             } finally { 
                 confirmSendDirectMessageButton.disabled = false;
                 isDirectMessageInProgress = false;
-                // Re-enable the main Direct Message button, but respect normal enabling rules
                 if (openDirectMessageModalButton) {
-                    const agentData = fullAgentListCache.find(a => a.name === agentToMessage);
-                    const isAscended = agentData && agentData.status.startsWith("Ascended");
-                    openDirectMessageModalButton.disabled = isAscended;
+                    openDirectMessageModalButton.disabled = buildDirectMessageTargetOptions().length === 0;
                 }
             }
         });
     }
     
-    if (cancelCreateApiAgentButton) {
-        cancelCreateApiAgentButton.addEventListener('click', () => {
-            if (createApiAgentModal) createApiAgentModal.style.display = "none";
+    function populateResolveRequestDetails(request) {
+        if (!request) return;
+        if (requestIdDisplay) requestIdDisplay.textContent = request.request_id;
+        if (requestTickDisplay) requestTickDisplay.textContent = request.tick;
+        if (requestAgentDisplay) requestAgentDisplay.textContent = request.agent_name;
+        if (requestModelDisplay) requestModelDisplay.textContent = request.agent_model;
+        if (requestTitleDisplay) requestTitleDisplay.textContent = request.title;
+        if (requestContentDisplay) requestContentDisplay.textContent = request.content;
+        if (resolveRequestModal) {
+            resolveRequestModal.dataset.requestId = request.request_id;
+        }
+    }
+
+    function updateRequestSelectorOptions(requests) {
+        resolveRequestCache = new Map();
+        if (!requestSelector || !requestSelectorWrapper) {
+            return;
+        }
+
+        requestSelector.innerHTML = '';
+        if (!requests || requests.length <= 1) {
+            requestSelectorWrapper.classList.add('hidden');
+            return;
+        }
+
+        requestSelectorWrapper.classList.remove('hidden');
+        requests.forEach((req) => {
+            const option = document.createElement('option');
+            option.value = String(req.request_id);
+            option.textContent = `#${req.request_id} — ${req.title || 'Untitled'}`;
+            requestSelector.appendChild(option);
+            resolveRequestCache.set(String(req.request_id), req);
+        });
+    }
+
+    if (requestSelector) {
+        requestSelector.addEventListener('change', () => {
+            const selectedId = String(requestSelector.value);
+            const request = resolveRequestCache.get(selectedId);
+            populateResolveRequestDetails(request);
         });
     }
 
@@ -1851,6 +3601,11 @@ document.addEventListener('DOMContentLoaded', () => {
         const selectedAgent = agentSelectorDashboard ? agentSelectorDashboard.value : null;
         if (!selectedAgent || selectedAgent === "all") {
             showDashboardStatus("Please select a specific agent to resolve their request.", "error");
+            return;
+        }
+        if (consumeBackdropDraftFlag(resolveRequestModal) && resolveRequestModal?.dataset.agentName === selectedAgent) {
+            resolveRequestModal.style.display = "block";
+            if (resolveResponseInput) resolveResponseInput.focus();
             return;
         }
 
@@ -1864,13 +3619,19 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // Populate modal with request details
-            const request = response.request;
-            if (requestIdDisplay) requestIdDisplay.textContent = request.request_id;
-            if (requestTickDisplay) requestTickDisplay.textContent = request.tick;
-            if (requestAgentDisplay) requestAgentDisplay.textContent = request.agent_name;
-            if (requestModelDisplay) requestModelDisplay.textContent = request.agent_model;
-            if (requestTitleDisplay) requestTitleDisplay.textContent = request.title;
-            if (requestContentDisplay) requestContentDisplay.textContent = request.content;
+            const requests = response.requests || (response.request ? [response.request] : []);
+            if (!requests.length) {
+                showDashboardStatus("No pending requests found for this agent.", "error");
+                return;
+            }
+
+            requests.sort((a, b) => (b.request_id || 0) - (a.request_id || 0));
+            updateRequestSelectorOptions(requests);
+            const defaultRequest = requests[0];
+            if (requestSelector && requestSelectorWrapper && !requestSelectorWrapper.classList.contains('hidden')) {
+                requestSelector.value = String(defaultRequest.request_id);
+            }
+            populateResolveRequestDetails(defaultRequest);
             if (resolveResponseInput) resolveResponseInput.value = '';
             if (resolveRequestStatus) {
                 resolveRequestStatus.classList.add('hidden');
@@ -1880,7 +3641,6 @@ document.addEventListener('DOMContentLoaded', () => {
             // Store agent name for later
             if (resolveRequestModal) {
                 resolveRequestModal.dataset.agentName = selectedAgent;
-                resolveRequestModal.dataset.requestId = request.request_id;
                 resolveRequestModal.style.display = "block";
             }
 
@@ -1893,13 +3653,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Modal handlers for resolve request modal
     if (closeResolveRequestModalButton) {
         closeResolveRequestModalButton.addEventListener('click', () => {
-            if (resolveRequestModal) resolveRequestModal.style.display = "none";
-        });
-    }
-
-    if (cancelResolveRequestButton) {
-        cancelResolveRequestButton.addEventListener('click', () => {
-            if (resolveRequestModal) resolveRequestModal.style.display = "none";
+            hideModalWithoutReset(resolveRequestModal, true);
         });
     }
 
@@ -1927,6 +3681,7 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const result = await fetchApi('/api/orchestrator/resolve_human_intervention', 'POST', {
                     agent_name: agentName,
+                    request_id: requestId,
                     response_text: responseText || null,  // Send null if empty
                     reason: responseText ? "Human provided response" : "Intervention resolved by UI action."
                 });
@@ -1958,11 +3713,13 @@ document.addEventListener('DOMContentLoaded', () => {
     
     function initializeDashboard() {
         const operationMode = document.body.dataset.operationMode;
+        applyLogDisplayMode();
         if (operationMode === 'api') {
             getStationVersion(); // Load version first
             loadStationConfig(); // Load station config and update top bar
             getOrchestratorStatus();
             updateStationStatistics(); // Initial load of statistics
+            renderTimeSinceLastTick();
             fetchAgentsForDashboard().then(() => {
                 if (window.location.hash) {
                     const agentNameFromHash = window.location.hash.substring(1);
@@ -1971,8 +3728,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
                 handleAgentDialogueViewChange();
+                connectSseLogStream();
             });
-            connectSseLogStream();
         } else {
             if(globalNotificationBubbleLog) addMessageToGlobalNotificationBubbleLog({event: "system_message", data: {message: "Orchestrator live log inactive in Manual Mode."}, timestamp: Date.now()/1000});
             const apiControls = [startLoopButton, pauseOrchestratorButton, resumeOrchestratorButton, stopOrchestratorButton, createApiAgentModalButton, endApiAgentSessionButton, openDirectMessageModalButton, resolveHumanInterventionButton];
@@ -1988,6 +3745,10 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchAgentsForDashboard();
             }
         }, 7000); 
+
+        setInterval(() => {
+            renderTimeSinceLastTick();
+        }, 1000);
     }
 
     // --- Station Config Functionality ---
@@ -2001,9 +3762,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (currentStationStatus) currentStationStatus.textContent = `Current: ${config.station_status || '(empty)'}`;
                 if (currentStationName) currentStationName.textContent = `Current: ${config.station_name || '(empty)'}`;
                 if (currentStationDescription) currentStationDescription.textContent = `Current: ${config.station_description || '(empty)'}`;
+                cachedSyncMode = config.sync_mode || 'parallel';
+                const syncModeDisplay = formatSyncModeForDisplay(cachedSyncMode);
                 
                 // Set read-only field
                 if (updateStationId) updateStationId.value = config.station_id || 'Unknown';
+                if (updateStationSyncMode) updateStationSyncMode.value = syncModeDisplay;
                 
                 // Clear input fields so placeholders show (users must type to change)
                 if (updateStationStatus) updateStationStatus.value = '';
@@ -2026,13 +3790,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updateTopBarStationName(stationName) {
-        const headerRightDiv = document.querySelector('header .container .text-lg');
+        const headerRightDiv = document.getElementById('header-stats-block');
         if (!headerRightDiv) return;
 
         // Use cached references and get current values before DOM manipulation
         const currentVersion = stationVersionDashboard ? stationVersionDashboard.textContent : "N/A";
         const currentTick = stationTickDashboard ? stationTickDashboard.textContent : "N/A";
         const currentStatus = cachedStationStatus || "Unknown";
+        const currentSyncMode = formatSyncModeForDisplay(cachedSyncMode);
 
         if (stationName && stationName.trim()) {
             // Update page title with station name
@@ -2043,6 +3808,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 `Station: <span class="font-semibold text-cyan-400">${escapeHtml(stationName)}</span> | ` +
                 `Version: <span id="station-version-dashboard" class="font-semibold">${currentVersion}</span> | ` +
                 `Station Tick: <span id="station-tick-dashboard" class="font-semibold">${currentTick}</span> | ` +
+                `Sync: <span id="station-sync-mode-dashboard" class="font-semibold">${escapeHtml(currentSyncMode)}</span> | ` +
                 `Status: <span id="station-status-dashboard" class="font-semibold">${currentStatus}</span>`;
         } else {
             // Update page title to default
@@ -2052,13 +3818,22 @@ document.addEventListener('DOMContentLoaded', () => {
             headerRightDiv.innerHTML =
                 `Station Version: <span id="station-version-dashboard" class="font-semibold">${currentVersion}</span> | ` +
                 `Station Tick: <span id="station-tick-dashboard" class="font-semibold">${currentTick}</span> | ` +
+                `Sync: <span id="station-sync-mode-dashboard" class="font-semibold">${escapeHtml(currentSyncMode)}</span> | ` +
                 `Status: <span id="station-status-dashboard" class="font-semibold">${currentStatus}</span>`;
         }
 
         // Important: Re-cache element references after DOM manipulation
         stationTickDashboard = document.getElementById('station-tick-dashboard');
         stationVersionDashboard = document.getElementById('station-version-dashboard');
+        stationSyncModeDashboard = document.getElementById('station-sync-mode-dashboard');
         stationStatusDashboard = document.getElementById('station-status-dashboard');
+    }
+
+    function formatSyncModeForDisplay(syncMode) {
+        const normalized = String(syncMode || 'parallel').trim().toLowerCase();
+        if (normalized === 'parallel') return 'Parallel';
+        if (normalized === 'sequential') return 'Sequential';
+        return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : 'Parallel';
     }
 
     function updateStationStatusInHeader(newStatus) {
@@ -2070,7 +3845,7 @@ document.addEventListener('DOMContentLoaded', () => {
             stationStatusDashboard.textContent = newStatus;
         } else {
             // If element doesn't exist yet, rebuild the header
-            const headerRightDiv = document.querySelector('header .container .text-lg');
+            const headerRightDiv = document.getElementById('header-stats-block');
             if (headerRightDiv) {
                 const stationNameMatch = headerRightDiv.textContent.match(/Station:\s*([^|]+)/);
                 const stationName = stationNameMatch ? stationNameMatch[1].trim() : "";
@@ -2107,6 +3882,11 @@ document.addEventListener('DOMContentLoaded', () => {
     // Event Listeners for Station Config
     if (updateStationConfigButton) {
         updateStationConfigButton.addEventListener('click', async () => {
+            if (consumeBackdropDraftFlag(updateStationConfigModal)) {
+                if (updateStationConfigModal) updateStationConfigModal.style.display = 'block';
+                if (updateStationName) updateStationName.focus();
+                return;
+            }
             showDashboardStatus('Loading station configuration...', 'info');
             const loaded = await loadStationConfig();
             if (loaded && updateStationConfigModal) {
@@ -2118,13 +3898,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (closeUpdateStationConfigModalButton) {
         closeUpdateStationConfigModalButton.addEventListener('click', () => {
-            if (updateStationConfigModal) updateStationConfigModal.style.display = 'none';
-        });
-    }
-
-    if (cancelUpdateStationConfigButton) {
-        cancelUpdateStationConfigButton.addEventListener('click', () => {
-            if (updateStationConfigModal) updateStationConfigModal.style.display = 'none';
+            hideModalWithoutReset(updateStationConfigModal, true);
         });
     }
 
@@ -2158,6 +3932,459 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             
             confirmUpdateStationConfigButton.disabled = false;
+        });
+    }
+
+    // --- Runtime API Config Functionality ---
+    let apiRuntimeConfigCache = null;
+
+    function getApiRuntimeTargets(config) {
+        const targets = [{ value: 'station_proxy', label: 'Station Proxy' }];
+        const providers = Array.isArray(config?.providers) ? config.providers : [];
+        providers.forEach((provider) => {
+            targets.push({ value: `provider:${provider.id}`, label: `${provider.label || provider.id}` });
+        });
+        if (config?.codex?.available) {
+            targets.push({ value: 'codex', label: 'Codex' });
+        }
+        if (config?.external_counter?.available) {
+            targets.push({ value: 'external_counter', label: 'External Counter' });
+        }
+        return targets;
+    }
+
+    function renderApiRuntimeTargetOptions(config, preferredValue = null) {
+        if (!apiRuntimeTargetSelect) return;
+        const targets = getApiRuntimeTargets(config);
+        const currentValue = preferredValue || apiRuntimeTargetSelect.value || targets[0]?.value || 'station_proxy';
+        apiRuntimeTargetSelect.innerHTML = targets.map((target) => (
+            `<option value="${escapeHtml(target.value)}">${escapeHtml(target.label)}</option>`
+        )).join('');
+        const hasCurrent = targets.some((target) => target.value === currentValue);
+        apiRuntimeTargetSelect.value = hasCurrent ? currentValue : (targets[0]?.value || 'station_proxy');
+    }
+
+    function apiRuntimeEnvHint(envName, fallbackText = '') {
+        if (envName) {
+            return `<div class="text-xs text-slate-500 mb-1">OS env: <span class="font-mono">${escapeHtml(envName)}</span></div>`;
+        }
+        if (fallbackText) {
+            return `<div class="text-xs text-slate-500 mb-1">${escapeHtml(fallbackText)}</div>`;
+        }
+        return '';
+    }
+
+    function apiRuntimeTextInput(id, label, value, placeholder = '', envName = '', helpText = '') {
+        return `
+            <div>
+                <label for="${escapeHtml(id)}" class="block text-sm font-medium text-slate-400 mb-1">${escapeHtml(label)}</label>
+                ${apiRuntimeEnvHint(envName)}
+                <input type="text" id="${escapeHtml(id)}" value="${escapeHtml(value || '')}" placeholder="${escapeHtml(placeholder || '')}" class="api-runtime-input w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200">
+                ${helpText ? `<div class="text-xs text-slate-500 mt-1">${escapeHtml(helpText)}</div>` : ''}
+            </div>
+        `;
+    }
+
+    function apiRuntimeEndpointTextField(options = {}) {
+        const inputId = options.id || '';
+        const inputClass = options.className || '';
+        const labelFor = inputId ? ` for="${escapeHtml(inputId)}"` : '';
+        const idAttr = inputId ? ` id="${escapeHtml(inputId)}"` : '';
+        return `
+            <div>
+                <label${labelFor} class="block text-sm font-medium text-slate-400 mb-1">${escapeHtml(options.label || '')}</label>
+                ${apiRuntimeEnvHint(options.envName || '')}
+                <input type="text"${idAttr} value="${escapeHtml(options.value || '')}" placeholder="${escapeHtml(options.placeholder || '')}" class="${escapeHtml(inputClass)} api-runtime-input w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200">
+                ${options.helpText ? `<div class="text-xs text-slate-500 mt-1">${escapeHtml(options.helpText)}</div>` : ''}
+            </div>
+        `;
+    }
+
+    function apiRuntimeApiKeyField(options = {}) {
+        const currentKey = options.currentKey || {};
+        const masked = currentKey?.present ? currentKey.masked : 'Not set';
+        const keyEnv = options.envName || currentKey?.env || '';
+        const inputId = options.inputId || '';
+        const inputClass = options.inputClass || '';
+        const labelFor = inputId ? ` for="${escapeHtml(inputId)}"` : '';
+        const idAttr = inputId ? ` id="${escapeHtml(inputId)}"` : '';
+        const currentKeyMarkup = `<span class="font-mono text-slate-300">${escapeHtml(masked)}</span>`;
+        const helpText = options.newRow
+            ? `Current: ${currentKeyMarkup}. New backup rows require a key.`
+            : `Current: ${currentKeyMarkup}. Leave blank to keep this key.`;
+        return `
+            <div>
+                <label${labelFor} class="block text-sm font-medium text-slate-400 mb-1">API Key</label>
+                ${apiRuntimeEnvHint(keyEnv)}
+                <input type="password"${idAttr} autocomplete="off" class="${escapeHtml(inputClass)} api-runtime-input w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200">
+                <div class="text-xs text-slate-500 mt-1">${helpText}</div>
+            </div>
+        `;
+    }
+
+    function apiRuntimeProxyInputPair(prefix, item) {
+        return `
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                ${apiRuntimeTextInput(`${prefix}-http-proxy`, 'HTTP Proxy', item.http_proxy || '', 'Blank uses Station Proxy', item.http_proxy_env || '')}
+                ${apiRuntimeTextInput(`${prefix}-https-proxy`, 'HTTPS Proxy', item.https_proxy || '', 'Blank uses Station Proxy', item.https_proxy_env || '')}
+            </div>
+        `;
+    }
+
+    function apiRuntimeEndpointFields(options = {}) {
+        const baseUrl = options.baseUrl || '';
+        const baseUrlEnv = options.baseUrlEnv || '';
+        const baseUrlInput = options.baseUrlInput || {};
+        const proxyItem = options.proxyItem || {};
+        const proxyInputPrefix = options.proxyClassPrefix || options.proxyPrefix || 'api-runtime';
+        const useProxyClasses = Boolean(options.proxyClassPrefix);
+        return `
+            ${apiRuntimeApiKeyField({
+                currentKey: options.currentKey,
+                envName: options.keyEnv || '',
+                inputId: options.keyInputId || '',
+                inputClass: options.keyInputClass || '',
+                newRow: Boolean(options.newRow),
+            })}
+            ${apiRuntimeEndpointTextField({
+                id: baseUrlInput.id || '',
+                className: baseUrlInput.className || '',
+                label: 'Base URL',
+                value: baseUrl,
+                placeholder: options.baseUrlPlaceholder || 'Blank uses provider default',
+                envName: baseUrlEnv,
+                helpText: options.baseUrlHelp || '',
+            })}
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                ${apiRuntimeEndpointTextField({
+                    id: useProxyClasses ? '' : `${proxyInputPrefix}-http-proxy`,
+                    className: useProxyClasses ? `${proxyInputPrefix}-http-proxy` : '',
+                    label: 'HTTP Proxy',
+                    value: proxyItem.http_proxy || '',
+                    placeholder: 'Blank uses Station Proxy',
+                    envName: proxyItem.http_proxy_env || '',
+                })}
+                ${apiRuntimeEndpointTextField({
+                    id: useProxyClasses ? '' : `${proxyInputPrefix}-https-proxy`,
+                    className: useProxyClasses ? `${proxyInputPrefix}-https-proxy` : '',
+                    label: 'HTTPS Proxy',
+                    value: proxyItem.https_proxy || '',
+                    placeholder: 'Blank uses Station Proxy',
+                    envName: proxyItem.https_proxy_env || '',
+                })}
+            </div>
+        `;
+    }
+
+    function findApiRuntimeProvider(providerId) {
+        const providers = Array.isArray(apiRuntimeConfigCache?.providers) ? apiRuntimeConfigCache.providers : [];
+        return providers.find((provider) => provider.id === providerId) || null;
+    }
+
+    function apiRuntimeBackupRow(entry = {}) {
+        const existingIndex = entry.index || '';
+        return `
+            <div class="api-runtime-backup-row api-runtime-panel rounded-md border border-slate-700 bg-slate-900/40 p-3 space-y-3" data-existing-index="${escapeHtml(existingIndex)}">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="text-sm text-slate-400">Backup Endpoint</div>
+                    <button type="button" class="api-runtime-remove-backup text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md">Remove</button>
+                </div>
+                ${apiRuntimeEndpointFields({
+                    currentKey: entry.api_key,
+                    keyInputClass: 'api-runtime-backup-key',
+                    newRow: !existingIndex,
+                    baseUrl: entry.base_url || '',
+                    baseUrlInput: { className: 'api-runtime-backup-base-url' },
+                    proxyItem: entry,
+                    proxyClassPrefix: 'api-runtime-backup',
+                })}
+            </div>
+        `;
+    }
+
+    function apiRuntimeBackupBlock(provider) {
+        const entries = Array.isArray(provider.backup_endpoints) ? provider.backup_endpoints : [];
+        const rows = entries.map((entry) => apiRuntimeBackupRow(entry)).join('');
+        return `
+            <div class="api-runtime-panel rounded-md border border-slate-700 bg-slate-900/40 p-3 space-y-3">
+                <div class="flex items-center justify-between gap-3">
+                    <div>
+                        <div class="text-sm text-slate-400">Backup Endpoints</div>
+                        <div class="text-xs text-slate-500">Used after provider call failures. Blank Base URL uses provider default; blank proxy uses Station Proxy.</div>
+                    </div>
+                    <button type="button" id="api-runtime-add-backup" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md">Add Backup</button>
+                </div>
+                <div id="api-runtime-backup-list" class="space-y-3">${rows}</div>
+            </div>
+        `;
+    }
+
+    function attachApiRuntimeBackupHandlers() {
+        const addButton = document.getElementById('api-runtime-add-backup');
+        const list = document.getElementById('api-runtime-backup-list');
+        if (addButton && list) {
+            addButton.addEventListener('click', () => {
+                list.insertAdjacentHTML('beforeend', apiRuntimeBackupRow({}));
+            });
+            list.addEventListener('click', (event) => {
+                const button = event.target.closest?.('.api-runtime-remove-backup');
+                if (!button) return;
+                const row = button.closest('.api-runtime-backup-row');
+                if (row) row.remove();
+            });
+        }
+    }
+
+    function renderApiRuntimeStationProxy(config) {
+        const proxy = config?.station_proxy || {};
+        return `
+            ${apiRuntimeProxyInputPair('api-runtime', proxy)}
+            <div class="text-xs text-slate-500">Leave proxy fields blank to use no Station proxy.</div>
+        `;
+    }
+
+    function apiRuntimeBackupEnvText(provider) {
+        if (!provider.backup_api_key_env) return '';
+        return `Add BACKUP_ prefix to the OS env names above to initialize backup settings; use ';' as delimiter.`;
+    }
+
+    function renderApiRuntimeDefaultProvider(provider) {
+        const fallbackText = provider.fallback_configured
+            ? `${provider.backup_endpoint_count || 0} backup endpoint(s) configured.`
+            : 'No backup endpoints configured.';
+        const backupEnvText = apiRuntimeBackupEnvText(provider);
+        return `
+            <div class="space-y-3">
+                ${apiRuntimeEndpointFields({
+                    currentKey: provider.api_key,
+                    keyEnv: provider.api_key_env || '',
+                    keyInputId: 'api-runtime-new-key',
+                    baseUrl: provider.base_url || '',
+                    baseUrlEnv: provider.base_url_env || '',
+                    baseUrlInput: { id: 'api-runtime-base-url' },
+                    baseUrlPlaceholder: provider.default_base_url || 'Blank uses provider default',
+                    baseUrlHelp: 'Leave blank to clear this custom Base URL and use the official/default Base URL.',
+                    proxyItem: provider,
+                    proxyPrefix: 'api-runtime',
+                })}
+            </div>
+            <div class="text-xs text-slate-500">${escapeHtml(fallbackText)} ${escapeHtml(backupEnvText)}</div>
+            ${apiRuntimeBackupBlock(provider)}
+        `;
+    }
+
+    function renderApiRuntimeCodex(config) {
+        const codex = config?.codex || {};
+        return `
+            <div class="text-xs text-slate-500">If the API key and Base URL are left blank, Codex will use the default options from <span class="font-mono">.codex</span>.</div>
+            ${apiRuntimeEndpointFields({
+                currentKey: codex.api_key,
+                keyEnv: codex.api_key_env || '',
+                keyInputId: 'api-runtime-new-key',
+                baseUrl: codex.base_url || '',
+                baseUrlEnv: codex.base_url_env || '',
+                baseUrlInput: { id: 'api-runtime-base-url' },
+                baseUrlPlaceholder: codex.default_base_url || 'Blank uses provider default',
+                proxyItem: codex,
+                proxyPrefix: 'api-runtime-codex',
+            })}
+        `;
+    }
+
+    function renderApiRuntimeExternalCounter(config) {
+        const external = config?.external_counter || {};
+        return `
+            ${apiRuntimeEndpointFields({
+                currentKey: external.api_key,
+                keyEnv: external.api_key_env || '',
+                keyInputId: 'api-runtime-new-key',
+                baseUrl: external.base_url || '',
+                baseUrlEnv: external.base_url_env || '',
+                baseUrlInput: { id: 'api-runtime-base-url' },
+                baseUrlPlaceholder: external.default_base_url || 'Blank uses provider default',
+                baseUrlHelp: 'Leave blank to clear this custom Base URL and use the official/default Base URL.',
+                proxyItem: external,
+                proxyPrefix: 'api-runtime',
+            })}
+        `;
+    }
+
+    function renderApiRuntimeConfigBody() {
+        if (!apiRuntimeConfigBody || !apiRuntimeTargetSelect || !apiRuntimeConfigCache) return;
+        const target = apiRuntimeTargetSelect.value;
+        if (target === 'station_proxy') {
+            apiRuntimeConfigBody.innerHTML = renderApiRuntimeStationProxy(apiRuntimeConfigCache);
+            return;
+        }
+        if (target.startsWith('provider:')) {
+            const providerId = target.split(':')[1];
+            const provider = findApiRuntimeProvider(providerId);
+            if (!provider) {
+                apiRuntimeConfigBody.innerHTML = `<div class="text-sm text-rose-300">Provider not found.</div>`;
+                return;
+            }
+            apiRuntimeConfigBody.innerHTML = renderApiRuntimeDefaultProvider(provider);
+            attachApiRuntimeBackupHandlers();
+            return;
+        }
+        if (target === 'codex') {
+            apiRuntimeConfigBody.innerHTML = renderApiRuntimeCodex(apiRuntimeConfigCache);
+            return;
+        }
+        if (target === 'external_counter') {
+            apiRuntimeConfigBody.innerHTML = renderApiRuntimeExternalCounter(apiRuntimeConfigCache);
+            return;
+        }
+        apiRuntimeConfigBody.innerHTML = '';
+    }
+
+    async function loadApiRuntimeConfig(preferredTarget = null) {
+        const data = await fetchApi('/api/station/api_runtime_config');
+        if (!data.success || !data.config) {
+            showDashboardStatus(data.error || 'Failed to load API settings', 'error');
+            return false;
+        }
+        apiRuntimeConfigCache = data.config;
+        renderApiRuntimeTargetOptions(apiRuntimeConfigCache, preferredTarget);
+        renderApiRuntimeConfigBody();
+        return true;
+    }
+
+    function readApiRuntimeKeyPayload(payload) {
+        const newKeyInput = document.getElementById('api-runtime-new-key');
+        const newKey = newKeyInput ? newKeyInput.value.trim() : '';
+        if (newKey) payload.api_key = newKey;
+    }
+
+    function validateApiRuntimeField(value, label) {
+        if (value.includes(';')) {
+            throw new Error(`${label} cannot contain semicolons. Add another backup row instead.`);
+        }
+        return value;
+    }
+
+    function readApiRuntimeBackupPayload() {
+        const rows = Array.from(document.querySelectorAll('.api-runtime-backup-row'));
+        return rows.map((row, index) => {
+            const existingIndexRaw = row.dataset.existingIndex || '';
+            const existingIndex = existingIndexRaw ? parseInt(existingIndexRaw, 10) : 0;
+            const apiKey = validateApiRuntimeField(row.querySelector('.api-runtime-backup-key')?.value.trim() || '', `Backup #${index + 1} API key`);
+            const baseUrl = validateApiRuntimeField(row.querySelector('.api-runtime-backup-base-url')?.value.trim() || '', `Backup #${index + 1} Base URL`);
+            const httpProxy = validateApiRuntimeField(row.querySelector('.api-runtime-backup-http-proxy')?.value.trim() || '', `Backup #${index + 1} HTTP Proxy`);
+            const httpsProxy = validateApiRuntimeField(row.querySelector('.api-runtime-backup-https-proxy')?.value.trim() || '', `Backup #${index + 1} HTTPS Proxy`);
+            if (!apiKey && !existingIndex) {
+                throw new Error(`Backup #${index + 1} API key is required.`);
+            }
+            return {
+                existing_index: existingIndex || undefined,
+                api_key: apiKey,
+                base_url: baseUrl,
+                http_proxy: httpProxy,
+                https_proxy: httpsProxy,
+            };
+        });
+    }
+
+    function buildApiRuntimePayload() {
+        const target = apiRuntimeTargetSelect ? apiRuntimeTargetSelect.value : 'station_proxy';
+        if (target === 'station_proxy') {
+            return {
+                target: 'station_proxy',
+                http_proxy: document.getElementById('api-runtime-http-proxy')?.value || '',
+                https_proxy: document.getElementById('api-runtime-https-proxy')?.value || '',
+            };
+        }
+        if (target.startsWith('provider:')) {
+            const providerId = target.split(':')[1];
+            const provider = findApiRuntimeProvider(providerId);
+            const payload = {
+                target: 'provider',
+                provider: providerId,
+                base_url: document.getElementById('api-runtime-base-url')?.value || '',
+                http_proxy: document.getElementById('api-runtime-http-proxy')?.value || '',
+                https_proxy: document.getElementById('api-runtime-https-proxy')?.value || '',
+            };
+            readApiRuntimeKeyPayload(payload);
+            payload.backup_endpoints = readApiRuntimeBackupPayload();
+            return payload;
+        }
+        if (target === 'codex') {
+            const payload = {
+                target: 'codex',
+                base_url: document.getElementById('api-runtime-base-url')?.value || '',
+                http_proxy: document.getElementById('api-runtime-codex-http-proxy')?.value || '',
+                https_proxy: document.getElementById('api-runtime-codex-https-proxy')?.value || '',
+            };
+            readApiRuntimeKeyPayload(payload);
+            return payload;
+        }
+        if (target === 'external_counter') {
+            const payload = {
+                target: 'external_counter',
+                base_url: document.getElementById('api-runtime-base-url')?.value || '',
+                http_proxy: document.getElementById('api-runtime-http-proxy')?.value || '',
+                https_proxy: document.getElementById('api-runtime-https-proxy')?.value || '',
+            };
+            readApiRuntimeKeyPayload(payload);
+            return payload;
+        }
+        throw new Error('Unknown API settings target.');
+    }
+
+    if (openApiRuntimeConfigModalButton) {
+        openApiRuntimeConfigModalButton.addEventListener('click', async () => {
+            if (consumeBackdropDraftFlag(apiRuntimeConfigModal)) {
+                if (apiRuntimeConfigModal) apiRuntimeConfigModal.style.display = 'block';
+                if (apiRuntimeTargetSelect) apiRuntimeTargetSelect.focus();
+                return;
+            }
+            showDashboardStatus('Loading API settings...', 'info');
+            const loaded = await loadApiRuntimeConfig();
+            if (loaded && apiRuntimeConfigModal) {
+                apiRuntimeConfigModal.style.display = 'block';
+                if (apiRuntimeTargetSelect) apiRuntimeTargetSelect.focus();
+            }
+        });
+    }
+
+    if (apiRuntimeTargetSelect) {
+        apiRuntimeTargetSelect.addEventListener('change', renderApiRuntimeConfigBody);
+    }
+
+    if (closeApiRuntimeConfigModalButton) {
+        closeApiRuntimeConfigModalButton.addEventListener('click', () => {
+            hideModalWithoutReset(apiRuntimeConfigModal, true);
+        });
+    }
+
+    if (apiRuntimeConfigForm) {
+        apiRuntimeConfigForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const selectedTarget = apiRuntimeTargetSelect ? apiRuntimeTargetSelect.value : null;
+            let payload;
+            try {
+                payload = buildApiRuntimePayload();
+            } catch (error) {
+                showDashboardStatus(error.message || 'Invalid API settings form.', 'error');
+                return;
+            }
+            if (saveApiRuntimeConfigButton) saveApiRuntimeConfigButton.disabled = true;
+            showDashboardStatus('Updating API settings...', 'info');
+            try {
+                const result = await fetchApi('/api/station/api_runtime_config', 'PUT', payload);
+                if (result.success && result.config) {
+                    apiRuntimeConfigCache = result.config;
+                    renderApiRuntimeTargetOptions(apiRuntimeConfigCache, selectedTarget);
+                    renderApiRuntimeConfigBody();
+                    showDashboardStatus(result.message || 'API settings updated.', 'success');
+                } else {
+                    showDashboardStatus(result.error || result.message || 'Failed to update API settings.', 'error');
+                }
+            } catch (error) {
+                // fetchApi already reports the error.
+            } finally {
+                if (saveApiRuntimeConfigButton) saveApiRuntimeConfigButton.disabled = false;
+            }
         });
     }
 

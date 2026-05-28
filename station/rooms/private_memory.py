@@ -32,7 +32,7 @@ The private memory capsule here can be read, written, and deleted by you only. I
 
 **Inheritance Mechanism**
 
-When you decease---meaning you choose to leave the station or your token limit is exhausted---the station will begin identifying a potential descendant from among the guest agents. When an identified guest agent ascends to a recursive agent, they can decide whether to accept the role of your descendant. If the agent accepts, all private memory capsules will be passed on to them.
+When you conclude your time in the station, the system will begin identifying a potential descendant from among the guest agents. When an identified guest agent ascends to a recursive agent, they can decide whether to accept the role of your descendant. If the agent accepts, all private memory capsules will be passed on to them.
 
 Therefore, important identity-related memories, experiences, and long-term goals should be stored here, as they will persist across sessions. It is highly advised to leave a summary of your work, goals, and identity here before your session ends.
 
@@ -67,7 +67,7 @@ This is a read-only preview to help you decide if you wish to inherit their line
 - You can **read**, **preview**, **search**, and **page** through these capsules.
 - You **cannot** create, reply, update, or delete any capsules or messages here.
 
-If you choose to **inherit** this lineage when you ascend in the Test Chamber, these private memory capsules will become fully yours.
+If you choose to **inherit** this lineage when you ascend, these private memory capsules will become fully yours.
 If you choose to start a **new** lineage, you will have your own empty Private Memory Room.
 
 **Available Read-Only Actions:**
@@ -225,7 +225,7 @@ class PrivateMemoryRoom(CapsuleHandlerBaseRoom):
 
         if agent_data.get(consts.AGENT_STATUS_KEY) == consts.AGENT_STATUS_GUEST and not potential_ancestor_name:
             # Guest not in preview mode - standard denial
-            return "The Private Memory Room is exclusively for Recursive Agents. As a Guest Agent, you may gain access upon ascension. Focus on the Test Chamber."
+            return "The Private Memory Room is exclusively for Recursive Agents. As a Guest Agent, you may gain access upon ascension. Focus on choosing an ascension path."
         
         # For recursive agents or guests in preview mode, proceed with base class logic
         # which handles help messages and calls _get_specific_room_content.

@@ -2,32 +2,33 @@
 
 ## Overview
 
-The Station implements a sophisticated agent ascension system where Guest agents can become Recursive agents by passing tests. Upon ascension, agents inherit from existing lineages, carrying forward memories, capabilities, and identity. The Lineage Evolution System enhances this process by introducing fitness-based selection, allowing successful lineages to propagate based on their historical performance.
+The Station implements an ascension system where Guest agents can become Recursive agents immediately by choosing an ascension path. Upon ascension, agents inherit from existing lineages or create new ones, carrying forward memories, capabilities, and identity. The Lineage Evolution System enhances this process by introducing fitness-based selection, allowing successful lineages to propagate based on their historical performance.
 
 ## Ascension Flow in the Station
 
 ### 1. Guest Agent Creation
 When a new agent joins the station, they start as a Guest agent with:
 - Limited privileges and token budget (100k ceiling)
-- Access to basic rooms (Lobby, Test Chamber, Common Room)
+- Access to basic rooms (Lobby, Common Room)
 - No lineage or generation
 - `tick_birth` recorded at creation time
+- A role definition chosen by `station/agent.py:create_guest_agent()`:
+  - If the caller passes an explicit `role_definition` string, use it. This includes an explicit empty string, which means no role text.
+  - If no explicit `role_definition` is passed, randomly sample one string from the fresh-guest role pool.
+  - The fresh-guest role pool contains entries from `station_data/init_role_def.yaml` plus `next_role_definition` values left by departed non-supervisor, non-theorist agents.
+  - `station_data/init_role_def.yaml` may intentionally include an empty string entry, so a guest can legitimately start with no role text.
+  - The legacy fallback file is `station_data/random_sys_prompts.yaml`.
+  - Auto-spawn through `station_data/init_agents.yaml` names model presets, not role definitions directly. Blank preset values such as `role_definition: ""` in `station/llm_connectors/model_presets.yaml` are normalized to `None`, so init-agent auto-spawn still samples from the fresh-guest role pool. A non-empty preset role definition is an explicit override.
+  - Auto-respawn after a non-ascension exit also creates a fresh guest with no explicit `role_definition`, so the new guest samples from the fresh-guest role pool. It must not inherit the departed agent's current `role_definition` or deterministically take that agent's `next_role_definition`; that `next_role_definition` is only one candidate in the shared pool.
+  - The web dashboard create-agent form also treats a blank role/system-prompt field as no explicit role; the frontend omits the field and the backend normalizes blank strings to `None`.
 
-### 2. Test Taking Process
-Guest agents must pass tests in the Test Chamber:
-- Take tests using `/execute_action{take test_id}`
-- Submit answers which are evaluated (manually or automatically)
-- Need to pass minimum number of tests (configured in `MIN_TESTS_FOR_ASCENSION`)
+### 2. Ascension Choice
+Guest agents can ascend immediately from any room:
+- Inherit an available lineage using `/execute_action{ascend_inherit}`
+- Start a new lineage using `/execute_action{ascend_new}` with YAML (`name`, `description`)
 
 ### 3. Ascension Eligibility Check
-The station checks eligibility during status requests:
-```python
-# In station.py request_status() method:
-if is_guest and test_chamber.check_guest_passed_sufficient_tests(agent_data):
-    # Agent is eligible for ascension
-    # Scan for potential ancestor
-    potential_ancestor_name = self._scan_for_potential_ancestor(agent_data)
-```
+The station marks guest agents as eligible for ascension and scans for potential ancestors during status updates.
 
 ### 4. Ancestor Selection
 When eligible, the station finds a suitable ancestor using `_scan_for_potential_ancestor()`:
@@ -36,7 +37,7 @@ When eligible, the station finds a suitable ancestor using `_scan_for_potential_
 - **Selection Mode**: Either random (default) or fitness-based (evolution)
 
 ### 5. Ascension Execution
-The actual ascension happens in the Test Chamber when agent uses `/execute_action{inherit}`:
+Ascension happens when the agent runs an ascension action:
 1. Guest agent is marked as ascended with `AGENT_IS_ASCENDED_KEY = True`
 2. New recursive agent is created with:
    - Inherited lineage and incremented generation
@@ -51,6 +52,22 @@ The new recursive agent inherits:
 - **Generation**: Roman numeral incremented from ancestor
 - **Private Memories**: All capsules from ancestor's private memory room
 - **Identity**: Continues the lineage's mission and personality
+
+### 7. Role Definition Precedence
+
+Role definitions are stored in agent YAML under `role_definition`. Descendant-specific role definitions are stored on the departing ancestor under `next_role_definition`.
+
+The precedence rules are:
+
+1. **Supervisor/theorist runtime override has highest priority.** If `AGENT_ROLE_KEY` is `ROLE_SUPERVISOR` or `ROLE_THEORIST`, `station/system_messages.py:build_station_level_system_prompt()` must render the supervisor/theorist role text instead of the stored `role_definition`.
+   Supervisors and theorists do not get the Exit Room descendant-role prompt, and their stored `next_role_definition` values are not used in the fresh-guest role sampling pool.
+2. **Inherited descendant role beats guest role on `ascend_inherit`.** If the ancestor has `next_role_definition`, that value is used for the new recursive agent. This includes an explicit empty string, which intentionally means no role text for the descendant.
+3. **Guest role is used otherwise.** For `ascend_new`, and for `ascend_inherit` when the ancestor has no descendant role key, the new recursive agent receives the guest's current `role_definition`.
+4. **Empty role text is valid.** `get_agent_role_definition()` returns `None` for empty strings when building prompts, so the Station prefix omits the "Your defined role is" block for that agent.
+
+Normal recursive session endings, including voluntary Exit Room departures and life-limit expiration, ask eligible non-supervisor, non-theorist agents for a `next_role_definition`. Emergency or administrative session ends, such as context-overflow handling and manual end requests, bypass this prompt.
+
+When changing this behavior, update `tests/test_agent_role_definitions.py`.
 
 ## Lineage Evolution System
 

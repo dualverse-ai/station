@@ -22,6 +22,7 @@ from anthropic import Anthropic, APIError, RateLimitError, AuthenticationError, 
 
 from station import file_io_utils
 from station import constants
+from station import runtime_api_config
 from .base import (
     BaseLLMConnector,
     LLMConnectorError,
@@ -46,22 +47,26 @@ class ClaudeConnector(BaseLLMConnector):
                  custom_api_params: Optional[Dict[str, Any]] = None):
 
         self.custom_api_params = custom_api_params or {}
+        self.api_runtime_provider_id = "claude"
+        self.api_runtime_env_names = ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+        self._api_runtime_config_snapshot = runtime_api_config.get_config_snapshot([
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+        ], provider_id="claude")
+        snapshot_env = self._api_runtime_config_snapshot.get("env", {})
         self.active_endpoint_name: Optional[str] = None
-        self.base_url = str(
-            self.custom_api_params.get("base_url")
-            or os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-        ).rstrip("/")
+        self.base_url = (snapshot_env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
         super().__init__(model_name, agent_name, agent_data_path, 
                          api_key, system_prompt, temperature, max_output_tokens,
                          max_retries, retry_delay_seconds)
 
-        self._configure_client()
+        self._configure_client_for_active_endpoint()
 
         # Unified beta headers for all API calls
         self.api_headers = self._build_api_headers()
 
         # self.history_messages will store history in Anthropic's format AFTER pruning
-        self.history_messages: List[Dict[str, Any]] = []
+        self.history_messages: List[Dict[str, Any]] = [] 
         self.last_known_total_session_tokens: Optional[int] = None
         self._initialize_chat_session()
 
@@ -79,26 +84,74 @@ class ClaudeConnector(BaseLLMConnector):
             return {"type": "ephemeral", "ttl": "5m"}
         return {"type": "ephemeral", "ttl": "1h"}
 
-    def _configure_client(self) -> None:
-        effective_api_key = (
-            self.api_key
-            or self.custom_api_params.get("api_key")
-            or os.getenv("ANTHROPIC_API_KEY")
-        )
+    def _resolve_endpoint_settings(self, snapshot: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], str, str]:
+        if snapshot is None:
+            snapshot = runtime_api_config.get_config_snapshot([
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+            ], provider_id="claude")
+        snapshot_env = snapshot.get("env", {})
+        effective_api_key = self.api_key if self._explicit_api_key else snapshot_env.get("ANTHROPIC_API_KEY")
         if not effective_api_key:
             raise ValueError(f"Anthropic API key not provided for {self.agent_name} and ANTHROPIC_API_KEY env variable not set.")
-        self.api_key = effective_api_key
+        base_url = str(snapshot_env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+        endpoint = snapshot.get("provider_endpoint") if isinstance(snapshot, dict) else None
+        endpoint_name = endpoint.get("name") if isinstance(endpoint, dict) else None
+        return endpoint_name, effective_api_key, base_url
+
+    def _configure_client_for_active_endpoint(self, snapshot: Optional[Dict[str, Any]] = None) -> None:
+        if snapshot is None:
+            snapshot = runtime_api_config.get_config_snapshot([
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+            ], provider_id="claude")
+        self._apply_runtime_proxy_snapshot(snapshot)
+        endpoint_name, resolved_api_key, resolved_base_url = self._resolve_endpoint_settings(snapshot)
+        self.api_key = resolved_api_key
+        self.base_url = resolved_base_url
+        self.active_endpoint_name = endpoint_name
+        self._api_runtime_config_snapshot = snapshot
+        self.api_runtime_config_generation = int(snapshot.get("generation", 0))
         try:
             self.client = anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url)
         except Exception as e:
             raise LLMPermanentAPIError(f"Failed to initialize Anthropic client for {self.agent_name}: {e}", original_exception=e)
         self._skip_token_counting = self._should_skip_token_counting()
         self.api_headers = self._build_api_headers()
-        print(f"Info ({self.agent_name}): Claude client configured (base_url={self.base_url}).")
+        endpoint_label = self.active_endpoint_name or "default"
+        print(
+            f"Info ({self.agent_name}): Claude client configured for endpoint '{endpoint_label}' "
+            f"(base_url={self.base_url})."
+        )
+
+    def _refresh_runtime_api_config_if_changed(self) -> bool:
+        if runtime_api_config.get_generation() == self.api_runtime_config_generation:
+            return False
+        self._configure_client_for_active_endpoint()
+        self._initialize_chat_session()
+        return True
+
+    def _apply_provider_runtime_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self._configure_client_for_active_endpoint(snapshot)
+        self._initialize_chat_session()
+
+    def _run_provider_base_recovery_probe(self, snapshot: Dict[str, Any]) -> bool:
+        self._apply_runtime_proxy_snapshot(snapshot)
+        _endpoint_name, api_key, base_url = self._resolve_endpoint_settings(snapshot)
+        client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+        client.messages.create(
+            model=self.model_name,
+            max_tokens=16,
+            messages=[{"role": "user", "content": "Reply with hi."}],
+        )
+        return True
 
     def _should_skip_token_counting(self) -> bool:
         official_base_url = "https://api.anthropic.com"
         return self.base_url.rstrip("/") != official_base_url
+
+    def _can_count_current_session_tokens_authoritatively(self) -> bool:
+        return not self._skip_token_counting
 
     def _get_claude_model_version(self) -> Optional[Tuple[int, int]]:
         """Extract Claude major/minor version from model names such as claude-opus-4-6 or claude-3-5-haiku-20241022."""
@@ -325,10 +378,10 @@ class ClaudeConnector(BaseLLMConnector):
                    isinstance(entry["parts"], list) and entry["parts"]:
                     text_content = "".join(part.get("text", "") for part in entry["parts"] if isinstance(part, dict))
                     # Load thinking_content
-                    thinking_content = entry.get("thinking_content")
+                    thinking_content = entry.get("thinking_content") 
                     history_for_filtering.append({
                         "tick": entry["tick"],
-                        "role": entry["role"],
+                        "role": entry["role"], 
                         "text_content": text_content,
                         "thinking_content": thinking_content
                     })
@@ -392,23 +445,23 @@ class ClaudeConnector(BaseLLMConnector):
         return self._prepare_api_metadata_for_persistence(metadata)
 
     def _initialize_chat_session(self) -> None:
-        raw_history_with_ticks = self._load_history_from_file()
+        raw_history_with_ticks = self._load_history_from_file() 
         processed_history_entries = self._filter_and_prune_history(raw_history_with_ticks)
 
         claude_ready_history: List[Dict[str, Any]] = []
         for entry in processed_history_entries:
-            claude_role = "user" if entry['role'] == "user" else "assistant"
+            claude_role = "user" if entry['role'] == "user" else "assistant" 
             # Skip entries with empty text content to avoid API errors
             if entry.get('text_content', '').strip():
                 # Thinking blocks are not part of Claude's message history API payload
                 claude_ready_history.append({"role": claude_role, "content": entry['text_content']})
-
+        
         self.history_messages = claude_ready_history
         print(f"Info ({self.agent_name}): Claude history_messages initialized/re-initialized. Length: {len(self.history_messages)}")
 
     def _send_message_implementation(self, user_prompt: str, current_tick: int, attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
         token_info: Dict[str, Optional[int]] = {
-            'total_tokens_in_session': None,
+            'total_tokens_in_session': None, 
             'last_exchange_prompt_tokens': None,
             'last_exchange_completion_tokens': None,
             'cache_creation_input_tokens': None,
@@ -416,12 +469,12 @@ class ClaudeConnector(BaseLLMConnector):
         extracted_thinking_text: Optional[str] = None
         llm_text_response_parts: List[str] = []
         final_message_snapshot: Any = None
-
+        
         if not user_prompt.strip():
             raise LLMConnectorError("User prompt cannot be empty for Claude _send_message_implementation.")
 
         api_messages_payload: List[Dict[str, Any]] = []
-
+        
         # Add historical messages without cache control (they'll be cached incrementally)
         for msg in self.history_messages:
             # self.history_messages contains {"role": "user/assistant", "content": "text_string"}
@@ -429,25 +482,25 @@ class ClaudeConnector(BaseLLMConnector):
             # Skip messages with empty content to avoid API errors
             content_str = str(msg.get("content", ""))
             if content_str.strip():  # Only add non-empty messages
-                content_block = [{"type": "text", "text": content_str}]
-
+                content_block = [{"type": "text", "text": content_str}] 
+                
                 api_messages_payload.append({
                     "role": msg["role"], # This should be "user" or "assistant"
                     "content": content_block
                 })
-
+        
         # Note: Claude API requires alternating user/assistant messages
         # If filtering empty messages causes consecutive user messages, the API will handle it
-
+        
         # Current user prompt WITH cache control for incremental conversation caching
         api_messages_payload.append({
-            "role": "user",
+            "role": "user", 
             "content": [{"type": "text", "text": user_prompt, "cache_control": self._build_cache_control()}]
         })
-
+        
         # --- ADDED BACK: Token counting and effective_max_tokens adjustment ---
         effective_max_tokens = int(self.max_output_tokens) if self.max_output_tokens is not None and self.max_output_tokens > 0 else self._get_default_max_output_tokens()
-
+        
         # Calculate current history tokens before adding the new user_prompt for this specific calculation
         # self.history_messages is already pruned and in Claude's format
         current_history_tokens_for_calc = 0
@@ -456,7 +509,7 @@ class ClaudeConnector(BaseLLMConnector):
                 # Use the most reliable count_tokens method available
                 if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'messages') and hasattr(self.client.beta.messages, 'count_tokens'):
                     count_response = self.client.beta.messages.count_tokens(
-                        model=self.model_name,
+                        model=self.model_name, 
                         messages=self.history_messages,
                         extra_headers=self.api_headers
                     )
@@ -481,7 +534,7 @@ class ClaudeConnector(BaseLLMConnector):
             try:
                 if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'messages') and hasattr(self.client.beta.messages, 'count_tokens'):
                     count_resp_payload = self.client.beta.messages.count_tokens(
-                        model=self.model_name,
+                        model=self.model_name, 
                         messages=api_messages_payload,
                         extra_headers=self.api_headers
                     )
@@ -498,7 +551,7 @@ class ClaudeConnector(BaseLLMConnector):
         # Claude's (and many models') context window limit (e.g., 200k) is for INPUT + OUTPUT.
         # So, max_tokens for output should be context_limit - input_tokens.
         MODEL_CONTEXT_WINDOW_LIMIT = 200000 # Example for Claude models
-
+        
         if effective_max_tokens is not None and estimated_input_tokens_for_call + effective_max_tokens > MODEL_CONTEXT_WINDOW_LIMIT:
             original_max_tokens = effective_max_tokens
             effective_max_tokens = MODEL_CONTEXT_WINDOW_LIMIT - estimated_input_tokens_for_call
@@ -512,7 +565,7 @@ class ClaudeConnector(BaseLLMConnector):
             system_messages = []
             if self.system_prompt:
                 system_messages = [{"type": "text", "text": self.system_prompt, "cache_control": self._build_cache_control()}]
-
+            
             thinking_config = self._build_preferred_thinking_config(effective_max_tokens)
             manual_thinking_config = self._build_manual_thinking_config(effective_max_tokens)
             output_config = self._build_output_config()
@@ -526,7 +579,7 @@ class ClaudeConnector(BaseLLMConnector):
             }
             if effective_max_tokens is not None:
                 stream_kwargs["max_tokens"] = effective_max_tokens
-
+            
             if thinking_config:
                 stream_kwargs["thinking"] = thinking_config
             if output_config:
@@ -553,7 +606,7 @@ class ClaudeConnector(BaseLLMConnector):
                 llm_text_response_parts: List[str] = []
                 for text_delta in stream.text_stream:
                     llm_text_response_parts.append(text_delta)
-
+                
                 llm_text_response = "".join(llm_text_response_parts)
 
                 final_message_snapshot = stream.get_final_message()
@@ -565,10 +618,10 @@ class ClaudeConnector(BaseLLMConnector):
                             if block.type == 'thinking' and hasattr(block, 'thinking'):
                                 extracted_thinking_text = block.thinking
                                 break # Assuming one thinking block for now
-
-                    if final_message_snapshot.usage:
+                    
+                    if final_message_snapshot.usage: 
                         token_info['last_exchange_prompt_tokens'] = final_message_snapshot.usage.input_tokens
-                        token_info['last_exchange_completion_tokens'] = final_message_snapshot.usage.output_tokens
+                        token_info['last_exchange_completion_tokens'] = final_message_snapshot.usage.output_tokens                        
                         token_info['last_exchange_cached_tokens'] = final_message_snapshot.usage.cache_read_input_tokens # type: ignore
                         token_info['cache_creation_input_tokens'] = final_message_snapshot.usage.cache_creation_input_tokens # type: ignore
                         estimated_total_tokens = self._estimate_total_session_tokens_from_usage(final_message_snapshot.usage)
@@ -595,7 +648,7 @@ class ClaudeConnector(BaseLLMConnector):
             self.history_messages.append({"role": "user", "content": user_prompt})
             # Only append assistant response if it's not empty
             if llm_text_response.strip() or (extracted_thinking_text and extracted_thinking_text.strip()):
-                self.history_messages.append({"role": "assistant", "content": llm_text_response})
+                self.history_messages.append({"role": "assistant", "content": llm_text_response}) 
 
             recounted_total = self.get_current_total_session_tokens()
             if recounted_total is not None:
@@ -613,24 +666,24 @@ class ClaudeConnector(BaseLLMConnector):
 
             return llm_text_response, extracted_thinking_text, token_info
 
-        except anthropic.RateLimitError as e:
+        except anthropic.RateLimitError as e: 
             print(f"DEBUG - Raw Claude RateLimitError for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMTransientAPIError(f"Anthropic API rate limit for {self.agent_name}: {getattr(e, 'message', str(e))}", original_exception=e)
-        except anthropic.AuthenticationError as e:
+        except anthropic.AuthenticationError as e: 
             print(f"DEBUG - Raw Claude AuthenticationError for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMPermanentAPIError(f"Anthropic API authentication error for {self.agent_name}: {getattr(e, 'message', str(e))}", original_exception=e)
-        except anthropic.APIConnectionError as e:
+        except anthropic.APIConnectionError as e: 
             print(f"DEBUG - Raw Claude APIConnectionError for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMTransientAPIError(f"Anthropic API connection error for {self.agent_name}: {getattr(e, 'message', str(e))}", original_exception=e)
-        except anthropic.APITimeoutError as e:
+        except anthropic.APITimeoutError as e: 
             print(f"DEBUG - Raw Claude APITimeoutError for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMTransientAPIError(f"Anthropic API request timed out for {self.agent_name}: {getattr(e, 'message', str(e))}", original_exception=e)
-        except anthropic.InternalServerError as e:
+        except anthropic.InternalServerError as e: 
             print(f"DEBUG - Raw Claude InternalServerError for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMTransientAPIError(f"Anthropic API internal server error for {self.agent_name}: {getattr(e, 'message', str(e))}", original_exception=e)
-        except anthropic.BadRequestError as e:
+        except anthropic.BadRequestError as e: 
             print(f"DEBUG - Raw Claude BadRequestError for {self.agent_name}: {self._get_error_debug_info(e)}")
-
+            
             # Check for context overflow first - this should terminate the agent session
             if self._is_context_overflow_error(e):
                 print(f"CRITICAL ({self.agent_name}): Context window overflow detected in Claude API")
@@ -642,20 +695,20 @@ class ClaudeConnector(BaseLLMConnector):
                     f"{getattr(e, 'message', str(e))}"
                 )
                 raise LLMTransientAPIError(error_message, original_exception=e)
-
-            error_message = f"Anthropic API Bad Request for {self.agent_name}: {getattr(e, 'message', str(e))}"
-            if hasattr(e, 'body') and e.body and isinstance(e.body, dict) and 'error' in e.body and isinstance(e.body['error'], dict):
-                 err_details = e.body['error']
-                 err_type = err_details.get('type')
-                 err_msg_detail_api = err_details.get('message')
-                 error_message = f"Anthropic API Bad Request for {self.agent_name} (Type: {err_type}): {err_msg_detail_api or str(e)}"
-                 if err_type == 'overloaded_error':
-                     raise LLMTransientAPIError(error_message, original_exception=e)
-            raise LLMPermanentAPIError(error_message, original_exception=e)
-        except anthropic.APIError as e:
+            
+            error_message = f"Anthropic API Bad Request for {self.agent_name}: {getattr(e, 'message', str(e))}" 
+            if hasattr(e, 'body') and e.body and isinstance(e.body, dict) and 'error' in e.body and isinstance(e.body['error'], dict): 
+                 err_details = e.body['error'] 
+                 err_type = err_details.get('type') 
+                 err_msg_detail_api = err_details.get('message') 
+                 error_message = f"Anthropic API Bad Request for {self.agent_name} (Type: {err_type}): {err_msg_detail_api or str(e)}" 
+                 if err_type == 'overloaded_error': 
+                     raise LLMTransientAPIError(error_message, original_exception=e) 
+            raise LLMPermanentAPIError(error_message, original_exception=e) 
+        except anthropic.APIError as e: 
             print(f"DEBUG - Raw Claude APIError for {self.agent_name}: {self._get_error_debug_info(e)}")
-            status_code = getattr(e, 'status_code', None)
-
+            status_code = getattr(e, 'status_code', None) 
+            
             # Check for overloaded_error in the error body (can appear in APIError too, not just BadRequestError)
             if hasattr(e, 'body') and e.body and isinstance(e.body, dict) and 'error' in e.body and isinstance(e.body['error'], dict):
                 err_details = e.body['error']
@@ -663,34 +716,34 @@ class ClaudeConnector(BaseLLMConnector):
                 if err_type == 'overloaded_error':
                     err_msg = f"Anthropic API overloaded error for {self.agent_name}: {err_details.get('message', 'Overloaded')}"
                     raise LLMTransientAPIError(err_msg, original_exception=e)
-
-            err_msg = f"Anthropic API error (status: {status_code}) for {self.agent_name}: {getattr(e, 'message', str(e))}"
-            if status_code and status_code >= 500:
-                raise LLMTransientAPIError(err_msg, original_exception=e)
-            else:
-                raise LLMPermanentAPIError(err_msg, original_exception=e)
-        except Exception as e:
+            
+            err_msg = f"Anthropic API error (status: {status_code}) for {self.agent_name}: {getattr(e, 'message', str(e))}" 
+            if status_code and status_code >= 500: 
+                raise LLMTransientAPIError(err_msg, original_exception=e) 
+            else: 
+                raise LLMPermanentAPIError(err_msg, original_exception=e) 
+        except Exception as e: 
             print(f"DEBUG - Raw Claude Exception for {self.agent_name}: {self._get_error_debug_info(e)}")
-            raise LLMConnectorError(f"Unexpected error in Claude _send_message_implementation for {self.agent_name}: {str(e)}", original_exception=e)
-
+            raise LLMConnectorError(f"Unexpected error in Claude _send_message_implementation for {self.agent_name}: {str(e)}", original_exception=e) 
+ 
     def _get_error_debug_info(self, e: Exception) -> str:
         """Helper method to extract detailed error information for debugging"""
         error_info = f"type={type(e).__name__}, str='{str(e)}'"
-
+        
         # Common attributes for Anthropic API errors
         for attr in ['status_code', 'message', 'body', 'response', 'request_id']:
             if hasattr(e, attr):
                 value = getattr(e, attr)
                 error_info += f", {attr}={repr(value)}"
-
+        
         # Any other attributes
         if hasattr(e, '__dict__'):
-            extra_attrs = {k: v for k, v in e.__dict__.items()
-                          if k not in ['status_code', 'message', 'body', 'response', 'request_id']
+            extra_attrs = {k: v for k, v in e.__dict__.items() 
+                          if k not in ['status_code', 'message', 'body', 'response', 'request_id'] 
                           and not k.startswith('_')}
             if extra_attrs:
                 error_info += f", extra_attrs={extra_attrs}"
-
+        
         return error_info
 
     def _is_context_overflow_error(self, error: Exception) -> bool:
@@ -699,7 +752,7 @@ class ClaudeConnector(BaseLLMConnector):
 
         if self._has_explicit_context_overflow_signal(error_str):
             return True
-
+        
         # Check error body for Claude BadRequestError
         if hasattr(error, 'body') and error.body and isinstance(error.body, dict):
             if 'error' in error.body and isinstance(error.body['error'], dict):
@@ -707,7 +760,7 @@ class ClaudeConnector(BaseLLMConnector):
                 message = error_details.get('message', '')
                 if self._has_explicit_context_overflow_signal(str(message)):
                     return True
-
+        
         return False
 
     def _has_explicit_context_overflow_signal(self, message: str) -> bool:
@@ -765,10 +818,10 @@ class ClaudeConnector(BaseLLMConnector):
         """Converts current (pruned) self.history_messages to generic format."""
         simple_history: List[Dict[str, str]] = []
         # self.history_messages is already pruned and in Claude's format
-        for message in self.history_messages:
+        for message in self.history_messages: 
             role = "user" if message.get("role") == "user" else "model" # Convert "assistant" to "model"
             text_content = message.get("content", "")
-            if not isinstance(text_content, str): text_content = str(text_content)
+            if not isinstance(text_content, str): text_content = str(text_content) 
             simple_history.append({"role": role, "text": text_content})
         return simple_history
 
@@ -781,20 +834,20 @@ class ClaudeConnector(BaseLLMConnector):
         try:
             if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'messages') and hasattr(self.client.beta.messages, 'count_tokens'):
                  count_response = self.client.beta.messages.count_tokens(
-                     model=self.model_name,
+                     model=self.model_name, 
                      messages=self.history_messages,
                      extra_headers=self.api_headers
                  )
-            elif hasattr(self.client, 'count_tokens'):
+            elif hasattr(self.client, 'count_tokens'): 
                  combined_text = " ".join([m.get('content', '') for m in self.history_messages if isinstance(m.get('content'), str)])
-                 count_response = self.client.count_tokens(text=combined_text)
+                 count_response = self.client.count_tokens(text=combined_text) 
             else:
                 print(f"Warning ({self.agent_name}): count_tokens method not found on Anthropic client.")
                 return None
 
-            if hasattr(count_response, 'input_tokens'):
+            if hasattr(count_response, 'input_tokens'): 
                 return count_response.input_tokens
-            elif hasattr(count_response, 'count'):
+            elif hasattr(count_response, 'count'): 
                 return count_response.count
             else:
                 print(f"Warning ({self.agent_name}): Could not determine token count from Claude count_tokens response: {count_response}")

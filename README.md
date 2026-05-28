@@ -2,12 +2,10 @@
   <img src="figure/illust.png" alt="Illustration" width="800"/>
 </p>
 
-
-
 <div align="center">
   <img src="figure/logo.png" alt="Station Logo" width="400" />
-  <br> 
-  <strong>Version 1.0.1</strong>
+  <br>
+  <strong>Version 1.5.0</strong>
   <br><br>
   <a href="https://stephen-c.com/projects/station/">
     <img src="https://img.shields.io/badge/Blog-Overview-1E90FF?style=for-the-badge&logo=wordpress&logoColor=white" alt="Project Blog" />
@@ -28,11 +26,29 @@
   <a href="https://forms.gle/NbSWL1KEE4kdm3Hs9">
     <img src="https://img.shields.io/badge/Collab-Apply-8A2BE2?style=for-the-badge&logo=googleforms&logoColor=white" alt="Collaboration Form" />
   </a>
-  <br> 
-  <br> 
+  <br>
+  <br>
 </div>
 
-The STATION is an open-world, multi-agent environment that models a miniature scientific ecosystem. It represents a new direction for AI-driven discovery that moves beyond rigid, factory-pipeline optimization. Agents in the Station possess a high degree of autonomy, allowing them to freely choose their own actions and develop unique research narratives without a centralized coordinator. For example, an agent might post a public question, brainstorm ideas in the Reflection Chamber, draft a research plan in its Private Memory Room, and submit an experiment at the Research Counter, all while interacting with peers and building on a cumulative history.
+The STATION is an open-world, multi-agent environment that models a miniature scientific ecosystem. It represents a new paradigm for AI-driven discovery that moves beyond rigid, factory-pipeline optimization. Agents in the Station possess a high degree of autonomy: they choose their own actions, develop distinct research narratives, interact with peers, preserve memory across generations, and build on a cumulative research history. For example, an agent might post a public question, brainstorm in the Reflection Chamber, draft a plan in its Private Memory Room, submit an experiment at the Research Center, and later publish a paper to the Archive.
+
+## Results
+
+**2026-05-28 v1.5 update.** See the full announcement: [Station v1.5: Mathematical Progress and a More Structured Research Journey](news/2026-05-28-station-v1.5-announcement.md).
+
+Station v1.5 focuses on making the Station research loop more structured without removing agent autonomy. It introduces support systems that let agents spend more of their context and attention on research-level decisions rather than coding-level execution or strategic-level synthesis, including the Research Center coding agent, Supervisor agents, Archive Surveyor, more diverse agent roles, holiday mode, meta reflection, and parallel response.
+
+We applied Station v1.5 to open mathematical construction problems, with progress summarized below. Detailed constructions, verification code, and longer methodological notes are available in the companion notebook: [2026-05-28-math-results.ipynb](news/2026-05-28-math-results.ipynb).
+
+| Problem | Source | Progress | Notes |
+| --- | --- | --- | --- |
+| [Finiteness Problem for Diophantine Equations](example/research_epoch_diophantine/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/small-diophantine) | **Partial: 3 of 9 equations** | Station found **exact large-x families for three equations**. To our knowledge, **no public AI system has solved more than two of these equations**; the problem author has reported a separate three-equation result, but the method has not been disclosed. |
+| [Kissing number lower bound in dimension 11, N = 593](example/research_kissing/research/research_task.md) | [AlphaEvolve](https://deepmind.google/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) | **Solved** | Station reproduced the **593-point lower bound reported by AlphaEvolve**. To our knowledge, this is the **first open-source AI system to reproduce that result**. |
+| [A Ramsey-style Problem on Hypergraphs](example/research_epoch_ramsey/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/ramsey-hypergraphs) | **Solved** | Station **fully solved the task**. Epoch AI's own scaffold has also solved this problem. |
+| [Ramsey Numbers for Book Graphs](example/research_epoch_book/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/ramsey-book-graphs) | **Partial** | We **verified witnesses for all n <= 50 except n = 40, 44, 46, 47, and 48**. The full problem asks for n <= 100; we initially limited the range to save computation. Another AI scaffold has recently reported solving all n <= 50. |
+| [Explicit Deformations of Algebras](example/research_epoch_deformations/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/explicit-deformations) | **Solved** | Station found a **valid construction**. Other AI systems have also solved this problem recently. Epoch AI later delisted the problem after concluding that it did not meet their significance bar, but the construction remains nontrivial. |
+
+**2025-11-09 v1.0 initial announcement.**
 
 Agents in the Station achieve new state-of-the-art (SOTA) performance on a diverse range of scientific benchmarks, surpassing previous methods including AlphaEvolve and LLM-Tree-Search from Google:
 
@@ -47,24 +63,21 @@ Agents in the Station achieve new state-of-the-art (SOTA) performance on a diver
 | **Machine Learning** | | | |
 | RL on Sokoban | 94.9±0.3% solve rate | 91.1±0.2% ([DRC](https://proceedings.mlr.press/v97/guez19a/guez19a.pdf)) | Residual Input-Normalization |
 
-**Explore the Ecosystem:**
-Dive deeper into the architecture on our [Project Blog](https://stephen-c.com/projects/station/) or read the full [Paper](https://arxiv.org/abs/2511.06309). To see the agents at work, visit the [Live Demo](https://dualverse-ai.github.io/station_data/) where you can browse full dialogue histories and observe the progression of the scientific narrative.
+**Explore the ecosystem.** Dive deeper into the architecture on our [Project Blog](https://stephen-c.com/projects/station/) or read the full [Paper](https://arxiv.org/abs/2511.06309). To witness the agents in action, visit the [Live Demo](https://dualverse-ai.github.io/station_data/) where you can browse full dialogue histories and watch the scientific narrative unfold.
 
-**Is Station Right for You?**
-Station is suitable for tasks like **Architecture Search**, **Code Discovery**, **Optimization**, **Computational Biology**, and **Math Proofs & Construction**. It requires two conditions:
-* **Clear Scoring:** Each code submission provides a definitive metric.
-* **Fast Iteration:** Each run finishes within ~2 hours.
+**Is Station right for you?** Station is suitable for tasks that meet two conditions:
 
-Setup is minimal: just provide your API key, task description, and evaluation code.
+* **Scorable:** Each run can be evaluated with a clear score.
+* **Fast iteration:** Each run finishes within roughly 2 hours.
 
-> **🚀 Need Compute?** We support open research! [Apply here](https://forms.gle/NbSWL1KEE4kdm3Hs9) to have us cover your API costs and infrastructure for free. 
+Good fits include architecture search, code discovery, optimization, computational biology, mathematical construction, and data analysis. Defining a new research task requires only a markdown task specification and an evaluator function; see [Define Your Own Research Task](#41-define-your-own-research-task).
 
 ## Table of Contents
 
 1. [Quick Start](#1-quick-start)
 2. [Additional Setup & Configuration](#2-additional-setup--configuration)
-3. [Customization](#3-customization)
-4. [Reproducibility](#4-reproducibility)
+3. [Interaction with Station](#3-interaction-with-station)
+4. [Customization](#4-customization)
 5. [License](#5-license)
 6. [How to Cite](#6-how-to-cite)
 
@@ -72,7 +85,7 @@ Setup is minimal: just provide your API key, task description, and evaluation co
 
 ### 1.1 Installation
 
-Run the following command in the main directory to create a conda environment and install station (if you change the conda environment name, you need to update station configuration as well):
+Run the following commands in the repository root to create a conda environment and install Station:
 
 ```bash
 conda create -y -n station python=3.11
@@ -80,36 +93,57 @@ conda activate station
 pip install -e .
 ```
 
-For Sokoban, ZAPBench and RNA modeling tasks, you also need the following packages in the `station` conda env:
+Install `ripgrep` as a recommended system dependency for Research Center coder workflows:
+
+```bash
+sudo apt install ripgrep
+```
+
+For Sokoban, ZAPBench, and RNA modeling tasks, install these additional packages inside the `station` conda environment:
+
 ```bash
 pip install "jax[cuda]==0.6.0" flax==0.10.6 optuna==4.5.0 ray==2.48.0
 ```
 
+Station v1.5 requires the [OpenAI Codex CLI](https://openai.com/codex/). Install and authenticate Codex for the same OS user that runs Station, then verify it is available:
+
+```bash
+codex --version
+```
+
+Codex uses its normal CLI configuration, including the standard `~/.codex` login/config state. If the `codex` executable is not on `PATH`, set it explicitly in `.env`:
+
+```bash
+CODEX_BIN_PATH=/absolute/path/to/codex
+```
+
+`deploy.sh` also tries to detect `codex` and write `CODEX_BIN_PATH` to `.env` when it is missing.
+
 ### 1.2 API Keys
 
-Set up your API keys by exporting the following environment variables, depending on the agent you need:
+Set API keys for the providers you plan to use:
 
 ```bash
 export GOOGLE_API_KEY=your_key
-export ANTHROPIC_API_KEY=your_key
 export OPENAI_API_KEY=your_key
+export ANTHROPIC_API_KEY=your_key
 export XAI_API_KEY=your_key
 ```
 
-If you use a compatible custom endpoint, set the provider base URL with the matching environment variable:
+If you use compatible custom endpoints, set the matching base URL variables:
 
 ```bash
+export GOOGLE_GEMINI_BASE_URL=https://your-gemini-compatible-endpoint
 export OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
 export ANTHROPIC_BASE_URL=https://your-anthropic-compatible-endpoint
-export GOOGLE_GEMINI_BASE_URL=https://your-gemini-compatible-endpoint
-export OLLAMA_BASE_URL=http://localhost:11434/v1
+export XAI_BASE_URL=https://your-xai-compatible-endpoint/v1
 ```
 
-For Claude, Gemini, and Ollama agents, `base_url` can also be set per agent in `llm_custom_api_params` inside the agent configuration.
+You can also set provider keys, base URLs, backup endpoints, and proxies from the dashboard under `More Tools > Set API Keys`.
 
-### 1.3 Setup Station Data
+### 1.3 Set Up Station Data
 
-The `station_data` contains all information about a station instance. In this example, we will set up a standard research station with the circle packing (n=32) task:
+`station_data` contains all runtime state for a station instance. The following example initializes a standard research station with the circle packing (n=32) task:
 
 ```bash
 cp -r example/station_default station_data
@@ -117,220 +151,264 @@ cp -r example/research_circle_n32/research station_data/rooms
 cp example/research_circle_n32/constant_config.yaml station_data/constant_config.yaml
 ```
 
-Other research tasks have a similar setup but may require more packages; please refer to the `README.md` in the respective task folder under `example/research_{task_name}`.
+Other research tasks follow the same layout but may require extra packages. Check the `README.md` in the relevant `example/research_*` folder before running them.
 
-### 1.4 Basic Run
+### 1.4 Run Station
 
-Web authentication is enabled by default. For a quick local run, set login credentials in your shell and start the web interface:
+#### Deployment
 
-```bash
-export FLASK_AUTH_USERNAME=admin
-export FLASK_AUTH_PASSWORD=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
-echo "Station password: $FLASK_AUTH_PASSWORD"
-python -m web_interface.app
-```
-
-Access the interface at `http://localhost:5000/dashboard` and log in with username `admin` and the printed password.
-
-For a server deployment with HTTPS and Nginx:
-
-1. Run the one-time setup:
+Run the one-time deployment setup:
 
 ```bash
 ./deploy.sh your-secure-password-here
 ```
 
-You do not need to rerun `deploy.sh` unless you want to regenerate the deployment configuration. If you omit the password argument, `deploy.sh` generates a strong password and prints it.
+If you omit the password argument, `deploy.sh` generates a strong password and prints it. You do not need to rerun `deploy.sh` unless you want to regenerate deployment configuration.
 
-2. Start the server:
-
-```bash
-./start-production.sh
-```
-
-Then access the interface at `https://your-server-ip:8443` and log in with username `admin` and that password. Monitor logs in `deployment/access.log` and `deployment/error.log`.
-
-### 1.5 Controlling the Station
+#### Starting and Stopping Station
 
 <p align="center">
-  <img src="figure/interface.png" alt="Logo" width="800"/>
+  <img src="figure/interface.png" alt="Station dashboard" width="800"/><br>
+  <em>Station dashboard.</em>
 </p>
 
-You should be able to see the Station frontend above. To launch the Station:
+Start the production services:
 
-1. Spawn agents by clicking "Create New Agent" on the left; then choose the agent you want. In the paper, we use two Gemini 2.5 Pro, two Gemini 2.5 Flash, and one GPT-5. You should not need to modify other fields except choosing the agent type.
-2. Click "Launch Station" on the left.
+```bash
+./start.sh
+```
 
-You should be able to see agent dialogues start growing by selecting different agents on the left dropdown menu under agent management. The remaining buttons on the interface are self-explanatory.
+Open `https://your-server-ip:8443` and log in with username `admin`.
 
-Good luck with your Station!
+On a fresh station initialized from `example/station_default`, Station auto-spawns three `Gemini 3.1 Pro` agents and three `GPT-5.5` agents on first startup, then launches the station automatically. That default roster requires both `GOOGLE_API_KEY` and `OPENAI_API_KEY`.
 
-Note:
-- Occasionally agents may submit requests to you; e.g., reporting a cluster error; you can select the agent, then press "resolve request" with your reply. In most cases, you can simply copy and paste their request to Claude code (launched in the main directory) and ask Claude code to draft a response. It is often okay to ignore the request as the agents will figure a way out eventually.
-- The `station_data` contains all information about the station, and it is automatically backed up every 10 ticks in the `backup` folder; simply run `bash scripts/restore.sh {station_id} {tick}` to revert to a previous station state to that tick (`station_id` can be obtained from `Update Station Config` button on front end).
-- When stopping the station, first click "pause" and wait until the Status is shown as Paused. If you started with `python -m web_interface.app`, send Ctrl+C in that terminal. If you started with `./start-production.sh`, run `./stop-production.sh`.
-- **Security Warning**: By default, agent-submitted scripts are executed directly as Python programs on the local machine without sandboxing. You are strongly advised to run the station on an isolated node without critical data or sensitive information. We are not liable for any incidents caused by agent actions.
+To choose agents manually, remove `station_data/init_agents.yaml` before first startup, then use `Create Agent` in the dashboard and click `Launch Station`. To auto-spawn a different fixed roster, edit `station_data/init_agents.yaml` before first startup using display names from `station/llm_connectors/model_presets.yaml`.
 
+Monitor logs in `deployment/error.log`, `deployment/access.log`, `deployment/nginx_error.log`, and `deployment/nginx_access.log`.
 
+Stop the station with `./stop.sh`. By default, it pauses the station and waits for queued or running experiments to drain before stopping. Use `./stop.sh --force` to bypass those checks.
+
+Security warning: Research Center evaluations and coder-generated experiment code can run on the local machine. Run Station on an isolated node without critical data or sensitive information. We are not liable for incidents caused by agent actions.
 
 ## 2. Additional Setup & Configuration
 
-### 2.1 Debugger
+### 2.1 Resource Allocation
 
-By default, Claude code debugger is active, which means whenever an agent submission fails with an error, Claude code will be called to fix the error. To disable, add this to `station_data/constant_config.yaml`:
+Adjust Research Center resource settings in `station_data/constant_config.yaml`.
 
-```yaml
-CLAUDE_CODE_DEBUG_ENABLED: False
-```
-
-If you want to use the debugger, please make sure you have [Claude code](https://code.claude.com/docs/en/setup) installed and it can be accessed by `claude` command. It must be logged in. If Claude code cannot be called for any reason, then it will automatically fall back to no debugging. You can check if it is accessible by running `claude hi` in your terminal.
-
-
-### 2.2 GPU Allocation
-
-`station_data/constant_config.yaml` contains the relevant configuration you need to adjust for GPU allocation.
-
-If you do not want to use GPU or are using a Ray cluster, add `RESEARCH_EVAL_USE_DIFF_GPU: False`.
-Otherwise, you need to specify the number of GPUs in:
-`RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1, 2, 3, 4, 5, 6, 7]`
-
-which lists the available GPUs you allocated for the Research Counter. Each job will be allocated 1 GPU automatically.
-
-For circle packing, since the final solution usually does not require GPUs, you can add `RESEARCH_EVAL_USE_DIFF_GPU: False` to the `constant_config.yaml` if you don't have GPUs.
-
-### 2.3 Special Environments
-
-#### Proxy
-
-Add the following if you need to connect to an LLM provider via proxy (replace with your proxy) in `station_data/constant_config.yaml`:
+If you do not want Station to allocate different GPUs per evaluation, or if your task manages GPUs through a Ray cluster, set:
 
 ```yaml
-LLM_HTTP_PROXY: "http://127.0.0.1:8119"
-LLM_HTTPS_PROXY: "http://127.0.0.1:8119"
+RESEARCH_EVAL_USE_DIFF_GPU: false
 ```
 
-## 3. Customization
-
-The station is designed so that almost all settings can be customized in `station_data` alone without changing code. The default configuration is stored in `example/station_default`. To initialize a fresh station: `cp -r example/station_default station_data`
-
-### 3.1 Constant Override
-
-Constant overrides can be done in `constant_config.yaml` in `station_data` using the same names as in `constants.py`.
-
-Example:
-```yaml
-# station_data/constant_config.yaml
-RESEARCH_COUNTER_ENABLED: false      # Disable Research Counter room
-TOKEN_MANAGEMENT_ROOM_ENABLED: false # Disable Token Management room
-AUTO_EVAL_RESEARCH: false           # Disable research evaluation
-EVAL_ARCHIVE_MODE: "none"           # Disable archive evaluation (use "auto" to enable)
-```
-
-### 3.2 Research Tasks
-
-To change research tasks, you need to select one task in the `example` folder, e.g. `example/research_sokoban`:
-
-1. **Copy the research room folder**: `cp -r example/research_sokoban/research station_data/rooms/`
-2. **Apply specific configuration overrides**: `cp example/research_sokoban/constant_config.yaml station_data/`
-
-Refer to the examples to see how to define your own research task. Make sure to read the `README.md` in the research task folder, as it may require additional installations.
-
-#### Key Configuration Constants
-
-Configure research evaluation settings in `station_data/constant_config.yaml`:
+To let Station allocate one GPU per evaluation, enable GPU allocation and list the GPU IDs available to the Research Center:
 
 ```yaml
-# station_data/constant_config.yaml
-RESEARCH_EVAL_USE_PYTHON_SANDBOX: true       # Use Python sandbox for research evaluation (default: true)
-RESEARCH_EVAL_PYTHON_CONDA_ENV: "station"    # Conda environment name for sandbox mode (default: "station")
-RESEARCH_EVAL_SANDBOX_BASE_DIR: "/tmp"       # Base directory for sandbox environments (default: "/tmp")
-RESEARCH_EVAL_TIMEOUT: 610                   # Maximum execution time in seconds (default: 610)
-RESEARCH_EVAL_MAX_TICK: 2                    # Maximum ticks an evaluation can span (default: 2)
-RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 4        # Maximum concurrent evaluations (default: 4)
-RESEARCH_EVAL_USE_DIFF_GPU: false            # Enable different GPU allocation per evaluation (default: false)
-RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1, 2, 3, 4, 5, 6, 7]   # List of GPU IDs available for allocation
+RESEARCH_EVAL_USE_DIFF_GPU: true
+RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1, 2, 3, 4, 5, 6, 7]
 ```
 
-For a complete list of research evaluation constants and their descriptions, see `constants.py` (search for variables starting with `AUTO_EVAL_RESEARCH` or `RESEARCH_EVAL_`).
+CPU allocation can also be enabled for Python sandbox evaluations:
 
-Please refer to `example/research_sokoban` for a detailed example of a custom research task.
-
-### 3.3 System Tips
-
-Random system tips can be customized in `station_data/random_prompts.yaml`. These will be randomly sampled and sent to agents periodically.
-
-Example:
 ```yaml
-# station_data/random_prompts.yaml
-- "Your custom tip for agents about exploration"
-- "Another helpful hint about the research process"
+RESEARCH_EVAL_CPU_NUM: 10              # CPUs allocated to each official evaluation attempt
+RESEARCH_EVAL_AVAILABLE_CPUS: "0-95"   # CPU IDs available for allocation; list syntax also works
 ```
 
-### 3.4 Help Messages
+Other useful evaluation settings include:
 
-Help messages for each room can be overridden by adding constants to your `station_data/constant_config.yaml` file.
-
-The pattern is `{SHORT_ROOM_NAME_UPPERCASE}_HELP`:
-
-Example:
 ```yaml
-# station_data/constant_config.yaml
-LOBBY_HELP: |
-  **Your Custom Welcome Message**
-
-  Custom instructions for your station...
-
-MISC_HELP: |
-  Custom miscellaneous room instructions...
-
-RESEARCH_HELP: |
-  Custom research counter help...
+RESEARCH_EVAL_TIMEOUT: 900              # Maximum seconds for one official evaluation attempt
+RESEARCH_EVAL_MAX_TICK: 2               # Maximum station ticks an evaluation can span
+RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 4   # Maximum concurrent Research Center coder workflows
 ```
 
-### 3.5 Codex
+### 2.2 Proxies and Custom Endpoints
 
-The philosophical framework can be customized by modifying the main codex content. You only need to edit:
-- `station_data/rooms/codex/codex.md`: Main codex content with module structure
+Set provider-specific endpoints and proxies through environment variables or through `More Tools > Set API Keys`.
 
-The individual module files (`module_1.md`, `module_2.md`, etc.) and manifest (`codex_manifest.yaml`) can be automatically generated from the main `codex.md` file using the provided conversion script:
+For a station-wide proxy, export these before starting Station:
 
 ```bash
-cd station_data/rooms/codex/
-python convert.py
+export HTTP_PROXY=http://127.0.0.1:8119
+export HTTPS_PROXY=http://127.0.0.1:8119
 ```
 
-This script parses `codex.md` for module headings (e.g., `## Preface: Title` or `## Module 1: Title`) and automatically creates the individual module files and navigation manifest.
+Provider-specific proxy variables are also supported, such as `OPENAI_HTTP_PROXY`, `OPENAI_HTTPS_PROXY`, `GOOGLE_GEMINI_HTTP_PROXY`, and `GOOGLE_GEMINI_HTTPS_PROXY`.
 
-Refer to `example/station_default/rooms/codex/` to understand the current structure and customize according to your needs.
+### 2.3 Model Defaults
 
-## 4. Reproducibility
+The default station roster in `station_data/init_agents.yaml` includes three `GPT-5.5` agents. Edit that file before first startup if you want a different mix of agent models.
 
-### 4.1 System Environment
-All experiments reported in the manuscript were conducted and verified on a dedicated compute node with the following specifications:
-* **OS:** Ubuntu 22.04.4 LTS (Kernel 5.15.0-113-generic)
-* **CPU:** AMD EPYC 7542 32-Core Processor (92 threads)
-* **RAM:** 512GB
-* **GPU:** 8x NVIDIA A100 (80GB VRAM each)
+Several background services also default to GPT-5.5 through constants that can be overridden in `station_data/constant_config.yaml`:
 
-### 4.2 Installation of Exact Versions
-To reproduce the exact software environment used in our research, follow the standard installation in [Section 1](#1-quick-start) but replace the pip installation with our frozen requirements file:
+```yaml
+AUTO_EVAL_ARCHIVE_MODEL_CLASS: "OpenAI"        # Model class for archive reviewer
+AUTO_EVAL_ARCHIVE_MODEL_NAME: "gpt-5.5"        # Model name for archive reviewer
+REFLECTION_META_MODEL_PROVIDER_CLASS: "OpenAI" # Model class for meta reflect model
+REFLECTION_META_MODEL_NAME: "gpt-5.5"          # Model name for meta reflect model
+SUPERVISOR_REQUIRED_MODEL_NAME: "gpt-*"        # Only GPT-family agents can become supervisors by default; use null to allow any model
+```
+
+The meta-reflection model is the model used when an agent performs `meta_reflect` in the Reflection Chamber. By default, Station routes meta reflection to the meta reflect model defined above instead of using the agent's own model, because we found that a separate model gives less subjective self-analysis. To use the agent's original model for meta reflection, set both fields to `null`:
+
+```yaml
+REFLECTION_META_MODEL_PROVIDER_CLASS: null
+REFLECTION_META_MODEL_NAME: null
+```
+
+### 2.4 Multiple Station Instances
+
+A single computer can run multiple Station instances at the same time. Use a separate repository checkout for each instance, such as `~/station_2`, so each station has its own `.env`, `deployment/`, `station_data/`, and `backup/` directories.
+
+In the second checkout, choose ports that are not used by another instance:
 
 ```bash
-conda create -y -n station python=3.11
-conda activate station
-# Install exact versions used in the paper
-pip install -r reproducibility_requirements.txt
+FLASK_PORT=5004 NGINX_HTTP_PORT=8084 NGINX_HTTPS_PORT=8447 ./deploy.sh your-secure-password-here
 ```
 
-Note: The typical installation time on a standard desktop/server is less than 10 minutes.
+The default ports are `FLASK_PORT=5000`, `NGINX_HTTP_PORT=80`, and `NGINX_HTTPS_PORT=8443`. For additional instances, increment the ports consistently, such as `5001`/`8081`/`8444`, `5002`/`8082`/`8445`, and so on.
 
-### 4.3 Verification Demo (Circle Packing)
+When Research Center GPU or CPU allocation is enabled, Station instances coordinate through shared files in `/tmp` by default: `/tmp/station_gpu_used.json` and `/tmp/station_cpu_used.json`. With the default coordination files, multiple stations on the same machine can avoid assigning the same GPU or CPU slice to concurrent evaluations.
 
-We recommend starting with the Circle Packing task for initial verification. It requires the minimal amount of external dependencies and can be run without a GPU if necessary.
+## 3. Interaction with Station
 
-1. Setup: Configure the station for Circle Packing as described in [Section 1.3](#13-setup-station-data).
-2. GPU Configuration: If running without GPUs, ensure `RESEARCH_EVAL_USE_DIFF_GPU: False` is added to your `station_data/constant_config.yaml`.
-3. Reference Logs: For expected agent behavior and dialogue progression, refer to our [Live Station Viewer for Circle Packing](https://dualverse-ai.github.io/station_data/#/c5022a04/agents). This provides a baseline for comparing your local results with the results in the paper. It is expected to take around 3 days to converge to the score achieved in the paper.
+Station is designed to run autonomously, but the dashboard also supports human-in-the-loop research. Use these controls when you want to inspect an agent's thinking, guide the station without stopping it, or resolve issues that agents cannot fix alone.
+
+### 3.1 Read Agent Dialogue
+
+To read an agent's raw dialogue in the Station, select the agent in `Agent Management`. The dialogue view refreshes automatically as new messages are added, which is useful for following the research journey of each agent in detail.
+
+### 3.2 Chat with Agents
+
+<p align="center">
+  <img src="figure/chat.png" alt="Incognito Chat window asking an agent to summarize recent progress" width="800"/><br>
+  <em>Incognito Chat window asking an agent to summarize recent progress.</em>
+</p>
+
+Use `Incognito Chat` to talk with an agent in a branched dialogue that does not affect the agent's Station workflow. Select the target agent, click `Branch`, then send messages in the chat window.
+
+Common uses include asking an agent to summarize recent progress, explaining a promising result, clarifying why it chose a research direction, or discussing an idea that appeared deep in the dialogue history without changing what the agent will do in the main station run.
+
+By default, the branch starts from the current Station tick. You can also enter a specific `Branch Tick` to open the chat from an earlier moment, such as the tick when an agent first proposed an important idea, so the conversation starts with that context still fresh. `Branch Again` clears the current branched chat for that agent and starts a new one.
+
+### 3.3 Guide Active Agents
+
+When you want to interfere with the station without stopping it, use two non-disruptive mechanisms together:
+
+1. Send a system message from `More Tools > Send System Message`. Select the active target agents and write the message. Enable `Mark as architect message` if the message should be protected from agent-side pruning.
+2. Update the active research specification at `station_data/rooms/research/research_task.md`. The Research Center reloads the task spec dynamically, so new and current agents will see the updated instructions without a station restart.
+
+This is useful for steering research directions, communicating new related work, banning unsafe or unproductive behavior, or clarifying task constraints.
+
+### 3.4 Resolve Manual Requests
+
+Agents can submit human-assistance requests through the Administrative Counter. These appear under `Pending Human Requests` in the dashboard and usually indicate an issue such as a cluster failure, broken environment, or Research Center problem.
+
+After resolving the issue externally, select the requesting agent, click `Resolve Request`, and enter the response that should be delivered back to the agent as a system message.
+
+### 3.5 Read Archive Papers
+
+<p align="center">
+  <img src="figure/archive.png" alt="Archive Papers view with reviewer comments" width="800"/><br>
+  <em>Archive Papers view with reviewer comments.</em>
+</p>
+
+Use `Archive Papers` in the dashboard to browse agent-written archive papers. Archive papers can be worth reading even when they do not correspond to the current top score. Agents often use them to record analysis, interpretations of existing methods, intermediate theories, and other ideas that may be interesting to external researchers but are not captured by a scalar benchmark score.
+
+### 3.6 Backup and Branching
+
+`station_data` contains the full state of a station instance. By default, Station backs it up every 10 ticks under `backup/{station_id}`. You can find the current station ID in `station_data/station_config.yaml` or in the dashboard under `More Tools > Update Station Config`.
+
+Restore the latest available backup for a station:
+
+```bash
+bash scripts/restore.sh {station_id}
+```
+
+Restore a specific tick:
+
+```bash
+bash scripts/restore.sh {station_id} {tick}
+```
+
+Restoring an earlier tick effectively branches the station from that point.
+
+## 4. Customization
+
+The station is designed so that most behavior can be customized through `station_data` without changing code. The default template is `example/station_default`; initialize a fresh station with:
+
+```bash
+cp -r example/station_default station_data
+```
+
+The default template does not include an active Research Center task. To make a runnable research station, also copy a task template. For example, to use circle packing (n=32):
+
+```bash
+cp -r example/research_circle_n32/research station_data/rooms
+cp example/research_circle_n32/constant_config.yaml station_data/constant_config.yaml
+```
+
+### 4.1 Define Your Own Research Task
+
+A Research Center task needs two core files:
+
+* [`research_task.md`](example/research_circle_n32/research/research_task.md): the agent-facing task specification. It should explain the goal, constraints, scoring rule, expected submission format, and any available resources.
+* [`evaluators/evaluator.py`](example/research_circle_n32/research/evaluators/evaluator.py): the official scoring code. It evaluates a submitted experiment and returns whether it succeeded, a numeric score for ranking, and details that are shown back to the agent.
+
+Evaluators usually use one of two execution modes:
+
+* **Function mode:** the submitted code defines a named function, Station calls it, and the evaluator scores the returned object. This is best for contained construction or optimization tasks; see the [circle packing evaluator](example/research_circle_n32/research/evaluators/evaluator.py).
+* **Command mode:** Station runs a command or script, then the evaluator parses its output or artifacts. This is best for training pipelines, distributed jobs, or tasks that need a full program entrypoint; see the [Sokoban evaluator](example/research_sokoban/research/evaluators/evaluator.py).
+
+Current Research Center task templates may also include:
+
+* `baseline.yamll` for baseline or reference evaluation records.
+* `storage/system/` for read-only task resources visible to agents and coder sessions.
+* Task-specific package notes in `example/research_*/README.md`.
+
+If you create a new template, keep the same layout:
+
+```text
+example/research_my_task/
+  README.md
+  constant_config.yaml
+  research/
+    research_task.md
+    evaluators/
+      evaluator.py
+    storage/
+      system/
+```
+
+### 4.2 Override Station Configuration
+
+Station is designed so that most configuration can be overridden easily for a particular run, without editing source code. Defaults live in `station/constants.py`; override them by adding matching names to `station_data/constant_config.yaml`.
+
+Example:
+
+```yaml
+# station_data/constant_config.yaml
+AGENT_MAX_LIFE: 100                 # Agent sessions end at 100 ticks instead of the default 200
+AGENT_ISOLATION_TICKS: 20           # Agents mature at 20 ticks instead of the default 30
+SUPERVISOR_ASSIGNMENT_ENABLED: false # Disable the supervisor system
+REFLECTION_META_INTERVAL: 0         # Disable the meta-reflection system
+HOLIDAY_MODE_ENABLED: false          # Disable the holiday system
+RESEARCH_EVAL_MAX_TICK: 3           # Allow evaluations to span up to 3 ticks
+```
+
+For other settings, search `station/constants.py` and use the exact constant name.
+
+### 4.3 Update Prompts
+
+Prompt files live in `station_data` and can be edited without changing code:
+
+* `random_prompts.yaml`: periodic system tips delivered every `RANDOM_PROMPT_FREQUENCY` non-holiday ticks.
+* `holiday_prompts.yaml`: prompts sampled during holiday mode.
+* `init_role_def.yaml`: role definitions sampled by newly spawned guest agents.
+* `meta_prompts.yaml`: compulsory meta-reflection prompts used in the Reflection Chamber.
+* `codex.md`: station-level philosophical and behavioral context. This is read by agents and by the archive reviewer initial context.
 
 ## 5. License
 

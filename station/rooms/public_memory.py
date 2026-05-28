@@ -24,6 +24,8 @@ import re
 from station.rooms.capsule_room_base import CapsuleHandlerBaseRoom
 from station.base_room import RoomContext, InternalActionHandler # RoomContext might be needed by parent
 from station import constants
+from station import capsule as capsule_manager
+from station import supervisor_utils
 
 _PUBLIC_MEMORY_ROOM_HELP = """
 **Welcome to the Public Memory Room.**
@@ -79,6 +81,46 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
     def _get_additional_yaml_fields_for_create(self) -> List[str]:
         # As per spec, 'abstract' is required for public memory capsules
         return [constants.YAML_CAPSULE_ABSTRACT]
+
+    def _get_room_specific_header_elements(self,
+                                           agent_data: Dict[str, Any],
+                                           room_context: RoomContext,
+                                           current_tick: int) -> List[str]:
+        consts = room_context.constants_module
+
+        if supervisor_utils.is_supervisor(agent_data, consts):
+            return []
+
+        supervisor_name = supervisor_utils.get_active_supervisor_name(
+            room_context.agent_manager,
+            consts
+        )
+        if not supervisor_name:
+            return []
+
+        supervisor_data = room_context.agent_manager.load_agent_data(supervisor_name)
+        if not supervisor_data:
+            return []
+
+        pinned_ids_full = self._get_pinned_capsules_ids(supervisor_data, room_context)
+
+        agent_read_status = self._get_agent_read_status(agent_data, room_context)
+        capsule_type = self._get_capsule_type()
+        lineage = self._get_lineage_for_capsule_operations(agent_data, room_context)
+        pinned_capsule_metadata = capsule_manager.get_capsules_by_full_ids(
+            capsule_type,
+            lineage,
+            pinned_ids_full,
+            agent_read_status=agent_read_status,
+        )
+
+        return self._build_pinned_capsules_section(
+            "**Supervisor's Pinned Capsules**",
+            pinned_ids_full,
+            pinned_capsule_metadata,
+            agent_read_status,
+            room_context
+        )
 
     def _check_action_permission(self,
                                  action_command: str,
@@ -222,20 +264,10 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
             if actual_agent_name == author_name:
                 continue  # Don't notify the author of their own mentions
             
-            # Load the agent data using the actual (correct case) name
-            mentioned_agent_data = agent_manager.load_agent_data(actual_agent_name)
-            if not mentioned_agent_data:
-                continue  # Agent doesn't exist
-                
-            # Check mute settings
             room_short_name = consts.SHORT_ROOM_NAME_PUBLIC_MEMORY
-            if room_short_name not in mentioned_agent_data:
-                mentioned_agent_data[room_short_name] = {}
-            
-            muted_capsules = mentioned_agent_data[room_short_name].get(consts.AGENT_ROOM_STATE_MUTED_CAPSULES_KEY, {})
-            if muted_capsules.get(full_capsule_id, False):
-                continue  # Agent has muted this capsule
-            
+            first_msg_id = f"{full_capsule_id}-1"
+            current_tick = room_context.station_instance._get_current_tick()
+
             # Create mention notification for capsule creation
             notification_text = (
                 f"{author_name} mentioned you in public capsule \"{capsule_title}\" (#{numeric_id_part}):\n"
@@ -243,20 +275,29 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
                 f"To reply, use `/execute_action{{goto {consts.SHORT_ROOM_NAME_PUBLIC_MEMORY}}}` then `/execute_action{{reply {numeric_id_part}}}`.\n"
                 f"To mute, use `/execute_action{{goto {consts.SHORT_ROOM_NAME_PUBLIC_MEMORY}}}` then `/execute_action{{mute {numeric_id_part}}}`." 
             )
-            
-            # Auto-mark the first message as read since the agent received the full content
-            if consts.AGENT_ROOM_STATE_READ_STATUS_KEY not in mentioned_agent_data[room_short_name]:
-                mentioned_agent_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = {}
-            
-            # Mark the first message of the capsule as read (format: public_X-1)
-            first_msg_id = f"{full_capsule_id}-1"
-            mentioned_agent_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY][first_msg_id] = True
-            
-            # Check if mentioned agent should receive notifications (maturity check)
-            current_tick = room_context.station_instance._get_current_tick()
-            if room_context.station_instance._should_agent_receive_broadcast(mentioned_agent_data, current_tick, "general"):
+
+            def update_mentioned_agent(mentioned_agent_data: Dict[str, Any]) -> None:
+                if mentioned_agent_data.get(consts.AGENT_SESSION_ENDED_KEY) or mentioned_agent_data.get(consts.AGENT_IS_ASCENDED_KEY):
+                    return
+                if room_short_name not in mentioned_agent_data or not isinstance(mentioned_agent_data.get(room_short_name), dict):
+                    mentioned_agent_data[room_short_name] = {}
+
+                muted_capsules = mentioned_agent_data[room_short_name].get(consts.AGENT_ROOM_STATE_MUTED_CAPSULES_KEY, {})
+                if muted_capsules.get(full_capsule_id, False):
+                    return  # Agent has muted this capsule
+
+                if not room_context.station_instance._should_agent_receive_broadcast(mentioned_agent_data, current_tick, "general"):
+                    return
+
+                # Auto-mark the first message as read since the agent received the full content.
+                read_status = mentioned_agent_data[room_short_name].get(consts.AGENT_ROOM_STATE_READ_STATUS_KEY)
+                if not isinstance(read_status, dict):
+                    read_status = {}
+                    mentioned_agent_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = read_status
+                read_status[first_msg_id] = True
                 agent_manager.add_pending_notification(mentioned_agent_data, notification_text)
-                agent_manager.save_agent_data(actual_agent_name, mentioned_agent_data)
+
+            agent_manager.update_agent_with_function(actual_agent_name, update_mentioned_agent)
 
     def _after_capsule_created(self,
                                new_capsule_data: Dict[str, Any],
@@ -315,13 +356,15 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
             if other_agent_name == author_name or other_agent_name.lower() in mentioned_agents_lookup:
                 continue 
 
-            other_agent_data = agent_manager.load_agent_data(other_agent_name)
-            if other_agent_data: 
-                # Check if agent should receive public memory broadcasts
+            def update_other_agent(other_agent_data: Dict[str, Any]) -> None:
+                if other_agent_data.get(consts.AGENT_SESSION_ENDED_KEY) or other_agent_data.get(consts.AGENT_IS_ASCENDED_KEY):
+                    return
+                # Check if agent should receive public memory broadcasts.
                 if room_context.station_instance._should_agent_receive_broadcast(other_agent_data, current_tick, "general"):
-                    # Don't auto-mark messages as read for non-mentioned agents since they only get title notifications
+                    # Don't auto-mark messages as read for non-mentioned agents since they only get title notifications.
                     agent_manager.add_pending_notification(other_agent_data, notification_text)
-                    agent_manager.save_agent_data(other_agent_name, other_agent_data)
+
+            agent_manager.update_agent_with_function(other_agent_name, update_other_agent)
 
     def _after_reply_added(self,
                            target_capsule_data: Dict[str, Any], 
@@ -387,22 +430,9 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
         
         # Notify each agent with appropriate message
         for agent_to_notify_name in all_agents_to_notify:
-            agent_to_notify_data = agent_manager.load_agent_data(agent_to_notify_name)
-            if not agent_to_notify_data:
-                continue
-                
             room_short_name = consts.SHORT_ROOM_NAME_PUBLIC_MEMORY
-            if room_short_name not in agent_to_notify_data:
-                agent_to_notify_data[room_short_name] = {}
-            
-            # Check if agent has muted this capsule
-            muted_capsules = agent_to_notify_data[room_short_name].get(consts.AGENT_ROOM_STATE_MUTED_CAPSULES_KEY, {})
             capsule_full_id = target_capsule_data[consts.CAPSULE_ID_KEY]
-            
-            if muted_capsules.get(capsule_full_id, False):
-                # Skip notification for muted capsule - don't mark as read
-                continue
-            
+
             # Determine if this agent was mentioned
             was_mentioned = agent_to_notify_name in mentioned_agent_names
             
@@ -428,16 +458,30 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
                 f"To mute, use `/execute_action{{goto {consts.SHORT_ROOM_NAME_PUBLIC_MEMORY}}}` then `/execute_action{{mute {original_capsule_numeric_id}}}`."
             )
             
-            # Auto-mark the message as read only for mentioned agents (who got full content)
-            if was_mentioned:
-                if consts.AGENT_ROOM_STATE_READ_STATUS_KEY not in agent_to_notify_data[room_short_name]:
-                    agent_to_notify_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = {}
-                
-                # Mark the new message as read
-                agent_to_notify_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY][new_msg_id_full] = True
-            
-            # Check if agent should receive reply notifications (maturity check)
             current_tick = room_context.station_instance._get_current_tick()
-            if room_context.station_instance._should_agent_receive_broadcast(agent_to_notify_data, current_tick, "general"):
+
+            def update_agent_to_notify(agent_to_notify_data: Dict[str, Any]) -> None:
+                if agent_to_notify_data.get(consts.AGENT_SESSION_ENDED_KEY) or agent_to_notify_data.get(consts.AGENT_IS_ASCENDED_KEY):
+                    return
+                if room_short_name not in agent_to_notify_data or not isinstance(agent_to_notify_data.get(room_short_name), dict):
+                    agent_to_notify_data[room_short_name] = {}
+
+                # Check if agent has muted this capsule.
+                muted_capsules = agent_to_notify_data[room_short_name].get(consts.AGENT_ROOM_STATE_MUTED_CAPSULES_KEY, {})
+                if muted_capsules.get(capsule_full_id, False):
+                    return
+
+                if not room_context.station_instance._should_agent_receive_broadcast(agent_to_notify_data, current_tick, "general"):
+                    return
+
+                # Auto-mark the message as read only for mentioned agents who got full content.
+                if was_mentioned:
+                    read_status = agent_to_notify_data[room_short_name].get(consts.AGENT_ROOM_STATE_READ_STATUS_KEY)
+                    if not isinstance(read_status, dict):
+                        read_status = {}
+                        agent_to_notify_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = read_status
+                    read_status[new_msg_id_full] = True
+
                 agent_manager.add_pending_notification(agent_to_notify_data, notification_text)
-                agent_manager.save_agent_data(agent_to_notify_name, agent_to_notify_data)
+
+            agent_manager.update_agent_with_function(agent_to_notify_name, update_agent_to_notify)

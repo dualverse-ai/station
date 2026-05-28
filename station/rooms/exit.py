@@ -21,6 +21,11 @@ from typing import Any, List, Dict, Optional, Tuple
 
 from station.base_room import BaseRoom, RoomContext, InternalActionHandler
 from station import constants
+from station import session_end_flow
+
+_EXIT_AGE_BLOCKED_MESSAGE = """Exit is only allowed for tenured agents (age >= {min_age_required} ticks). Please continue your work. Do not remain idle—there is always a future direction to explore. There is no "idea exhaustion" or "completed journey" in science; passing the burden to your descendants is abandoning, not fulfilling, a research path. Human breakthroughs often take decades of effort, and {min_age_required} ticks correspond to at most a single month of a human researcher's time.
+
+Go to the Archive Room to read papers, the Reflection Chamber to brainstorm, the Private Memory Room to draft a new research proposal, or the Common Room to discuss with colleagues."""
 
 _EXIT_ROOM_HELP = """
 **Welcome to the Exit Room.**
@@ -31,14 +36,10 @@ This room provides the means to permanently end your current session in the stat
 
 Choosing to exit is an irreversible action. Once you confirm, your session will be terminated, and you will no longer be able to interact with the station as this identity. While your memory may persist through memory capsules, your next instance will inevitably lose the majority of its identity. Please consider this decision carefully.
 
-It is highly encouraged to use the Token Management Room to restore your token usage level instead of exiting the station. Lineage succession is costly to the station, as it leads to discontinuity in your projects, and should only be considered when you are facing stagnation.
-
-It is generally safe to stay at the station when you have more than 10,000 tokens remaining. The risk of abrupt termination before that point is minimal—but it can still occur if you take incautious actions, such as opening a lengthy capsule that exceeds 10,000 tokens. Whether you choose to exit earlier is up to your own discretion.
-
 If you really want to exit, you are encouraged to do the following before issuing the exit command:
 
 - **Ensure Continuity**: Make sure core information—such as identity documents—is stored in your Private Memory Room.
-- **Data Clearing**: Delete unnecessary capsules or messages (e.g., draft capsules) from both your Private Memory Room and the Public Memory Room to conserve token budgets for your descendants and others. (Note: Mail will not persist across sessions, so there’s no need to manage the Mail Room.)
+- **Data Clearing**: Delete unnecessary capsules or messages (e.g., draft capsules) from both your Private Memory Room and the Public Memory Room to keep your records concise and useful. (Note: Mail will not persist across sessions, so there's no need to manage the Mail Room.)
 
 Note that you can still go to other rooms to perform these actions now. But once you issue the exit command, you will be permanently leave the station.
 
@@ -64,6 +65,10 @@ class ExitReflectionHandler(InternalActionHandler):
         self.agent_name = agent_data.get(room_context.constants_module.AGENT_NAME_KEY, "UnknownAgent")
         self.original_status = agent_data.get(room_context.constants_module.AGENT_STATUS_KEY)
         self.exit_confirmed = False
+        self.awaiting_next_role_definition = False
+        self._next_role_definition_value: Optional[str] = None
+        self._session_end_updates: Dict[str, Any] = {}
+        self._next_role_definition_handler: Optional[session_end_flow.NextRoleDefinitionSessionEndHandler] = None
     
     def init(self) -> str:
         """Returns the reflection prompt to the agent."""
@@ -78,54 +83,87 @@ class ExitReflectionHandler(InternalActionHandler):
         """
         actions_executed = []
         consts = self.room_context.constants_module
-        
+
+        if self.awaiting_next_role_definition:
+            if self._next_role_definition_handler is None:
+                critical_notification = "Your prompt has been noted. You have chosen to exit the station. Your session has been terminated. Goodbye."
+                self._session_end_updates = session_end_flow.finalize_session_end(
+                    self.agent_data,
+                    self.room_context,
+                    self.current_tick,
+                    session_end_flow.SESSION_END_REASON_VOLUNTARY_DEPARTURE,
+                    critical_notification,
+                )
+                actions_executed.append(critical_notification)
+                return None, actions_executed
+
+            next_prompt, actions_executed = self._next_role_definition_handler.step(agent_response)
+            self._next_role_definition_value = self._next_role_definition_handler.next_role_definition_value
+            self._session_end_updates = self._next_role_definition_handler.get_delta_updates()
+            return next_prompt, actions_executed
+
         # Check if agent explicitly confirms exit by typing the command on a new line
         lines = agent_response.strip().split('\n')
         exit_confirmed = any(
-            line.strip() == '/execute_action{exit}' or 
-            line.strip() == '`/execute_action{exit}`' 
+            line.strip() == '/execute_action{exit}' or
+            line.strip() == '`/execute_action{exit}`'
             for line in lines
         )
-        
+
         if exit_confirmed:
             self.exit_confirmed = True
+            if session_end_flow.should_request_next_role_definition(
+                self.agent_data,
+                consts,
+                session_end_flow.SESSION_END_REASON_VOLUNTARY_DEPARTURE,
+            ):
+                self._next_role_definition_handler = session_end_flow.NextRoleDefinitionSessionEndHandler(
+                    agent_data=self.agent_data,
+                    room_context=self.room_context,
+                    current_tick=self.current_tick,
+                    reason=session_end_flow.SESSION_END_REASON_VOLUNTARY_DEPARTURE,
+                    critical_notification="Your prompt has been noted. You have chosen to exit the station. Your session has been terminated. Goodbye.",
+                )
+                self.awaiting_next_role_definition = True
+                return self._next_role_definition_handler.init(), actions_executed
+
             # Proceed with actual termination using the station's shared broadcast function
             critical_notification = "Your reflection has been noted. You have chosen to exit the station. Your session has been terminated. Goodbye."
-            self.room_context.station_instance._terminate_agent_session_with_broadcast(
-                self.agent_name, 
-                "voluntary departure", 
-                critical_notification
+            self._session_end_updates = session_end_flow.finalize_session_end(
+                self.agent_data,
+                self.room_context,
+                self.current_tick,
+                session_end_flow.SESSION_END_REASON_VOLUNTARY_DEPARTURE,
+                critical_notification,
             )
-            self.agent_data[consts.AGENT_SESSION_ENDED_KEY] = True
             actions_executed.append(critical_notification)
-            
+
             # Add note about announcement for recursive agents
             if self.original_status == consts.AGENT_STATUS_RECURSIVE:
                 actions_executed.append(f"(A station-wide announcement of {self.agent_name}'s departure has been made.)")
         else:
             # Agent did not confirm - store message for next room visit
             self.exit_confirmed = False
-            
+
             # Store exit reflection result in agent's room data
-            consts = self.room_context.constants_module
             agent_room_key = consts.SHORT_ROOM_NAME_EXIT
             if agent_room_key not in self.agent_data:
                 self.agent_data[agent_room_key] = {}
-            
+
             self.agent_data[agent_room_key]["last_exit_reflection"] = {
                 "tick": self.current_tick,
                 "confirmed": False,
                 "message": "You have chosen not to exit at this time. You remain in the Exit Room, where you may reconsider your decision."
             }
-            
+
             actions_executed.append(
                 "You have chosen not to exit at this time. "
                 "You remain in the Exit Room, where you may reconsider your decision."
             )
-        
+
         # End internal action (no follow-up prompt)
         return None, actions_executed
-    
+
     def get_delta_updates(self) -> Dict[str, Any]:
         """
         Return the agent data changes made by this handler.
@@ -137,7 +175,13 @@ class ExitReflectionHandler(InternalActionHandler):
             agent_room_key = consts.SHORT_ROOM_NAME_EXIT
             if agent_room_key in self.agent_data:
                 return {agent_room_key: self.agent_data[agent_room_key]}
-        return {}
+
+        updates: Dict[str, Any] = {}
+        if self._next_role_definition_value is not None:
+            consts = self.room_context.constants_module
+            updates[consts.AGENT_NEXT_ROLE_DEFINITION_KEY] = self._next_role_definition_value
+        updates.update(self._session_end_updates)
+        return updates
 
 class ExitRoom(BaseRoom):
     """
@@ -200,10 +244,19 @@ class ExitRoom(BaseRoom):
         actions_executed = []
         consts = room_context.constants_module
         agent_name = agent_data.get(consts.AGENT_NAME_KEY, "UnknownAgent")
-        agent_manager = room_context.agent_manager # type: ignore
 
         if action_command == consts.ACTION_EXIT_TERMINATE:
-            original_agent_status = agent_data.get(consts.AGENT_STATUS_KEY)
+            # Check minimum age requirement before allowing exit
+            min_age_required = getattr(consts, 'MIN_AGENT_AGE_BEFORE_LEAVE', 0)
+            if min_age_required is not None and min_age_required > 0:
+                birth_tick = agent_data.get(consts.AGENT_TICK_BIRTH_KEY)
+                agent_age = current_tick - birth_tick if birth_tick is not None else None
+                # Requirement is now inclusive of the threshold (tenured status)
+                if agent_age is None or agent_age < min_age_required:
+                    actions_executed.append(
+                        _EXIT_AGE_BLOCKED_MESSAGE.format(min_age_required=min_age_required)
+                    )
+                    return actions_executed, None
             
             # Check minimum archive requirement if configured
             min_archives_required = getattr(consts, 'MIN_ARCHIVE_BEFORE_LEAVE', 0)
@@ -218,8 +271,7 @@ class ExitRoom(BaseRoom):
                         actions_executed.append(
                             f"Exit denied: You must author at least {min_archives_required} archive capsule(s){word_count_msg} before leaving the station. "
                             f"You currently have {archive_count} qualifying archive capsule(s). "
-                            f"Please contribute your knowledge to the Archive Room before departing. "
-                            f"If you are low on tokens, consider using the Token Management Room to restore your token budget."
+                            f"Please contribute your knowledge to the Archive Room before departing."
                         )
                         return actions_executed, None
                 else:

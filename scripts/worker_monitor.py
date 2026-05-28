@@ -165,7 +165,7 @@ def disconnect_from_ray(stop_station=False):
     Disconnect this node from the Ray cluster.
 
     Args:
-        stop_station: If True, also stop the station by running stop-production.sh
+        stop_station: If True, also stop the station by running stop.sh --force
 
     Returns:
         bool: True if successfully disconnected, False otherwise
@@ -174,21 +174,21 @@ def disconnect_from_ray(stop_station=False):
         # Stop station FIRST if requested (before disconnecting from Ray)
         if stop_station:
             try:
-                logging.warning("Stopping station by running stop-production.sh...")
+                logging.warning("Stopping station by running stop.sh --force...")
                 # Get the directory where this script is located
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 # Go up one level to main station directory
                 station_dir = os.path.dirname(script_dir)
-                stop_script = os.path.join(station_dir, 'stop-production.sh')
+                stop_script = os.path.join(station_dir, 'stop.sh')
 
                 if os.path.exists(stop_script):
-                    stop_result = subprocess.run([stop_script], capture_output=True, text=True, timeout=30)
+                    stop_result = subprocess.run([stop_script, '--force'], capture_output=True, text=True, timeout=30)
                     if stop_result.returncode == 0:
                         logging.info("Successfully stopped station")
                     else:
                         logging.error(f"Failed to stop station: {stop_result.stderr}")
                 else:
-                    logging.error(f"stop-production.sh not found at {stop_script}")
+                    logging.error(f"stop.sh not found at {stop_script}")
             except Exception as e:
                 logging.error(f"Error stopping station: {e}")
 
@@ -230,7 +230,7 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Monitor GPU health and disconnect from Ray on failures')
     parser.add_argument('--station', action='store_true',
-                        help='Also stop the station (run stop-production.sh) when disconnecting from Ray')
+                        help='Also stop the station (run stop.sh --force) when disconnecting from Ray')
     args = parser.parse_args()
     
     logger = setup_logging()

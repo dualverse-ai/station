@@ -26,6 +26,7 @@ from typing import Any, List, Dict, Optional, Tuple
 
 from . import constants 
 from . import file_io_utils
+from . import capsule_index
 
 
 # --- Helper Functions ---
@@ -49,6 +50,18 @@ def _ensure_string_or_none(value: Any) -> Optional[str]:
     if value is None:
         return None
     return str(value)
+
+
+def _sync_capsule_index_after_save(
+    capsule_data: Dict[str, Any],
+    file_path: str,
+    lineage_name: Optional[str] = None,
+) -> None:
+    try:
+        capsule_index.upsert_capsule(capsule_data, file_path, lineage_name=lineage_name)
+    except Exception as e:
+        print(f"CapsuleIndex: update failed path={file_path!r}: {e}")
+        raise
 
 # ... (other helper functions like _generate_message_id, _get_capsule_dir_path, etc. remain the same) ...
 def _generate_message_id(capsule_id_str: str, messages_list: List[Dict]) -> str:
@@ -175,6 +188,7 @@ def create_capsule(capsule_content_from_agent: Dict[str, Any],
             
         file_path = _get_capsule_path(capsule_type, new_numeric_id, lineage_for_private)
         file_io_utils.save_yaml(capsule_data, file_path)
+        _sync_capsule_index_after_save(capsule_data, file_path, lineage_for_private)
         return new_numeric_id, capsule_data
     except Exception as e: print(f"Error creating capsule: {e}"); return 0, None
 
@@ -218,7 +232,9 @@ def add_message_to_capsule(numeric_id: int,
             if not msg_in_cap.get(constants.MESSAGE_IS_DELETED_KEY, False): current_total_word_count += msg_in_cap.get(constants.MESSAGE_WORD_COUNT_KEY, 0)
         capsule_data[constants.CAPSULE_WORD_COUNT_TOTAL_KEY] = current_total_word_count
         file_path = _get_capsule_path(capsule_type, numeric_id, lineage_name)
-        file_io_utils.save_yaml(capsule_data, file_path); return True
+        file_io_utils.save_yaml(capsule_data, file_path)
+        _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
+        return True
     except Exception as e: print(f"Error adding message to capsule {numeric_id} of type {capsule_type}: {e}"); return False
 
 def update_capsule_metadata(numeric_id: int, 
@@ -272,6 +288,7 @@ def update_capsule_metadata(numeric_id: int,
             capsule_data[constants.CAPSULE_LAST_UPDATED_AT_TICK_KEY] = current_tick
             file_path = _get_capsule_path(capsule_type, numeric_id, lineage_name)
             file_io_utils.save_yaml(capsule_data, file_path)
+            _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
             
             # Notify agents about the capsule update if room_context is provided
             if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
@@ -351,6 +368,7 @@ def update_message_content(numeric_id: int,
 
             file_path = _get_capsule_path(capsule_type, numeric_id, lineage_name) #
             file_io_utils.save_yaml(capsule_data, file_path)
+            _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
             
             # Notify agents about the message update if room_context is provided
             if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
@@ -394,63 +412,61 @@ def get_capsule_metadata(numeric_id: int,
                          lineage_name: Optional[str] = None,
                          agent_read_status: Optional[Dict[str, bool]] = None
                          ) -> Optional[Dict[str, Any]]:
-    full_capsule_data = get_capsule(numeric_id, capsule_type, lineage_name, 
-                                    include_deleted_capsule=False, 
-                                    include_deleted_messages=False) 
-    if not full_capsule_data:
-        return None
-    
-    metadata = {key: value for key, value in full_capsule_data.items() if key != constants.CAPSULE_MESSAGES_KEY}
-    
-    active_messages = full_capsule_data.get(constants.CAPSULE_MESSAGES_KEY, []) 
-    metadata['total_message_count'] = len(active_messages)
-    
-    unread_count = 0
-    if agent_read_status is not None: # This is agent_data[room_key][AGENT_ROOM_STATE_READ_STATUS_KEY]
-        for msg in active_messages: # active_messages are non-deleted messages from the capsule
-            msg_id = msg.get(constants.MESSAGE_ID_KEY)
-            if msg_id and not agent_read_status.get(msg_id, False): # If msg_id not in read_status or its value is False
-                unread_count += 1
-    metadata[constants.CAPSULE_UNREAD_MESSAGE_COUNT_KEY] = unread_count
-    return metadata
+    return capsule_index.get_capsule_metadata(
+        numeric_id,
+        capsule_type,
+        lineage_name,
+        agent_read_status=agent_read_status,
+    )
 
 def list_capsules(capsule_type: str,
                   lineage_name: Optional[str] = None,
                   agent_read_status: Optional[Dict[str, bool]] = None, 
                   tag_filter: Optional[str] = None 
                   ) -> List[Dict[str, Any]]: 
-    capsule_metadata_list = []
-    try:
-        dir_path = _get_capsule_dir_path(capsule_type, lineage_name)
-        if not file_io_utils.dir_exists(dir_path): return []
-        
-        # Correctly get prefix for the given capsule type and potential lineage
-        prefix_pattern, _ = _get_capsule_file_prefix_and_full_id(capsule_type, 1, lineage_name) # Dummy ID for prefix
+    indexed_items, _total = capsule_index.list_capsules(
+        capsule_type,
+        lineage_name,
+        agent_read_status=agent_read_status,
+        tag_filter=tag_filter,
+    )
+    return indexed_items
 
-        all_capsule_files = file_io_utils.list_files(dir_path, constants.YAML_EXTENSION)
-        candidate_file_infos = []
-        escaped_prefix = re.escape(prefix_pattern)
-        pattern = re.compile(f"^{escaped_prefix}(\\d+){re.escape(constants.YAML_EXTENSION)}$")
-        
-        for filename in all_capsule_files:
-            match = pattern.match(filename)
-            if match:
-                try: candidate_file_infos.append({'filename': filename, 'id': int(match.group(1))})
-                except ValueError: continue
-        
-        candidate_file_infos.sort(key=lambda x: x['id'], reverse=True) 
-        
-        for file_info in candidate_file_infos:
-            metadata = get_capsule_metadata(file_info['id'], capsule_type, lineage_name, agent_read_status)
-            if metadata: 
-                if tag_filter:
-                    tags = metadata.get(constants.CAPSULE_TAGS_KEY, []) # Tags are already processed into a list here
-                    if isinstance(tags, list) and tag_filter.lower() in [str(t).lower() for t in tags]:
-                        capsule_metadata_list.append(metadata)
-                else:
-                    capsule_metadata_list.append(metadata)
-    except Exception as e: print(f"Error listing {capsule_type} capsules: {e}")
-    return capsule_metadata_list
+
+def list_capsules_page(capsule_type: str,
+                       lineage_name: Optional[str] = None,
+                       agent_read_status: Optional[Dict[str, bool]] = None,
+                       tag_filter: Optional[str] = None,
+                       visible_agent_name: Optional[str] = None,
+                       exclude_capsule_ids: Optional[List[str]] = None,
+                       page: int = 1,
+                       page_size: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+    page = page if isinstance(page, int) and page > 0 else 1
+    page_size = page_size if isinstance(page_size, int) and page_size > 0 else 20
+    return capsule_index.list_capsules(
+        capsule_type,
+        lineage_name,
+        agent_read_status=agent_read_status,
+        tag_filter=tag_filter,
+        visible_agent_name=visible_agent_name,
+        exclude_capsule_ids=exclude_capsule_ids,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+    )
+
+
+def get_capsules_by_full_ids(capsule_type: str,
+                             lineage_name: Optional[str],
+                             capsule_ids: List[str],
+                             agent_read_status: Optional[Dict[str, bool]] = None,
+                             visible_agent_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    return capsule_index.get_capsules_by_full_ids(
+        capsule_type,
+        lineage_name,
+        capsule_ids,
+        agent_read_status=agent_read_status,
+        visible_agent_name=visible_agent_name,
+    )
 
 
 def delete_capsule(numeric_id: int, capsule_type: str, current_tick: int, lineage_name: Optional[str] = None) -> bool:
@@ -474,6 +490,7 @@ def delete_capsule(numeric_id: int, capsule_type: str, current_tick: int, lineag
 
         file_path = _get_capsule_path(capsule_type, numeric_id, lineage_name)
         file_io_utils.save_yaml(capsule_data, file_path)
+        _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
         return True
     except Exception as e: print(f"Error soft deleting capsule {numeric_id} of type {capsule_type}: {e}"); return False
 
@@ -511,7 +528,9 @@ def delete_message_from_capsule(numeric_id: int, capsule_type: str, message_id_s
             capsule_data[constants.CAPSULE_WORD_COUNT_TOTAL_KEY] = 0 # Explicitly set to 0
 
         file_path = _get_capsule_path(capsule_type, numeric_id, lineage_name)
-        file_io_utils.save_yaml(capsule_data, file_path); return True
+        file_io_utils.save_yaml(capsule_data, file_path)
+        _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
+        return True
     except Exception as e: print(f"Error soft deleting message {message_id_str} from capsule {numeric_id} type {capsule_type}: {e}"); return False
 
 def _update_agent_name_references_in_capsule_data(capsule_data: Dict[str, Any], old_name: str, new_name: str, current_tick: int) -> bool:
@@ -552,10 +571,19 @@ def update_agent_name_in_capsules(old_agent_name: str, new_agent_name: str, curr
         capsule_data = file_io_utils.load_yaml(file_path) 
         if capsule_data:
             if _update_agent_name_references_in_capsule_data(capsule_data, old_agent_name, new_agent_name, current_tick):
-                try: file_io_utils.save_yaml(capsule_data, file_path); updated_capsule_count += 1
+                try:
+                    file_io_utils.save_yaml(capsule_data, file_path)
+                    _sync_capsule_index_after_save(capsule_data, file_path, None)
+                    updated_capsule_count += 1
                 except Exception as e: print(f"Error saving updated capsule {filename} during name update: {e}")
     if updated_capsule_count > 0: print(f"Agent name reference update: Processed {capsule_type_to_scan}. Updated {updated_capsule_count} capsules for name '{old_agent_name}' -> '{new_agent_name}'.")
     return updated_capsule_count
+
+def _format_capsule_item_id_for_action(item_id: str) -> str:
+    """Convert an internal capsule/message ID into the room action ID agents use."""
+    item_id_str = str(item_id)
+    match = re.search(r"(\d+(?:-\d+)?)$", item_id_str)
+    return match.group(1) if match else item_id_str
 
 def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str, 
                                   capsule_title: str, updated_item_id: str,
@@ -624,14 +652,15 @@ def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str,
                 
                 # Determine the room display name
                 room_display_name = "Public Memory Room" if capsule_type == constants.CAPSULE_TYPE_PUBLIC else "Archive Room"
+                display_item_id = _format_capsule_item_id_for_action(updated_item_id)
                 
                 # Create notification message
                 notification_msg = (
                     f"**Content Update Notification**\n\n"
                     f"A {room_display_name.lower()} item you previously read has been updated:\n"
-                    f"**{capsule_title}** (Item: {updated_item_id})\n\n"
+                    f"**{capsule_title}** (Item: {display_item_id})\n\n"
                     f"Your read status has been cleared for this content. "
-                    f"To view the updated content, use: `/execute_action{{read {updated_item_id}}}` in the {room_display_name}."
+                    f"To view the updated content, use: `/execute_action{{read {display_item_id}}}` in the {room_display_name}."
                 )
                 
                 # Add notification to agent

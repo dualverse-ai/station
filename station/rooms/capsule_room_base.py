@@ -119,6 +119,54 @@ class CapsuleHandlerBaseRoom(BaseRoom):
             agent_data, room_key, room_context.constants_module.AGENT_ROOM_STATE_READ_STATUS_KEY, current_read_statuses
         )
 
+    def _build_pinned_capsules_section(self,
+                                       title: str,
+                                       pinned_ids_full: List[str],
+                                       all_capsule_metadata: List[Dict[str, Any]],
+                                       agent_read_status: Dict[str, bool],
+                                       room_context: RoomContext) -> List[str]:
+        consts = room_context.constants_module
+
+        if not pinned_ids_full:
+            return []
+
+        valid_pinned_capsules_metadata = []
+        valid_capsule_ids_for_display = {cap_meta.get(consts.CAPSULE_ID_KEY) for cap_meta in all_capsule_metadata}
+
+        for full_capsule_id_str_pinned in pinned_ids_full:
+            if full_capsule_id_str_pinned in valid_capsule_ids_for_display:
+                capsule_meta = next(
+                    (meta for meta in all_capsule_metadata if meta.get(consts.CAPSULE_ID_KEY) == full_capsule_id_str_pinned),
+                    None
+                )
+                if capsule_meta:
+                    valid_pinned_capsules_metadata.append(capsule_meta)
+
+        if not valid_pinned_capsules_metadata:
+            return []
+
+        table_header_parts = [" ID ", " Title ", " Author "]
+        table_separator_parts = [":----", ":-------------------------------", ":----------------"]
+        if self._get_capsule_type() == consts.CAPSULE_TYPE_MAIL:
+            table_header_parts.append(" Recipients ")
+            table_separator_parts.append(":-----------------")
+        table_header_parts.extend([" Date ", " Words ", " Msgs ", " Status "])
+        table_separator_parts.extend([":----------", ":------:", ":-----:", ":---------"])
+
+        dynamic_table_header = "|" + "|".join(table_header_parts) + "|"
+        dynamic_table_separator = "|" + "|".join(table_separator_parts) + "|"
+
+        lines = [title, dynamic_table_header, dynamic_table_separator]
+        valid_pinned_capsules_metadata.sort(
+            key=lambda x: x.get(consts.CAPSULE_CREATED_AT_TICK_KEY, 0),
+            reverse=True
+        )
+        for capsule_meta in valid_pinned_capsules_metadata:
+            lines.append(self._format_capsule_for_list_display(capsule_meta, agent_read_status, room_context))
+        lines.append("")
+
+        return lines
+
     def _get_pinned_capsules_ids(self, agent_data: Dict[str, Any], room_context: RoomContext) -> List[str]:
         room_key = self._get_agent_room_data_key(room_context)
         return room_context.agent_manager.get_agent_room_state(
@@ -275,69 +323,56 @@ class CapsuleHandlerBaseRoom(BaseRoom):
         dynamic_table_header = "|" + "|".join(table_header_parts) + "|"
         dynamic_table_separator = "|" + "|".join(table_separator_parts) + "|"
 
-        # Fetch all capsule metadata initially
-        all_capsule_metadata_unfiltered = capsule_manager.list_capsules(capsule_type, lineage, agent_read_status)
-
-        # --- Filter mail capsules for visibility ---
-        if capsule_type == consts.CAPSULE_TYPE_MAIL and agent_name:
-            authorized_capsules_metadata = []
-            for meta in all_capsule_metadata_unfiltered:
-                is_author = agent_name == meta.get(consts.CAPSULE_AUTHOR_NAME_KEY)
-                is_recipient = agent_name in meta.get(consts.CAPSULE_RECIPIENTS_KEY, [])
-                if is_author or is_recipient:
-                    authorized_capsules_metadata.append(meta)
-            all_capsule_metadata = authorized_capsules_metadata 
-        else:
-            all_capsule_metadata = all_capsule_metadata_unfiltered
-        # --- End of mail filtering ---
-
         pinned_ids_full = self._get_pinned_capsules_ids(agent_data, room_context)
-        if pinned_ids_full:
-            output_lines.append("**Pinned Capsules**")
-            # --- MODIFICATION: Filter pinned items based on the (already filtered) all_capsule_metadata ---
-            valid_pinned_capsules_metadata = []
-            # Create a set of valid capsule IDs from the filtered list for quick lookup
-            valid_capsule_ids_for_display = {cap_meta.get(consts.CAPSULE_ID_KEY) for cap_meta in all_capsule_metadata}
-
-            for full_capsule_id_str_pinned in pinned_ids_full:
-                if full_capsule_id_str_pinned in valid_capsule_ids_for_display:
-                    # Find the metadata from the already filtered all_capsule_metadata
-                    capsule_meta = next((meta for meta in all_capsule_metadata if meta.get(consts.CAPSULE_ID_KEY) == full_capsule_id_str_pinned), None)
-                    if capsule_meta: # Should always be found if ID is in valid_capsule_ids_for_display
-                        valid_pinned_capsules_metadata.append(capsule_meta)
-            # --- END MODIFICATION for pinned items ---
-            
-            if valid_pinned_capsules_metadata: # Display only if there are valid pinned items
-                output_lines.append(dynamic_table_header)
-                output_lines.append(dynamic_table_separator)
-                # Sort the valid pinned capsules for display
-                valid_pinned_capsules_metadata.sort(key=lambda x: x.get(consts.CAPSULE_CREATED_AT_TICK_KEY, 0), reverse=True)
-                for capsule_meta in valid_pinned_capsules_metadata:
-                    output_lines.append(self._format_capsule_for_list_display(capsule_meta, agent_read_status, room_context))
-                output_lines.append("")
-            # else: No valid pinned items to display, or list was empty. No explicit message needed here.
+        visible_agent_name = agent_name if capsule_type == consts.CAPSULE_TYPE_MAIL else None
+        pinned_capsule_metadata = capsule_manager.get_capsules_by_full_ids(
+            capsule_type,
+            lineage,
+            pinned_ids_full,
+            agent_read_status=agent_read_status,
+            visible_agent_name=visible_agent_name,
+        )
+        output_lines.extend(
+            self._build_pinned_capsules_section(
+                "**Pinned Capsules**",
+                pinned_ids_full,
+                pinned_capsule_metadata,
+                agent_read_status,
+                room_context
+            )
+        )
 
 
         current_page = self._get_current_page(agent_data, room_context)
         page_size = consts.DEFAULT_PAGE_SIZE_CAPSULES
         
-        # --- MODIFICATION: REMOVE this redundant call to list_capsules ---
-        # all_capsule_metadata = capsule_manager.list_capsules(capsule_type, lineage, agent_read_status) # <<< REMOVE THIS LINE
-        # --- END MODIFICATION ---
-        
-        # Now, non_pinned_capsules should be derived from the (potentially filtered) all_capsule_metadata
-        non_pinned_capsules = [cap for cap in all_capsule_metadata if cap.get(consts.CAPSULE_ID_KEY) not in pinned_ids_full]
-
-        total_items = len(non_pinned_capsules)
+        paginated_capsules, total_items = capsule_manager.list_capsules_page(
+            capsule_type,
+            lineage,
+            agent_read_status=agent_read_status,
+            visible_agent_name=visible_agent_name,
+            exclude_capsule_ids=pinned_ids_full,
+            page=current_page,
+            page_size=page_size,
+        )
         total_pages = (total_items + page_size - 1) // page_size if page_size > 0 else 0
         if total_items == 0: total_pages = 1 # If no items, still show Page 1/1
 
-        current_page = max(1, min(current_page, total_pages if total_items > 0 else 1)) 
+        clamped_page = max(1, min(current_page, total_pages if total_items > 0 else 1))
+        if clamped_page != current_page:
+            current_page = clamped_page
+            paginated_capsules, total_items = capsule_manager.list_capsules_page(
+                capsule_type,
+                lineage,
+                agent_read_status=agent_read_status,
+                visible_agent_name=visible_agent_name,
+                exclude_capsule_ids=pinned_ids_full,
+                page=current_page,
+                page_size=page_size,
+            )
+        else:
+            current_page = clamped_page
         self._set_current_page(agent_data, current_page, room_context) 
-
-        start_index = (current_page - 1) * page_size
-        end_index = start_index + page_size
-        paginated_capsules = non_pinned_capsules[start_index:end_index]
 
         output_lines.append(f"**List of Capsules (Page {current_page} / {total_pages})**")
         if paginated_capsules:

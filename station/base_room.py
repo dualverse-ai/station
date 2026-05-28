@@ -89,9 +89,22 @@ class InternalActionHandler(ABC):
         Keys should correspond to keys in the agent's data structure.
         For nested updates, the value itself can be a dictionary representing
         the nested structure to be updated/merged.
-        Example: {"codex_read_status": {"module1": 123}}
+        Example: {"some_room_state_key": {"item1": 123}}
         """
         return {} # Default implementation returns no changes
+
+    def get_llm_override(self) -> Optional[Dict[str, str]]:
+        """
+        Returns an optional LLM override for this internal action only.
+        """
+        return None
+
+    def get_dialogue_tick_protection(self) -> Optional[Dict[str, str]]:
+        """
+        Returns an optional protection record for the Station tick that owns this
+        internal action.
+        """
+        return None
     
 class LoggingInternalActionHandlerWrapper(InternalActionHandler):
     """
@@ -180,6 +193,12 @@ class LoggingInternalActionHandlerWrapper(InternalActionHandler):
 
     def get_delta_updates(self) -> Dict[str, Any]:
         return self.actual_handler.get_delta_updates()
+
+    def get_llm_override(self) -> Optional[Dict[str, str]]:
+        return self.actual_handler.get_llm_override()
+
+    def get_dialogue_tick_protection(self) -> Optional[Dict[str, str]]:
+        return self.actual_handler.get_dialogue_tick_protection()
         
 
 class BaseRoom(ABC):
@@ -234,6 +253,15 @@ class BaseRoom(ABC):
                 help_text = f"\n\n---\n\n**Help Message - {self.room_name}**\n" + help_text + "\n\n---"
                 if help_text and help_text.strip():
                     output_parts.append(help_text)
+
+                if hasattr(room_context.agent_manager, "protect_dialogue_tick"):
+                    room_context.agent_manager.protect_dialogue_tick(
+                        agent_data,
+                        current_tick,
+                        room_context.constants_module.PROTECTED_DIALOGUE_REASON_ROOM_HELP,
+                        source=f"room:{room_data_key}",
+                        metadata={"room_name": self.room_name},
+                    )
                 
                 # Mark help as shown for this room in the agent's data (in-memory)
                 room_context.agent_manager.set_agent_room_state(
@@ -315,4 +343,3 @@ class BaseRoom(ABC):
                 return None
         
         return None
-

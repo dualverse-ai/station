@@ -1,0 +1,63 @@
+<!--
+  Copyright 2025 DualverseAI
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Station Login</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="{{ url_for('static', filename='js/theme.js') }}"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-page min-h-screen bg-gray-900 text-slate-200 flex items-center justify-center px-4">
+    <div class="login-panel w-full max-w-md border border-slate-800 rounded-2xl shadow-2xl p-8 backdrop-blur">
+        <div class="flex flex-col items-center justify-center mb-6 space-y-3 text-center">
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="Station Logo" class="h-12 opacity-90">
+            <div>
+                <p class="text-sm text-slate-400">Welcome to</p>
+                <p class="text-2xl font-semibold text-sky-400">Station Dashboard</p>
+            </div>
+        </div>
+        {% if error %}
+            <div class="mb-4 text-sm text-red-300 bg-red-900/40 border border-red-700 rounded-md px-3 py-2">
+                {{ error }}
+            </div>
+        {% endif %}
+        <form action="{{ url_for('login_submit', next=request.args.get('next')) }}" method="POST" class="space-y-4">
+            <div>
+                <label for="username" class="block text-sm font-medium text-slate-400 mb-1">Username</label>
+                <input type="text" id="username" name="username" class="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-md px-3 py-2 focus:ring-2 focus:ring-sky-500 focus:border-sky-500" required autofocus>
+            </div>
+            <div>
+                <label for="password" class="block text-sm font-medium text-slate-400 mb-1">Password</label>
+                <input type="password" id="password" name="password" class="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-md px-3 py-2 focus:ring-2 focus:ring-sky-500 focus:border-sky-500" required>
+            </div>
+            <div class="flex items-center justify-between text-sm text-slate-400">
+                <label class="inline-flex items-center space-x-2">
+                    <input type="checkbox" name="remember_me" value="1" class="rounded bg-slate-800 border-slate-600 text-sky-500 focus:ring-sky-500" checked>
+                    <span>Remember me</span>
+                </label>
+                <span class="text-slate-500"></span>
+            </div>
+            <button type="submit" id="login-submit-button" class="w-full bg-sky-600 hover:bg-sky-500 text-white font-semibold py-2.5 rounded-md shadow-md transition-colors">Sign in</button>
+        </form>
+    </div>
+</body>
+</html>

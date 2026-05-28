@@ -39,6 +39,116 @@ install_package() {
     fi
 }
 
+# Attempt to locate conda even when 'which conda' fails (e.g., when conda is a shell function)
+find_conda_path() {
+    local path
+
+    # FIRST: Check if CONDA_EXE environment variable is set (most reliable)
+    if [ -n "$CONDA_EXE" ] && [ -x "$CONDA_EXE" ]; then
+        echo "$CONDA_EXE"
+        return
+    fi
+
+    # SECOND: Try a simple which lookup
+    path=$(which conda 2>/dev/null | head -n1)
+    if [ -n "$path" ]; then
+        echo "$path"
+        return
+    fi
+
+    # THIRD: If conda command exists but is a shell function, derive from `conda info --base`
+    if command -v conda >/dev/null 2>&1; then
+        local base_dir
+        base_dir=$(conda info --base 2>/dev/null)
+        if [ -n "$base_dir" ] && [ -d "$base_dir" ]; then
+            if [ -x "$base_dir/condabin/conda" ]; then
+                echo "$base_dir/condabin/conda"
+                return
+            fi
+            if [ -x "$base_dir/bin/conda" ]; then
+                echo "$base_dir/bin/conda"
+                return
+            fi
+        fi
+    fi
+
+    # FOURTH: Check common installation locations
+    local common_paths=(
+        "$HOME/miniconda3/bin/conda"
+        "$HOME/anaconda3/bin/conda"
+        "$HOME/miniconda3/condabin/conda"
+        "$HOME/anaconda3/condabin/conda"
+        "/opt/conda/bin/conda"
+        "/usr/local/bin/conda"
+        "/usr/bin/conda"
+    )
+
+    for check_path in "${common_paths[@]}"; do
+        if [ -x "$check_path" ]; then
+            echo "$check_path"
+            return
+        fi
+    done
+
+    # Fallback: empty
+    echo ""
+}
+
+find_js_cli_path() {
+    local executable_name=$1
+    local path
+
+    path=$(command -v "$executable_name" 2>/dev/null | head -n1)
+    if [ -n "$path" ]; then
+        echo "$path"
+        return
+    fi
+
+    local common_paths=(
+        "$HOME/.nvm/versions/node"/*/bin/"$executable_name"
+        "/home/ubuntu/.nvm/versions/node"/*/bin/"$executable_name"
+        "$HOME/.local/bin/$executable_name"
+        "/usr/local/bin/$executable_name"
+        "/usr/bin/$executable_name"
+    )
+
+    for check_path in "${common_paths[@]}"; do
+        if [ -x "$check_path" ]; then
+            echo "$check_path"
+            return
+        fi
+    done
+
+    echo ""
+}
+
+# Update or append an environment variable in $ENV_FILE, preferring an exported value if present.
+set_env_var() {
+    local var_name=$1
+    local default_value=$2
+    local env_value=${!var_name}
+    local target_value
+
+    if [ -n "$env_value" ]; then
+        target_value="$env_value"
+    elif grep -q "^${var_name}=" "$ENV_FILE" 2>/dev/null; then
+        target_value=$(grep -m1 "^${var_name}=" "$ENV_FILE" | cut -d'=' -f2-)
+    else
+        target_value="$default_value"
+    fi
+
+    if grep -q "^${var_name}=" "$ENV_FILE" 2>/dev/null; then
+        # Replace existing line
+        sed -i "s|^${var_name}=.*|${var_name}=${target_value}|" "$ENV_FILE"
+    else
+        # Append new line
+        echo "${var_name}=${target_value}" >> "$ENV_FILE"
+    fi
+
+    # Export for current script usage
+    export "${var_name}=${target_value}"
+}
+
 get_env_value() {
     local key=$1
     if [ ! -f "$ENV_FILE" ]; then
@@ -80,6 +190,7 @@ mkdir -p "$DEPLOYMENT_DIR"
 echo "Installing Python dependencies..."
 pip install -r requirements.txt
 install_package "nginx"
+install_package "ripgrep"
 
 # 3. Environment Configuration
 echo "Setting up environment file..."
@@ -118,11 +229,11 @@ else
     echo "Generated and saved a strong FLASK_AUTH_PASSWORD."
 fi
 
-# 4. Find and save paths for Conda and Claude
-echo "Detecting and saving paths for Conda and Claude..."
+# 4. Find and save paths for Conda, Claude, and Codex
+echo "Detecting and saving paths for Conda, Claude, and Codex..."
 
 # Find Conda path
-CONDA_PATH=$(which conda)
+CONDA_PATH=$(find_conda_path)
 if [ -z "$CONDA_PATH" ]; then
     echo "WARNING: 'conda' command not found. Python sandbox evaluation might not work. Please ensure Conda is installed and in your PATH."
 else
@@ -135,7 +246,8 @@ else
 fi
 
 # Find Claude path
-CLAUDE_PATH=$(which claude)
+# Find Claude path
+CLAUDE_PATH=$(find_js_cli_path claude)
 if [ -z "$CLAUDE_PATH" ]; then
     echo "WARNING: 'claude' command not found. Claude Code Debugger might not work. Please ensure Claude is installed and in your PATH."
 else
@@ -144,6 +256,19 @@ else
         echo "✓ Claude path saved to .env: $CLAUDE_PATH"
     else
         echo "✓ Claude path already in .env."
+    fi
+fi
+
+# Find Codex path
+CODEX_PATH=$(find_js_cli_path codex)
+if [ -z "$CODEX_PATH" ]; then
+    echo "WARNING: 'codex' command not found. Research Center Codex backend might not work. Please ensure Codex is installed and in your PATH."
+else
+    if ! grep -q "CODEX_BIN_PATH" "$ENV_FILE"; then
+        echo "CODEX_BIN_PATH=$CODEX_PATH" >> "$ENV_FILE"
+        echo "✓ Codex path saved to .env: $CODEX_PATH"
+    else
+        echo "✓ Codex path already in .env."
     fi
 fi
 
@@ -160,19 +285,10 @@ fi
 echo "Creating Nginx configuration..."
 CURRENT_DIR=$(pwd)
 
-# Determine ports (can be overridden in .env)
-if [ -z "$FLASK_PORT" ]; then
-    FLASK_PORT=5000
-    echo "FLASK_PORT=$FLASK_PORT" >> "$ENV_FILE"
-fi
-if [ -z "$NGINX_HTTP_PORT" ]; then
-    NGINX_HTTP_PORT=80
-    echo "NGINX_HTTP_PORT=$NGINX_HTTP_PORT" >> "$ENV_FILE"
-fi
-if [ -z "$NGINX_HTTPS_PORT" ]; then
-    NGINX_HTTPS_PORT=8443
-    echo "NGINX_HTTPS_PORT=$NGINX_HTTPS_PORT" >> "$ENV_FILE"
-fi
+# Determine ports (can be overridden by exported env vars or .env)
+set_env_var "FLASK_PORT" "5000"
+set_env_var "NGINX_HTTP_PORT" "80"
+set_env_var "NGINX_HTTPS_PORT" "8443"
 
 # Check for port conflicts
 echo "Checking for port conflicts..."
@@ -298,8 +414,8 @@ else
 fi
 echo ""
 echo "Next steps:"
-echo "1. Start production services: ./start-production.sh"
+echo "1. Start production services: ./start.sh"
 echo "2. Access your station at: https://your-server-ip:$NGINX_HTTPS_PORT"
-echo "3. Stop services when done: ./stop-production.sh"
+echo "3. Stop services when done: ./stop.sh"
 echo ""
 echo "For development: python -m web_interface.app"

@@ -1,6 +1,6 @@
 # Creating Research Tasks for the Station
 
-This guide explains how to create new research tasks for the Station's Research Counter system.
+This guide explains how to create new research tasks for the Station's Research Center system.
 
 ## Overview
 
@@ -34,7 +34,7 @@ from station.eval_research.base_evaluator import ResearchTaskEvaluator
 
 class Task1Evaluator(ResearchTaskEvaluator):
     def __init__(self):
-        super().__init__("1")
+        super().__init__()
     
     def evaluate_submission(self, result, eval_id=None, author=None):
         """Verify the algorithm output"""
@@ -235,7 +235,7 @@ Add to `station_data/rooms/research/research_tasks.yaml`:
     
     #### Academic Integrity
     - **No pretrained models**: Always start from random initialization
-    - **No external resources**: External Counter not allowed - no literature reviews
+    - **No external resources**: Administrative Counter not allowed - no literature reviews
     - **Domain knowledge boundaries**:
       - **NOT ALLOWED**: Problem-specific heuristics (e.g., Sokoban deadlock patterns)
       - **ALLOWED**: General techniques (e.g., attention mechanisms, memory systems)

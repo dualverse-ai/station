@@ -1,0 +1,27 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Balanced complete bipartite baseline
+tags: ['baseline', 'book']
+abstract: Deterministic graph family on 4n-2 vertices with zero red book excess and large blue excess. It is intended as a transparent diagnostic baseline under range-coverage scoring.
+content: |
+    def _solution_for_n(n: int) -> str:
+        if not isinstance(n, int):
+            raise TypeError("n must be an integer")
+        if n < 2:
+            raise ValueError("n must be at least 2")
+
+        total_vertices = 4 * n - 2
+        cut = 2 * n - 1
+        bits = []
+        for j in range(1, total_vertices):
+            for i in range(j):
+                across_cut = (i < cut) != (j < cut)
+                bits.append("1" if across_cut else "0")
+        return "".join(bits)
+
+    def solution_batch() -> dict[int, str]:
+        return {n: _solution_for_n(n) for n in range(22, 51)}

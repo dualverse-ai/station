@@ -22,6 +22,8 @@ from typing import Dict, Any, Optional, List, Tuple, Set
 from station import file_io_utils
 from station import constants
 from station import agent as agent_module
+from station import runtime_api_config
+from station.system_messages import build_station_level_system_prompt
 
 
 # --- Custom LLM Connector Exceptions ---
@@ -42,6 +44,11 @@ class LLMPermanentAPIError(LLMConnectorError):
     pass
 
 
+class LLMCorruptedThoughtSignatureError(LLMPermanentAPIError):
+    """Indicates Gemini rejected persisted thought signatures in the submitted history."""
+    pass
+
+
 class LLMSafetyBlockError(LLMConnectorError):
     """Indicates the response was blocked due to safety filters."""
     def __init__(self, message: str, block_reason: Optional[str] = None, prompt_feedback: Any = None, original_exception: Optional[Exception] = None):
@@ -51,7 +58,7 @@ class LLMSafetyBlockError(LLMConnectorError):
 
 
 class LLMContextOverflowError(LLMConnectorError):
-    """Indicates the input exceeds the model's context window limit, requiring agent session termination."""
+    """Indicates the input exceeds the model's context window limit."""
     pass
 
 
@@ -74,6 +81,7 @@ class BaseLLMConnector(abc.ABC):
         self.model_name = model_name
         self.agent_name = agent_name
         self.api_key = api_key
+        self._explicit_api_key = api_key is not None
         self.system_prompt = system_prompt
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
@@ -85,30 +93,50 @@ class BaseLLMConnector(abc.ABC):
         self.retry_delay_seconds = retry_delay_seconds
 
         # When False, the connector must not write anything to station_data (history files, agent YAML, etc).
-        # Temporal chat uses this mode to avoid leaving any records.
+        # Parallel staged sends use this mode while they prepare isolated output.
         self.persist_to_disk: bool = True
+        self._needs_reload_after_staged_history_flush: bool = False
+        self._last_api_metadata: Optional[Dict[str, Any]] = None
+        runtime_proxy_snapshot = getattr(self, "_api_runtime_config_snapshot", None)
+        if not isinstance(runtime_proxy_snapshot, dict):
+            runtime_proxy_snapshot = runtime_api_config.get_station_proxy_snapshot()
+        self.api_runtime_config_generation: int = int(runtime_proxy_snapshot.get("generation", 0))
         
-        # Set proxy environment variables if configured in constants
-        if constants.LLM_HTTP_PROXY:
-            os.environ['http_proxy'] = constants.LLM_HTTP_PROXY
-            # Also set grpc_proxy for gRPC-based clients
-            if 'grpc_proxy' not in os.environ:
-                os.environ['grpc_proxy'] = constants.LLM_HTTP_PROXY
-        if constants.LLM_HTTPS_PROXY:
-            os.environ['https_proxy'] = constants.LLM_HTTPS_PROXY
-            # Set grpc_proxy if not already set
-            if 'grpc_proxy' not in os.environ:
-                os.environ['grpc_proxy'] = constants.LLM_HTTPS_PROXY
+        self._apply_runtime_proxy_snapshot(runtime_proxy_snapshot)
         
         # Load pruning blocks and store a copy to detect changes
         self.agent_prune_blocks: List[Dict[str, Any]] = self._load_prune_blocks_from_agent_data()
         self._last_known_prune_blocks: List[Dict[str, Any]] = copy.deepcopy(self.agent_prune_blocks)
         self._last_known_system_prompt: Optional[str] = self.system_prompt
         self._debug_station_id: Optional[str] = None
+        if not hasattr(self, "api_runtime_provider_id"):
+            self.api_runtime_provider_id: Optional[str] = None
+        if not hasattr(self, "api_runtime_env_names"):
+            self.api_runtime_env_names: Tuple[str, ...] = ()
 
     def _debug_api_enabled(self) -> bool:
         raw_value = str(os.getenv("DEBUG_API", "")).strip().lower()
         return raw_value in {"1", "true", "yes", "on"}
+
+    def _apply_runtime_proxy_snapshot(self, runtime_proxy_snapshot: Dict[str, Any]) -> None:
+        """Apply the effective runtime proxy for this connector before client creation."""
+        http_proxy = runtime_proxy_snapshot.get("http_proxy")
+        https_proxy = runtime_proxy_snapshot.get("https_proxy")
+        for env_name in ("http_proxy", "HTTP_PROXY"):
+            if http_proxy:
+                os.environ[env_name] = http_proxy
+            else:
+                os.environ.pop(env_name, None)
+        for env_name in ("https_proxy", "HTTPS_PROXY"):
+            if https_proxy:
+                os.environ[env_name] = https_proxy
+            else:
+                os.environ.pop(env_name, None)
+        grpc_proxy = https_proxy or http_proxy
+        if grpc_proxy:
+            os.environ["grpc_proxy"] = grpc_proxy
+        else:
+            os.environ.pop("grpc_proxy", None)
 
     def _get_debug_api_dir(self) -> str:
         if self._debug_station_id is None:
@@ -125,9 +153,9 @@ class BaseLLMConnector(abc.ABC):
                     if isinstance(candidate, str) and candidate.strip():
                         station_id = candidate.strip()
             except Exception as e:
-                print(f"Warning ({self.agent_name}): Failed to resolve station_id for DEBUG_API path: {e}")
+                self._log("WARNING", f"Failed to resolve station_id for DEBUG_API path: {e}")
             self._debug_station_id = station_id
-        return os.path.join(os.getcwd(), "tests", self._debug_station_id)
+        return os.path.join(os.getcwd(), "tmp", "debug_api", self._debug_station_id)
 
     def _write_debug_api_snapshot(self, filename: str, payload: Dict[str, Any]) -> None:
         if not self._debug_api_enabled():
@@ -139,7 +167,7 @@ class BaseLLMConnector(abc.ABC):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"Warning ({self.agent_name}): Failed to write DEBUG_API snapshot '{filename}': {e}")
+            self._log("WARNING", f"Failed to write DEBUG_API snapshot '{filename}': {e}")
 
 
     def _load_prune_blocks_from_agent_data(self) -> List[Dict[str, Any]]:
@@ -150,31 +178,33 @@ class BaseLLMConnector(abc.ABC):
                 return agent_full_data.get(constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY, [])
             return []
         except Exception as e:
-            print(f"Error ({self.agent_name}): Failed to load prune blocks: {e}")
+            self._log("ERROR", f"Failed to load prune blocks: {e}")
             return []
 
     def _bypass_agent_data_system_prompt_reload(self) -> bool:
         """
         Return True when the connector should keep its constructor-provided system prompt.
 
-        Most Station agents reload their runtime system prompt from agent YAML.
-        System services such as the archive reviewer are different: they use an
-        explicit connector-level system prompt plus separate task/context user
-        messages, so they should keep the constructor-provided prompt.
+        Most Station agents derive their runtime system prompt from agent YAML via
+        build_station_level_system_prompt(...). System services such as the archive
+        reviewer are different: they use an explicit connector-level system prompt
+        plus separate task/context user messages, and should not be wrapped with the
+        Station-wide prefix/Codex prompt.
         """
         return self.agent_name == "AutoArchiveEvaluator"
 
     def _load_system_prompt_from_agent_data(self) -> Optional[str]:
-        """Loads current system prompt from public-branch agent data."""
+        """Loads current system prompt from agent data."""
         try:
             if self._bypass_agent_data_system_prompt_reload():
                 return self._last_known_system_prompt
             agent_full_data = agent_module.load_agent_data(self.agent_name, include_ended=True, include_ascended=True)
             if agent_full_data is None:
                 return self._last_known_system_prompt
-            return agent_full_data.get(constants.AGENT_LLM_SYSTEM_PROMPT_KEY, self._last_known_system_prompt)
+            raw_prompt = agent_module.get_agent_role_definition(agent_full_data)
+            return build_station_level_system_prompt(self.agent_name, raw_prompt)
         except Exception as e:
-            print(f"Error ({self.agent_name}): Failed to load system prompt: {e}")
+            self._log("ERROR", f"Failed to load system prompt: {e}")
             return self._last_known_system_prompt
 
     @abc.abstractmethod
@@ -236,7 +266,7 @@ class BaseLLMConnector(abc.ABC):
             text_content = entry.get('text_content', '')
 
             if tick is None or role is None:
-                print(f"Warning ({self.agent_name}): Skipping history entry with missing tick or role: {entry}")
+                self._log("WARNING", f"Skipping history entry with missing tick or role: {entry}")
                 continue
 
             # Always include protected ticks
@@ -273,14 +303,24 @@ class BaseLLMConnector(abc.ABC):
 
             # Insert summary replacement only if non-empty summary
             # Empty summary = complete removal (skip entirely, like original behavior)
-            if summary.strip():
+            stripped_summary = summary.strip()
+            if stripped_summary:
                 if start_tick == end_tick:
-                    system_msg = f"System: Pruned Tick {start_tick}"
+                    tick_label = f"Tick {start_tick}"
+                    verb = "was"
                 else:
-                    system_msg = f"System: Pruned Ticks {start_tick}-{end_tick}"
+                    tick_label = f"Ticks {start_tick}-{end_tick}"
+                    verb = "were"
 
-                final_entries.append({'role': 'user', 'text_content': system_msg})
-                final_entries.append({'role': 'model', 'text_content': f"Summary: {summary}"})
+                final_entries.append({
+                    'role': 'user',
+                    'text_content': (
+                        f"{tick_label} {verb} pruned by the agent in the Token Management Room.\n"
+                        "Summary submitted by the agent:\n"
+                        f"{stripped_summary}"
+                    ),
+                })
+                final_entries.append({'role': 'model', 'text_content': "Dialogue pruned."})
 
         # Add remaining entries after all pruned ranges
         while current_entry_index < len(filtered_entries):
@@ -290,8 +330,16 @@ class BaseLLMConnector(abc.ABC):
             final_entries.append(out_entry)
             current_entry_index += 1
 
-        print(f"Before pruning, raw history length: {len(raw_history_entries)}, after pruning: {len(final_entries)} for {self.agent_name}.")
+        if self._debug_api_enabled():
+            self._log(
+                "DEBUG",
+                f"History pruning raw_entries={len(raw_history_entries)} "
+                f"active_entries={len(final_entries)}",
+            )
         return final_entries
+
+    def _log(self, level: str, message: str) -> None:
+        print(f"LLMConnector {level.upper()} ({self.agent_name}): {message}")
 
     def _calculate_retry_delay(self, attempt_number: int) -> int:
         """
@@ -318,6 +366,91 @@ class BaseLLMConnector(abc.ABC):
         delay = self.retry_delay_seconds * (2 ** doubling_level)
 
         return delay
+
+    def _compact_log_value(self, value: Any, max_length: Optional[int] = 500) -> str:
+        text = " ".join(str(value).split())
+        if max_length is not None and len(text) > max_length:
+            return f"{text[:max_length]}...[truncated]"
+        return text
+
+    def _format_exception_for_log(
+        self,
+        error: Exception,
+        *,
+        include_raw: bool = True,
+        max_message_length: Optional[int] = 500,
+    ) -> str:
+        """
+        Build a useful one-line error summary for retry logs.
+
+        Connector exceptions often wrap SDK exceptions in ``original_exception``;
+        include both layers so the retry log says what actually failed.
+        """
+        parts = [
+            f"{type(error).__name__}: {self._compact_log_value(error, max_message_length)}",
+        ]
+        original_exception = getattr(error, "original_exception", None)
+        if include_raw and original_exception is not None:
+            formatter = getattr(self, "_format_original_exception_for_log", None)
+            if callable(formatter) and max_message_length is not None:
+                parts.append("Raw exception: " + formatter(original_exception))
+                return " | ".join(parts)
+
+            raw_parts = [
+                f"type={type(original_exception).__name__}",
+                f"repr={self._compact_log_value(repr(original_exception), max_message_length)!r}",
+                f"str={self._compact_log_value(str(original_exception), max_message_length)!r}",
+            ]
+            for attr_name in ("code", "status", "message", "details", "status_code", "body"):
+                if hasattr(original_exception, attr_name):
+                    try:
+                        raw_parts.append(
+                            f"{attr_name}="
+                            f"{self._compact_log_value(getattr(original_exception, attr_name), max_message_length)!r}"
+                        )
+                    except Exception as attr_error:
+                        raw_parts.append(f"{attr_name}=<unreadable: {attr_error!r}>")
+
+            response = getattr(original_exception, "response", None)
+            if response is not None:
+                response_parts = []
+                for attr_name in ("status_code", "reason_phrase", "text"):
+                    if hasattr(response, attr_name):
+                        try:
+                            response_parts.append(
+                                f"{attr_name}="
+                                f"{self._compact_log_value(getattr(response, attr_name), max_message_length)!r}"
+                            )
+                        except Exception as attr_error:
+                            response_parts.append(f"{attr_name}=<unreadable: {attr_error!r}>")
+                if response_parts:
+                    raw_parts.append("response={" + ", ".join(response_parts) + "}")
+
+            parts.append("Raw exception: " + ", ".join(raw_parts))
+        elif hasattr(error, "__dict__"):
+            error_attrs = {
+                k: v
+                for k, v in error.__dict__.items()
+                if not k.startswith("_") and k != "original_exception" and v is not None
+            }
+            if error_attrs:
+                parts.append(f"Error attributes: {error_attrs}")
+        return " | ".join(parts)
+
+    def _format_retry_error_for_log(self, error: Exception) -> str:
+        original_exception = getattr(error, "original_exception", None)
+        if original_exception is not None:
+            formatter = getattr(self, "_format_original_exception_for_log", None)
+            if callable(formatter):
+                return (
+                    f"{type(error).__name__}; raw="
+                    f"{formatter(original_exception)}"
+                )
+        return self._format_exception_for_log(
+            error,
+            include_raw=True,
+            max_message_length=700,
+        )
 
     def _compact_persisted_value(self, value: Any) -> Any:
         """Recursively drop None and empty containers before writing metadata to disk."""
@@ -347,10 +480,13 @@ class BaseLLMConnector(abc.ABC):
 
     def _prepare_api_metadata_for_persistence(self, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not metadata:
+            self._last_api_metadata = None
             return None
         compacted = self._compact_persisted_value(metadata)
         if isinstance(compacted, dict) and compacted:
+            self._last_api_metadata = compacted
             return compacted
+        self._last_api_metadata = None
         return None
 
     def _sanitize_api_return_payload(
@@ -440,36 +576,21 @@ class BaseLLMConnector(abc.ABC):
         except (ValueError, TypeError):
             return set()
 
-    def _contains_protected_keywords(self, text: str) -> bool:
-        """
-        Check if the text contains any keywords that should prevent pruning.
-        """
-        if not text:
-            return False
-        
-        # Check if text contains any of the protected keywords
-        for keyword in constants.NOT_PRUNABLE_KEYWORDS:
-            if keyword in text:
-                return True
-        return False
-
     def _get_protected_ticks(self, raw_history_entries: List[Dict[str, Any]]) -> set:
         """
-        Identify ticks that contain protected keywords in any station response.
+        Identify ticks that must remain visible after pruning.
         Returns a set of tick numbers that should not be pruned.
         """
-        protected_ticks = set()
-        
-        for entry in raw_history_entries:
-            tick = entry.get('tick')
-            role = entry.get('role')
-            text_content = entry.get('text_content', '')
-            
-            # Check if this is a station response (user role) with protected keywords
-            if role == 'user' and tick is not None and self._contains_protected_keywords(text_content):
-                protected_ticks.add(tick)
-        
-        return protected_ticks
+        try:
+            agent_full_data = agent_module.load_agent_data(
+                self.agent_name,
+                include_ended=True,
+                include_ascended=True,
+            )
+        except Exception as e:
+            self._log("ERROR", f"Failed to load protected dialogue ticks: {e}")
+            agent_full_data = None
+        return agent_module.get_protected_dialogue_ticks(agent_full_data, raw_history_entries)
 
     @abc.abstractmethod
     def _send_message_implementation(self, user_prompt: str, current_tick: int, attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
@@ -483,6 +604,110 @@ class BaseLLMConnector(abc.ABC):
         """Hook for connectors that need to adjust client state before a send."""
         return None
 
+    def _apply_provider_runtime_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """Hook for connectors that can rebuild their client from a provider endpoint snapshot."""
+        return None
+
+    def _run_provider_base_recovery_probe(self, snapshot: Dict[str, Any]) -> bool:
+        """Hook for connectors to probe the base endpoint with their current model."""
+        return False
+
+    def _provider_fallback_enabled(self) -> bool:
+        if not getattr(self, "api_runtime_provider_id", None):
+            return False
+        if getattr(self, "_explicit_api_key", False):
+            return False
+        endpoint = runtime_api_config.get_provider_default_endpoint(self.api_runtime_provider_id)
+        return bool(endpoint.get("configured"))
+
+    def _current_provider_endpoint_index(self) -> Optional[int]:
+        snapshot = getattr(self, "_api_runtime_config_snapshot", None)
+        if not isinstance(snapshot, dict):
+            return None
+        endpoint = snapshot.get("provider_endpoint")
+        if not isinstance(endpoint, dict):
+            return None
+        try:
+            return int(endpoint.get("index", 0))
+        except Exception:
+            return None
+
+    def _provider_base_url_from_snapshot(self, snapshot: Dict[str, Any]) -> Optional[str]:
+        snapshot_env = snapshot.get("env") if isinstance(snapshot, dict) else {}
+        if not isinstance(snapshot_env, dict):
+            return None
+        for env_name in tuple(getattr(self, "api_runtime_env_names", ()) or ()):
+            if str(env_name).endswith("_BASE_URL"):
+                return snapshot_env.get(env_name)
+        return None
+
+    def _provider_snapshot_matches_current(self, snapshot: Dict[str, Any]) -> bool:
+        endpoint = snapshot.get("provider_endpoint") if isinstance(snapshot, dict) else None
+        if not isinstance(endpoint, dict):
+            return runtime_api_config.get_generation() == self.api_runtime_config_generation
+        try:
+            snapshot_index = int(endpoint.get("index", 0))
+        except Exception:
+            snapshot_index = None
+        return (
+            int(snapshot.get("generation", 0)) == self.api_runtime_config_generation
+            and snapshot_index == self._current_provider_endpoint_index()
+        )
+
+    def _prepare_provider_runtime_before_send(self, current_tick: int) -> None:
+        if not self._provider_fallback_enabled():
+            return
+
+        provider_id = str(self.api_runtime_provider_id)
+        env_names = tuple(getattr(self, "api_runtime_env_names", ()) or ())
+        current_endpoint_index = self._current_provider_endpoint_index()
+        probe_snapshot = runtime_api_config.claim_provider_base_recovery_probe(provider_id, env_names)
+        if probe_snapshot is not None:
+            success = False
+            try:
+                success = self._run_provider_base_recovery_probe(probe_snapshot)
+            except Exception as probe_error:
+                self._log(
+                    "INFO",
+                    f"Provider base recovery probe for {provider_id} failed: "
+                    f"{self._format_retry_error_for_log(probe_error)}",
+                )
+            finally:
+                runtime_api_config.complete_provider_base_recovery_probe(provider_id, success)
+            if success:
+                self._log(
+                    "INFO",
+                    f"Provider base recovery probe for {provider_id} "
+                    f"succeeded (base_url={self._provider_base_url_from_snapshot(probe_snapshot) or 'provider_default'})."
+                )
+
+        default_snapshot = runtime_api_config.get_config_snapshot(env_names, provider_id=provider_id)
+        if not self._provider_snapshot_matches_current(default_snapshot):
+            endpoint = default_snapshot.get("provider_endpoint") or {}
+            try:
+                next_endpoint_index = int(endpoint.get("index", 0))
+            except Exception:
+                next_endpoint_index = None
+            if current_endpoint_index is not None and next_endpoint_index != current_endpoint_index:
+                self._log(
+                    "INFO",
+                    f"Switching {provider_id} default endpoint to "
+                    f"{endpoint.get('name', endpoint.get('index'))} "
+                    f"(index={endpoint.get('index')}, "
+                    f"base_url={self._provider_base_url_from_snapshot(default_snapshot) or 'provider_default'})."
+                )
+            self._apply_provider_runtime_snapshot(default_snapshot)
+
+    def _refresh_runtime_api_config_if_changed(self) -> bool:
+        """
+        Refresh provider clients after dashboard runtime API/proxy updates.
+
+        Returns True when the connector refreshed internal client state. Existing
+        in-flight API calls keep their old client; retry attempts call this hook
+        before starting the next attempt.
+        """
+        return False
+
     def _handle_send_error(self, error: Exception, current_tick: int) -> bool:
         """
         Hook for connectors that want to react to send errors.
@@ -490,6 +715,81 @@ class BaseLLMConnector(abc.ABC):
         Returns True to retry immediately without the normal backoff sleep.
         """
         return False
+
+    def _handle_provider_send_error(self, error: Exception, current_tick: int) -> bool:
+        if not self._provider_fallback_enabled():
+            return False
+        provider_id = str(self.api_runtime_provider_id)
+        env_names = tuple(getattr(self, "api_runtime_env_names", ()) or ())
+        current_endpoint_index = self._current_provider_endpoint_index()
+        retry_state = getattr(self, "_provider_send_retry_state", None)
+        if not isinstance(retry_state, dict):
+            retry_state = {
+                "endpoint_index": current_endpoint_index,
+                "failure_streak": 0,
+                "cycle_count": 0,
+            }
+            self._provider_send_retry_state = retry_state
+        if "cycle_count" not in retry_state:
+            retry_state["cycle_count"] = 0
+        if retry_state.get("endpoint_index") != current_endpoint_index:
+            retry_state["endpoint_index"] = current_endpoint_index
+            retry_state["failure_streak"] = 0
+        retry_state["failure_streak"] = int(retry_state.get("failure_streak", 0)) + 1
+
+        if retry_state["failure_streak"] < 2:
+            runtime_api_config.record_provider_failure(
+                provider_id,
+                current_endpoint_index,
+                promote_default=False,
+            )
+            self._log(
+                "INFO",
+                f"{provider_id} endpoint index={current_endpoint_index} failed "
+                f"({self._format_retry_error_for_log(error)}); retrying same endpoint once before switching."
+            )
+            return True
+
+        retry_snapshot = runtime_api_config.record_provider_failure_and_get_retry_snapshot(
+            provider_id,
+            current_endpoint_index,
+            env_names,
+        )
+        if retry_snapshot is None:
+            return False
+        endpoint = retry_snapshot.get("provider_endpoint") or {}
+        self._log(
+            "INFO",
+            f"{provider_id} endpoint index={current_endpoint_index} failed "
+            f"({self._format_retry_error_for_log(error)}); switching request to endpoint "
+            f"{endpoint.get('name', endpoint.get('index'))} "
+            f"(index={endpoint.get('index')}, "
+            f"base_url={self._provider_base_url_from_snapshot(retry_snapshot) or 'provider_default'})."
+        )
+        self._apply_provider_runtime_snapshot(retry_snapshot)
+        retry_state["endpoint_index"] = self._current_provider_endpoint_index()
+        retry_state["failure_streak"] = 0
+        if retry_snapshot.get("provider_endpoint_cycle_wrapped"):
+            retry_state["cycle_count"] = int(retry_state.get("cycle_count", 0)) + 1
+            retry_delay = self._calculate_retry_delay(int(retry_state["cycle_count"]))
+            endpoint_count = endpoint.get("endpoint_count", "?")
+            self._log(
+                "INFO",
+                f"Completed one {provider_id} provider fallback loop "
+                f"({endpoint_count} endpoint(s)); waiting {retry_delay}s before starting "
+                f"fallback loop #{int(retry_state['cycle_count']) + 1}."
+            )
+            if retry_delay > 0:
+                time.sleep(retry_delay)
+        return True
+
+    def _record_provider_success(self) -> None:
+        if not self._provider_fallback_enabled():
+            return
+        runtime_api_config.record_provider_success(
+            str(self.api_runtime_provider_id),
+            self._current_provider_endpoint_index(),
+        )
 
     def sync_state(self) -> None:
         """
@@ -502,6 +802,9 @@ class BaseLLMConnector(abc.ABC):
         Called before generating observations and before sending messages to ensure
         token counts are accurate.
         """
+        if getattr(self, "_skip_agent_data_sync", False):
+            return
+
         current_prune_blocks_on_disk = self._load_prune_blocks_from_agent_data()
         current_system_prompt = self._load_system_prompt_from_agent_data()
 
@@ -511,19 +814,29 @@ class BaseLLMConnector(abc.ABC):
 
         if prune_changed or prompt_changed:
             if prune_changed:
-                print(f"Info ({self.agent_name}): Pruning blocks changed. Re-initializing chat session.")
+                self._log("INFO", "Pruning blocks changed. Re-initializing chat session.")
                 self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
                 self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
             if prompt_changed:
-                print(f"Info ({self.agent_name}): System prompt changed. Re-initializing chat session.")
+                self._log("INFO", "System prompt changed. Re-initializing chat session.")
                 self.system_prompt = current_system_prompt
                 self._last_known_system_prompt = current_system_prompt
                 self._handle_system_prompt_update()
             try:
                 self._initialize_chat_session() # Re-initialize with new pruning rules
 
-                # Count tokens after re-initialization and update agent's budget
-                print(f"Info ({self.agent_name}): Counting tokens after re-initialization.")
+                # Count tokens after re-initialization and update agent's budget.
+                # If pruning changed but this provider cannot recount the rebuilt
+                # session, do not persist a stale last-known count.
+                can_count_authoritatively = self._can_count_current_session_tokens_authoritatively()
+                if prune_changed and not can_count_authoritatively:
+                    self._mark_agent_token_budget_stale(
+                        constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
+                    )
+                    self._log("WARNING", "Token count unavailable after pruning; marking token budget stale.")
+                    return
+
+                self._log("INFO", "Counting tokens after re-initialization.")
                 new_token_count = self.get_current_total_session_tokens()
                 if new_token_count is not None:
                     if self.persist_to_disk:
@@ -531,15 +844,21 @@ class BaseLLMConnector(abc.ABC):
                         agent_data = agent_module.load_agent_data(self.agent_name)
                         if agent_data:
                             agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_KEY] = new_token_count
+                            agent_data.pop(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY, None)
+                            agent_data.pop(constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY, None)
                             agent_module.save_agent_data(self.agent_name, agent_data)
-                            print(f"Info ({self.agent_name}): Token budget updated to {new_token_count} after pruning.")
+                            self._log("INFO", f"Token budget updated to {new_token_count} after pruning.")
                         else:
-                            print(f"Warning ({self.agent_name}): Could not load agent data to update token count after pruning.")
+                            self._log("WARNING", "Could not load agent data to update token count after pruning.")
                 else:
-                    print(f"Warning ({self.agent_name}): Could not count tokens after pruning re-initialization.")
+                    if prune_changed:
+                        self._mark_agent_token_budget_stale(
+                            constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
+                        )
+                    self._log("WARNING", "Could not count tokens after pruning re-initialization.")
 
             except Exception as e_reinit:
-                print(f"Error ({self.agent_name}): Failed to re-initialize chat session after pruning update: {e_reinit}.")
+                self._log("ERROR", f"Failed to re-initialize chat session after pruning update: {e_reinit}.")
                 # Note: We don't raise here to allow the caller to proceed, but state may be stale
 
     def send_message(self, user_prompt: str, current_tick: int) -> Tuple[str, Dict[str, Optional[int]]]:
@@ -547,14 +866,35 @@ class BaseLLMConnector(abc.ABC):
         # This is idempotent - if sync_state() was already called earlier (e.g., before request_status),
         # this will be a no-op with no wasted computation
         self.sync_state()
+        self._prepare_provider_runtime_before_send(current_tick)
         self._before_send_message(current_tick)
 
         # --- Original send_message retry logic ---
         last_exception: Optional[Exception] = None
         last_empty_response: Optional[Tuple[str, Optional[str], Dict[str, Optional[int]]]] = None
         current_attempt = 0
-        while current_attempt <= self.max_retries:
+        self._provider_send_retry_state = {}
+        context_overflow_failures = 0
+        context_overflow_max_attempts = max(
+            1,
+            int(getattr(constants, "LLM_CONTEXT_OVERFLOW_MAX_ATTEMPTS", 3)),
+        )
+        while current_attempt <= self.max_retries or context_overflow_failures < context_overflow_max_attempts:
             try:
+                try:
+                    if self._refresh_runtime_api_config_if_changed():
+                        self._log(
+                            "INFO",
+                            f"Runtime API config refreshed before attempt {current_attempt + 1}."
+                        )
+                        self._before_send_message(current_tick)
+                except Exception as refresh_error:
+                    self._log(
+                        "WARNING",
+                        f"Runtime API config refresh failed: "
+                        f"{self._format_retry_error_for_log(refresh_error)}",
+                    )
+
                 llm_response, thinking_response, token_info = self._send_message_implementation(user_prompt, current_tick, attempt_number=current_attempt)
 
                 # Validate that the response is not empty
@@ -571,47 +911,86 @@ class BaseLLMConnector(abc.ABC):
                         )
                     else:
                         # All retries exhausted, accept the empty response
-                        print(f"Warning ({self.agent_name}): Empty response received after {self.max_retries} retries. Accepting empty response.")
+                        self._log(
+                            "WARNING",
+                            f"Empty response received after {self.max_retries} retries. "
+                            "Accepting empty response.",
+                        )
                         return llm_response, thinking_response, token_info
 
+                self._record_provider_success()
                 return llm_response, thinking_response, token_info
             except LLMContextOverflowError as e:
-                # Context overflow should not be retried - the context won't get smaller with retries!
-                print(f"LLMConnector ({self.agent_name}): Context overflow detected, not retrying: {e}")
+                last_exception = e
+                current_attempt += 1
+                context_overflow_failures += 1
+                if context_overflow_failures >= context_overflow_max_attempts:
+                    self._log(
+                        "ERROR",
+                        f"Context overflow persisted after "
+                        f"{context_overflow_failures} attempt(s). Pausing caller for manual review."
+                    )
+                    raise
+                if self._handle_provider_send_error(e, current_tick):
+                    continue
+
+                retry_delay = self._calculate_retry_delay(context_overflow_failures)
+                self._log(
+                    "WARNING",
+                    f"Context overflow detected "
+                    f"(attempt {context_overflow_failures}/{context_overflow_max_attempts}): {e}. "
+                    f"Retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+                continue
+            except LLMCorruptedThoughtSignatureError:
+                self._log(
+                    "ERROR",
+                    "Corrupted thought signature detected. "
+                    "Pausing caller without provider fallback or retry."
+                )
                 raise
             except Exception as e:
                 last_exception = e
                 current_attempt += 1
                 retry_immediately = False
+                handled_by_provider = False
                 try:
-                    retry_immediately = self._handle_send_error(e, current_tick)
+                    retry_immediately = self._handle_provider_send_error(e, current_tick)
+                    handled_by_provider = retry_immediately
+                    if not retry_immediately:
+                        retry_immediately = self._handle_send_error(e, current_tick)
                 except Exception as hook_error:
-                    print(f"Warning ({self.agent_name}): send error hook failed: {hook_error}")
+                    self._log(
+                        "WARNING",
+                        f"Send error hook failed: {self._format_retry_error_for_log(hook_error)}",
+                    )
 
                 if current_attempt > self.max_retries:
-                    print(f"LLMConnector ({self.agent_name}): Max retries ({self.max_retries}) exhausted. Last error: {e}")
+                    self._log(
+                        "ERROR",
+                        f"Max retries ({self.max_retries}) exhausted. Full error: "
+                        f"{self._format_exception_for_log(e, include_raw=True, max_message_length=None)}",
+                    )
                     raise
                 if retry_immediately:
-                    print(f"LLMConnector ({self.agent_name}): Retrying immediately after transient error handling.")
+                    if not handled_by_provider:
+                        self._log(
+                            "INFO",
+                            f"Retrying immediately after handled error "
+                            f"(next_attempt={current_attempt + 1}/{self.max_retries}, "
+                            f"error={self._format_retry_error_for_log(e)}).",
+                        )
                     continue
-                
-                # Print detailed error information for debugging
-                error_details = str(e)
-                raw_error_info = ""
-                
-                # Extract additional error details if available
-                if hasattr(e, 'original_exception') and e.original_exception:
-                    raw_error_info = f" | Raw API Error: {e.original_exception}"
-                elif hasattr(e, '__dict__'):
-                    # Print all available attributes for debugging
-                    error_attrs = {k: v for k, v in e.__dict__.items() if not k.startswith('_')}
-                    if error_attrs:
-                        raw_error_info = f" | Error Attributes: {error_attrs}"
                 
                 # Calculate incremental retry delay
                 retry_delay = self._calculate_retry_delay(current_attempt)
 
-                print(f"LLMConnector ({self.agent_name}): API error (Attempt {current_attempt}/{self.max_retries}): {error_details}{raw_error_info}. Retrying in {retry_delay}s...")
+                self._log(
+                    "WARNING",
+                    f"API error (attempt {current_attempt}/{self.max_retries}): "
+                    f"{self._format_retry_error_for_log(e)}. Retrying in {retry_delay}s...",
+                )
                 time.sleep(retry_delay)
         
         if last_exception: 
@@ -635,6 +1014,24 @@ class BaseLLMConnector(abc.ABC):
         """
         pass
 
+    def _can_count_current_session_tokens_authoritatively(self) -> bool:
+        """
+        Return False when get_current_total_session_tokens() would only return
+        stale provider usage instead of recounting the rebuilt session.
+        """
+        return True
+
+    def _mark_agent_token_budget_stale(self, reason: str) -> None:
+        if not self.persist_to_disk:
+            return
+        agent_data = agent_module.load_agent_data(self.agent_name)
+        if not agent_data:
+            self._log("WARNING", "Could not load agent data to mark token budget stale.")
+            return
+        agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY] = True
+        agent_data[constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY] = reason
+        agent_module.save_agent_data(self.agent_name, agent_data)
+
     def force_refresh_and_get_current_session_tokens(self) -> Optional[int]:
         """
         Forces a refresh of the pruning blocks, re-initializes the chat session
@@ -644,16 +1041,26 @@ class BaseLLMConnector(abc.ABC):
 
         # Check if pruning blocks actually changed to avoid unnecessary re-initialization
         if current_prune_blocks_on_disk != self._last_known_prune_blocks:
-            print(f"Info ({self.agent_name}): Pruning blocks changed (detected by force_refresh). Re-initializing chat session.")
+            self._log("INFO", "Pruning blocks changed (detected by force_refresh). Re-initializing chat session.")
             self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
             self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
             try:
                 self._initialize_chat_session()
             except Exception as e_reinit:
-                print(f"Error ({self.agent_name}): Failed to re-initialize chat session during force_refresh: {e_reinit}. Token count may be inaccurate.")
+                self._log(
+                    "ERROR",
+                    f"Failed to re-initialize chat session during force_refresh: {e_reinit}. "
+                    "Token count may be inaccurate.",
+                )
                 return None # Indicate failure to get accurate count
+            if not self._can_count_current_session_tokens_authoritatively():
+                self._mark_agent_token_budget_stale(
+                    constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
+                )
+                self._log("WARNING", "Token count unavailable after pruning force-refresh; marking token budget stale.")
+                return None
         else:
-            print(f"Info ({self.agent_name}): Pruning blocks unchanged. Proceeding to get current token count.")
+            self._log("INFO", "Pruning blocks unchanged. Proceeding to get current token count.")
 
         return self.get_current_total_session_tokens()
 

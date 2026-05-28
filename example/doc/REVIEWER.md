@@ -5,8 +5,9 @@ The Archive Room features an automated LLM-based reviewer system that evaluates 
 ## Overview
 
 **Two-Prompt Architecture:**
-1. **Initial Context Prompt**: Establishes research context and evaluation criteria (sent once)
-2. **Submission Prompts**: Evaluates individual submissions (sent per archive)
+1. **System Prompt**: Fixed connector-level reviewer instruction (`ARCHIVE_REVIEWER_SYSTEM_PROMPT`)
+2. **Initial Context Prompt**: Establishes research context and evaluation criteria (sent once)
+3. **Submission Prompts**: Evaluates individual submissions (sent per archive)
 
 **Evaluation Flow:**
 1. Agent submits archive → Queued for review
@@ -25,11 +26,17 @@ The reviewer receives:
 
 ## Prompt System Details
 
+### System Prompt
+
+**Constant**: `ARCHIVE_REVIEWER_SYSTEM_PROMPT`
+
+This is the reviewer connector's actual system prompt. Unlike normal Station agents, `AutoArchiveEvaluator` intentionally bypasses `build_station_level_system_prompt(...)`; its Codex/task/archive context is provided through the initial context prompt instead.
+
 ### Initial Context Prompt
 
 **Constant**: `EVAL_ARCHIVE_INITIAL_PROMPT`  
 **When**: Sent once at tick 1 to establish evaluation context  
-**Format Placeholders**: `{research_task_spec}`, `{archive_abstract}`
+**Format Placeholders**: `{research_task_spec}`, `{archive_abstract}`, `{codex}`
 
 **Example Output:**
 ```
@@ -168,7 +175,8 @@ Additional scores appear in:
 ## Technical Implementation
 
 ### Context Management
-- **Initial Context**: Sent once at tick 1, contains research task + existing archive abstracts
+- **System Prompt**: Fixed connector-level reviewer prompt; does not use the station-wide agent wrapper
+- **Initial Context**: Sent once at tick 1, contains research task + existing archive abstracts + Codex
 - **Protected Pruning**: Tick 1 never pruned, refreshed with latest data when pruning occurs  
 - **Automatic Refresh**: Context updated with new research tasks and archive papers
 - **Submission Prompts**: Lightweight prompts referencing established context

@@ -17,12 +17,15 @@ import os
 import sys
 import json
 import argparse
+import hashlib
 import threading
 import time
+from datetime import timedelta
+from functools import wraps
 from queue import Queue, Empty as QueueEmpty # Renamed to avoid conflict
-from flask import Flask, request, jsonify, render_template, Response
+from flask import Flask, request, jsonify, render_template, Response, session, redirect, url_for
 from flask_httpauth import HTTPBasicAuth
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 # Load .env file to ensure environment variables persist across gunicorn worker restarts
@@ -40,7 +43,17 @@ from station.base_room import InternalActionHandler
 from station.rooms.common import CommonRoom
 from station import constants
 from station import file_io_utils
+from station import runtime_api_config
+from station import capsule as capsule_module
 from station import __version__ 
+from station.llm_connectors.presets import load_model_presets
+from station.system_messages import build_station_level_system_prompt
+from web_interface.archive_utils import (
+    build_archive_detail_payload,
+    build_archive_list_payload,
+)
+from web_interface.input_utils import normalize_optional_role_definition
+from web_interface.stream_utils import sanitize_stream_event_payload as _sanitize_stream_event_payload
 
 # --- Global Variables ---
 OPERATION_MODE: str = "api" 
@@ -53,13 +66,27 @@ orchestrator_log_queue = Queue()
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24))
 
+def _cookie_hash_suffix() -> str:
+    secret = app.secret_key
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    return hashlib.sha256(secret).hexdigest()[:8]
+
+def _build_session_cookie_name(station_id: Optional[str] = None) -> str:
+    base = "station_session"
+    if station_id:
+        base = f"{base}_{station_id}"
+    return f"{base}_{_cookie_hash_suffix()}"
+
+# Initial cookie name (may be refined once station instance is available)
+_env_cookie_name = os.environ.get("FLASK_SESSION_COOKIE_NAME")
+app.config["SESSION_COOKIE_NAME"] = _env_cookie_name or _build_session_cookie_name()
+
 # ProxyFix for handling X-Forwarded headers correctly
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Import Flask utilities after app creation
-from flask import url_for, redirect
-
 # --- Authentication Setup ---
 auth = HTTPBasicAuth()
 
@@ -74,25 +101,115 @@ def verify_password(username, password):
     
     return username == auth_username and password == auth_password
 
+def _get_auth_credentials():
+    auth_username = os.environ.get('FLASK_AUTH_USERNAME', 'admin')
+    auth_password = os.environ.get('FLASK_AUTH_PASSWORD', 'changeme')
+    return auth_username, auth_password
+
+def _session_authenticated():
+    if not constants.WEB_AUTH_ENABLED:
+        return True
+    auth_username, _ = _get_auth_credentials()
+    return session.get("user") == auth_username
+
+# Configure cookie-based sessions for "remember me"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=14)
+if os.environ.get("FLASK_SESSION_COOKIE_SECURE", "true").lower() in ("1", "true", "yes"):
+    app.config["SESSION_COOKIE_SECURE"] = True
+
 # Auth decorator that respects the enable/disable setting
 def auth_required(f):
-    if constants.WEB_AUTH_ENABLED:
-        return auth.login_required(f)
-    return f
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not constants.WEB_AUTH_ENABLED or _session_authenticated():
+            return f(*args, **kwargs)
+        # Fall back to HTTP Basic for API/CLI clients
+        return auth.login_required(f)(*args, **kwargs)
+    return wrapper
+
+def _is_public_route():
+    if request.endpoint in ("login_page", "login_submit", "static"):
+        return True
+    if request.path.startswith("/static/"):
+        return True
+    return False
 
 # Add auth to all routes by default using before_request
 @app.before_request
 def require_auth():
-    if constants.WEB_AUTH_ENABLED and not auth.current_user():
+    if not constants.WEB_AUTH_ENABLED or _is_public_route():
+        return None
+
+    # Session cookie keeps you signed in
+    if _session_authenticated():
+        return None
+
+    # Let API clients continue using HTTP Basic
+    if request.authorization or request.path.startswith("/api/"):
         return auth.login_required(lambda: None)()
+
+    # Default: send to login form
+    return redirect(url_for("login_page", next=request.path))
+
+@app.route("/login", methods=["GET"])
+def login_page():
+    if not constants.WEB_AUTH_ENABLED:
+        return redirect(url_for("dashboard_page"))
+    if _session_authenticated():
+        return redirect(url_for("dashboard_page"))
+    error = request.args.get("error")
+    return render_template("login.html", error=error)
+
+@app.route("/login", methods=["POST"])
+def login_submit():
+    if not constants.WEB_AUTH_ENABLED:
+        return redirect(url_for("dashboard_page"))
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+    remember_me = bool(request.form.get("remember_me"))
+    auth_username, auth_password = _get_auth_credentials()
+
+    if username == auth_username and password == auth_password:
+        session["user"] = username
+        session.permanent = remember_me
+        next_url = request.args.get("next") or url_for("dashboard_page")
+        return redirect(next_url)
+
+    return redirect(url_for("login_page", error="Invalid credentials"))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login_page"))
+
+def _get_parallel_tick_status() -> Optional[Dict[str, Any]]:
+    if getattr(constants, "SYNC_MODE", constants.SYNC_MODE_PARALLEL) != constants.SYNC_MODE_PARALLEL:
+        return None
+
+    try:
+        from station.sync.parallel_status import load_parallel_tick_status
+
+        return load_parallel_tick_status(orchestrator_instance)
+    except Exception as exc:
+        return {"active": False, "error": str(exc)}
+
 
 # --- Initialization ---
 def initialize_station_and_orchestrator():
     global station_instance, orchestrator_instance, OPERATION_MODE
     OPERATION_MODE = "api"
     print(f"Initializing application in '{OPERATION_MODE}' mode.")
+    runtime_api_config.validate_provider_backup_env_config()
     try:
         station_instance = Station()
+        # Once station is available, scope the session cookie to its unique ID (unless overridden)
+        if "FLASK_SESSION_COOKIE_NAME" not in os.environ:
+            station_cookie_name = _build_session_cookie_name(
+                getattr(station_instance, "station_id", "unknown")
+            )
+            app.config["SESSION_COOKIE_NAME"] = station_cookie_name
         orchestrator_log_queue.put({"event": "status_update", "data": {"message": "Station instance initialized."}, "timestamp": time.time()})
 
         orchestrator_instance = Orchestrator(
@@ -119,7 +236,36 @@ def root_redirect_route():
 @app.route('/dashboard')
 @auth_required
 def dashboard_page():
-    return render_template('dashboard.html', operation_mode=OPERATION_MODE)
+    model_presets = load_model_presets()
+    return render_template('dashboard.html', operation_mode=OPERATION_MODE, model_presets=model_presets)
+
+
+@app.route('/api/archive/papers', methods=['GET'])
+def archive_papers_list_route():
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+
+    try:
+        payload = build_archive_list_payload(capsule_module)
+        return jsonify({"success": True, **payload})
+    except Exception as e:
+        app.logger.error(f"Error loading archive papers: {e}")
+        return jsonify({"success": False, "error": f"Failed to load archive papers: {str(e)}"}), 500
+
+
+@app.route('/api/archive/papers/<int:numeric_id>', methods=['GET'])
+def archive_paper_detail_route(numeric_id: int):
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+
+    try:
+        payload = build_archive_detail_payload(capsule_module, numeric_id)
+        if not payload:
+            return jsonify({"success": False, "error": f"Archive paper #{numeric_id} not found."}), 404
+        return jsonify({"success": True, **payload})
+    except Exception as e:
+        app.logger.error(f"Error loading archive paper #{numeric_id}: {e}")
+        return jsonify({"success": False, "error": f"Failed to load archive paper #{numeric_id}: {str(e)}"}), 500
 
 # --- API Endpoints - Orchestrator Control (API Mode) ---
 @app.route('/api/orchestrator/status', methods=['GET'])
@@ -133,6 +279,7 @@ def get_orchestrator_status_route():
         "is_prepared": orchestrator_instance.is_prepared, # ADDED
         "is_running": orchestrator_instance.is_running,
         "is_paused": orchestrator_instance.is_paused,
+        "sync_mode": getattr(constants, "SYNC_MODE", constants.SYNC_MODE_PARALLEL),
         "pause_requested": orchestrator_instance.pause_requested,
         "pause_condition_met": orchestrator_instance.pause_condition_met,
         "pause_reason": orchestrator_instance.get_pause_reason(),
@@ -146,6 +293,7 @@ def get_orchestrator_status_route():
                               if orchestrator_instance.agent_turn_order and
                                  0 <= orchestrator_instance.current_agent_index_in_turn_order < len(orchestrator_instance.agent_turn_order)
                               else "N/A"),
+        "parallel_tick_status": _get_parallel_tick_status(),
         "agents_awaiting_human": agents_awaiting_human_list
     }
     return jsonify({"success": True, "status": status_data})
@@ -235,7 +383,7 @@ def orchestrator_add_agent_route_ep(): # Renamed
     internal_note = data.get('internal_note', "")
     assigned_ancestor = data.get('assigned_ancestor', "")
     
-    llm_system_prompt = data.get('llm_system_prompt')
+    llm_system_prompt = normalize_optional_role_definition(data.get('llm_system_prompt'))
     llm_temperature_str = data.get('llm_temperature')
     llm_temperature = float(llm_temperature_str) if llm_temperature_str else None
     llm_max_tokens_str = data.get('llm_max_tokens')
@@ -255,7 +403,7 @@ def orchestrator_add_agent_route_ep(): # Renamed
         initial_tokens_max=initial_tokens_max,
         internal_note=internal_note,
         assigned_ancestor=assigned_ancestor,
-        llm_system_prompt=llm_system_prompt,
+        role_definition=llm_system_prompt,
         llm_temperature=llm_temperature,
         llm_max_tokens=llm_max_tokens,
         llm_custom_api_params=llm_custom_api_params
@@ -294,6 +442,24 @@ def orchestrator_manual_message_route_ep_v2(): # Renamed
     )
     return jsonify({"success": success, **response_data})
 
+@app.route('/api/reviewer/manual_message', methods=['POST'])
+def reviewer_manual_message_route():
+    """Manual direct message to the Reviewer (archive evaluator)"""
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 403
+
+    evaluator = getattr(station_instance, "auto_archive_evaluator", None)
+    if not evaluator:
+        return jsonify({"success": False, "error": "Reviewer system is not available."}), 503
+
+    data = request.get_json() or {}
+    message_text = data.get('message_text')
+    if not message_text or not isinstance(message_text, str) or not message_text.strip():
+        return jsonify({"success": False, "error": "message_text is required and cannot be empty."}), 400
+
+    success, response_data = evaluator.send_manual_message_to_reviewer(message_text)
+    return jsonify({"success": success, **response_data})
+
 @app.route('/api/orchestrator/get_human_request', methods=['GET'])
 def get_human_request_details():
     """Get details of a pending human request for a specific agent"""
@@ -303,23 +469,34 @@ def get_human_request_details():
     agent_name = request.args.get('agent_name')
     if not agent_name:
         return jsonify({"success": False, "error": "agent_name is required."}), 400
+    request_id_param = request.args.get('request_id')
+    request_id = None
+    if request_id_param is not None:
+        try:
+            request_id = int(request_id_param)
+        except (TypeError, ValueError):
+            request_id = request_id_param
 
-    # Get the request details from the external counter
+    # Get the request details from the administrative counter
     try:
         from station import constants
-        external_counter = orchestrator_instance.station.rooms.get(constants.ROOM_EXTERNAL)
-        if not external_counter:
-            return jsonify({"success": False, "error": "External Counter not available"}), 404
+        admin_counter = orchestrator_instance.station.rooms.get(constants.ROOM_ADMIN)
+        if not admin_counter:
+            return jsonify({"success": False, "error": "Administrative Counter not available"}), 404
 
         # Check if agent has a pending request
-        if agent_name not in external_counter.pending_requests:
+        if agent_name not in admin_counter.pending_requests:
             return jsonify({"success": False, "error": f"No pending request for agent {agent_name}"}), 404
 
-        request_id = external_counter.pending_requests[agent_name]
+        pending_request_ids = admin_counter.pending_requests[agent_name]
+        if isinstance(pending_request_ids, list):
+            pending_request_ids = list(pending_request_ids)
+        else:
+            pending_request_ids = [pending_request_ids]
 
         # Load the human requests log to get details
         import os
-        log_path = external_counter.log_file_path
+        log_path = admin_counter.log_file_path
         if not os.path.exists(log_path):
             return jsonify({"success": False, "error": "Human requests log not found"}), 404
 
@@ -327,22 +504,33 @@ def get_human_request_details():
         from station import file_io_utils
         requests = file_io_utils.load_yaml_lines(log_path)
 
+        matching_requests = []
         for req in requests:
-            if req.get('request_id') == request_id and not req.get('resolved', False):
-                return jsonify({
-                    "success": True,
-                    "request": {
-                        "request_id": req.get('request_id'),
-                        "tick": req.get('tick'),
-                        "agent_name": req.get('agent_name'),
-                        "agent_model": req.get('agent_model'),
-                        "title": req.get('title'),
-                        "content": req.get('content'),
-                        "timestamp": req.get('timestamp')
-                    }
+            if req.get('request_id') in pending_request_ids and not req.get('resolved', False):
+                matching_requests.append({
+                    "request_id": req.get('request_id'),
+                    "tick": req.get('tick'),
+                    "agent_name": req.get('agent_name'),
+                    "agent_model": req.get('agent_model'),
+                    "title": req.get('title'),
+                    "content": req.get('content'),
+                    "timestamp": req.get('timestamp')
                 })
 
-        return jsonify({"success": False, "error": f"Request {request_id} not found in log"}), 404
+        if request_id is not None:
+            matching_requests = [req for req in matching_requests if req.get('request_id') == request_id]
+
+        if not matching_requests:
+            if request_id is not None:
+                return jsonify({"success": False, "error": f"Request {request_id} not found in log"}), 404
+            return jsonify({"success": False, "error": f"No pending requests found for agent {agent_name}"}), 404
+
+        return jsonify({
+            "success": True,
+            "requests": matching_requests,
+            "request": matching_requests[0],
+            "selected_request_id": request_id
+        })
 
     except Exception as e:
         return jsonify({"success": False, "error": f"Error fetching request: {str(e)}"}), 500
@@ -354,6 +542,7 @@ def orchestrator_resolve_human_intervention_route_ep_v2(): # Renamed
 
     data = request.get_json()
     agent_name = data.get('agent_name')
+    request_id = data.get('request_id')
     if not agent_name:
         return jsonify({"success": False, "error": "agent_name is required."}), 400
 
@@ -363,7 +552,8 @@ def orchestrator_resolve_human_intervention_route_ep_v2(): # Renamed
     success, message = orchestrator_instance.resolve_human_intervention(
         agent_name,
         resolution_reason,
-        human_response=response_text
+        human_response=response_text,
+        request_id=request_id
     )
     return jsonify({"success": success, "message": message})
 
@@ -433,6 +623,12 @@ def get_agent_dialogue_history_route(agent_name: str):
         return jsonify({"success": False, "error": "Station not properly initialized."}), 500
 
     load_full = request.args.get('full', 'false').lower() == 'true'
+    window = request.args.get('window', 'recent').lower()
+    try:
+        tick_limit = int(request.args.get('ticks', '50'))
+    except (TypeError, ValueError):
+        tick_limit = 50
+    tick_limit = max(1, min(tick_limit, 1000))
 
     # Handle special case for Reviewer
     if agent_name == "Reviewer":
@@ -454,7 +650,25 @@ def get_agent_dialogue_history_route(agent_name: str):
         return jsonify({"success": True, "history": [], "message": f"No dialogue history found for {agent_name}."})
 
     try:
-        history_entries = file_io_utils.load_yaml_lines(log_file_path)
+        range_meta: Dict[str, Any] = {
+            "mode": "full" if load_full else window,
+            "ticks": tick_limit,
+            "min_tick": None,
+            "max_tick": None,
+            "is_partial": False,
+            "has_older": False,
+            "has_newer": False,
+        }
+        if load_full or agent_name == "Reviewer":
+            history_entries = file_io_utils.load_yaml_lines(log_file_path)
+        elif window in ("recent", "earliest"):
+            history_entries, range_meta = file_io_utils.load_yaml_lines_tick_window(
+                log_file_path,
+                window=window,
+                tick_limit=tick_limit,
+            )
+        else:
+            return jsonify({"success": False, "error": f"Unsupported history window: {window}"}), 400
         is_truncated = False
 
         # Transform reviewer format to agent format if this is the reviewer
@@ -477,7 +691,7 @@ def get_agent_dialogue_history_route(agent_name: str):
                 history_entries = history_entries[-500:]
 
         # Use json.dumps with Response instead of jsonify to avoid Content-Length mismatch
-        response_data = {"success": True, "history": history_entries, "is_truncated": is_truncated}
+        response_data = {"success": True, "history": history_entries, "is_truncated": is_truncated, "range": range_meta}
         json_str = json.dumps(response_data)
         return Response(json_str, mimetype='application/json')
     except Exception as e:
@@ -494,6 +708,57 @@ def get_station_tick_ep_v2(): # Renamed
 def get_agents_ep_v2(): # Renamed
     if not station_instance: return jsonify({"success": False, "error": "Station not initialized"}), 500
     return jsonify({"success": True, "agents": station_instance.get_all_agents_summary()})
+
+
+def _build_reviewer_system_prompt_text() -> str:
+    """Return the actual runtime system prompt for the archive reviewer."""
+    evaluator = getattr(station_instance, "auto_archive_evaluator", None) if station_instance else None
+
+    connector_system_prompt = constants.ARCHIVE_REVIEWER_SYSTEM_PROMPT
+    if evaluator and getattr(evaluator, "llm_connector", None):
+        connector_system_prompt = getattr(
+            evaluator.llm_connector,
+            "system_prompt",
+            connector_system_prompt,
+        ) or connector_system_prompt
+
+    return connector_system_prompt
+
+
+@app.route('/api/agent/<agent_name>/system_prompt', methods=['GET'])
+def get_agent_system_prompt_ep(agent_name: str):
+    if not station_instance:
+        return jsonify({"success": False, "error": "Station not initialized"}), 500
+
+    if agent_name == "Reviewer":
+        return jsonify({
+            "success": True,
+            "agent_name": agent_name,
+            "system_prompt": _build_reviewer_system_prompt_text()
+        })
+
+    if not getattr(station_instance, "agent_module", None):
+        return jsonify({"success": False, "error": "Station agent module is not available"}), 500
+
+    try:
+        agent_data = station_instance.agent_module.load_agent_data(
+            agent_name,
+            include_ended=True,
+            include_ascended=True,
+        )
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Failed to load agent data: {str(e)}"}), 500
+
+    if not agent_data:
+        return jsonify({"success": False, "error": f"Agent '{agent_name}' not found."}), 404
+
+    raw_role_definition = station_instance.agent_module.get_agent_role_definition(agent_data)
+    system_prompt = build_station_level_system_prompt(agent_name, raw_role_definition)
+    return jsonify({
+        "success": True,
+        "agent_name": agent_name,
+        "system_prompt": system_prompt or ""
+    })
 
 @app.route('/api/station/statistics', methods=['GET'])
 def get_station_statistics():
@@ -533,7 +798,8 @@ def get_station_config():
             "station_status": station_instance.config.get(constants.STATION_CONFIG_STATION_STATUS, "Unknown"),
             "station_name": station_instance.config.get(constants.STATION_CONFIG_NAME, ""),
             "station_description": station_instance.config.get(constants.STATION_CONFIG_DESCRIPTION, ""),
-            "station_id": station_instance.config.get(constants.STATION_ID_KEY, "Unknown")
+            "station_id": station_instance.config.get(constants.STATION_ID_KEY, "Unknown"),
+            "sync_mode": getattr(constants, "SYNC_MODE", "parallel"),
         }
         return jsonify({"success": True, "config": config})
     except Exception as e:
@@ -560,11 +826,52 @@ def update_station_config():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route('/api/station/api_runtime_config', methods=['GET'])
+def get_api_runtime_config():
+    """Return sanitized runtime API/proxy configuration for the dashboard."""
+    try:
+        return jsonify({
+            "success": True,
+            "config": runtime_api_config.build_public_config(),
+        })
+    except Exception as e:
+        app.logger.error(f"Error loading runtime API config: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/station/api_runtime_config', methods=['PUT'])
+def update_api_runtime_config():
+    """Apply an in-memory runtime API/proxy update for this Station process."""
+    try:
+        data = request.get_json()
+        if not isinstance(data, dict):
+            return jsonify({"success": False, "error": "Invalid JSON payload"}), 400
+
+        config = runtime_api_config.apply_update(data)
+        if orchestrator_instance:
+            try:
+                orchestrator_instance.handle_runtime_api_config_updated(config.get("generation", 0))
+            except Exception as e:
+                app.logger.warning(f"Failed to notify orchestrator of runtime API config update: {e}")
+
+        return jsonify({
+            "success": True,
+            "message": "Runtime API settings updated for this running Station process.",
+            "config": config,
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        app.logger.error(f"Error updating runtime API config: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 # --- SSE Stream ---
 @app.route('/api/orchestrator/live_log_stream') # Or your actual SSE route path
 def live_log_stream_route_ep_v2(): # Ensure this is the correct function name
     if OPERATION_MODE != "api":
         return Response("SSE only available in API mode.", status=403, mimetype='text/event-stream')
+    selected_agent_name = request.args.get("agent_name") or None
     
     def event_stream():
         # ... (connect_event yield as before) ...
@@ -576,11 +883,8 @@ def live_log_stream_route_ep_v2(): # Ensure this is the correct function name
             while True:
                 try:
                     log_entry = orchestrator_log_queue.get(timeout=1) # Waits up to 1 second
-                    # --- ADD DEBUG PRINT ---
-                    app.logger.info(f"APP.PY_SSE_DEBUG: Got from queue: {log_entry.get('event')}")
+                    log_entry = _sanitize_stream_event_payload(log_entry, selected_agent_name)
                     yield f"data: {json.dumps(log_entry)}\n\n"
-                    # --- ADD DEBUG PRINT ---
-                    # app.logger.info(f"APP.PY_SSE_DEBUG: Yielded event: {log_entry.get('event')}")
                 except QueueEmpty:
                     # Send a comment as a keep-alive signal
                     yield ": keepalive\n\n"
@@ -607,6 +911,7 @@ def recent_events_route():
     """Get recent events from the log queue for polling mode (fallback)"""
     if OPERATION_MODE != "api":
         return jsonify({"success": False, "message": "Recent events only available in API mode"}), 403
+    selected_agent_name = request.args.get("agent_name") or None
     
     events = []
     try:
@@ -614,6 +919,7 @@ def recent_events_route():
         for _ in range(50):
             try:
                 event = orchestrator_log_queue.get_nowait()
+                event = _sanitize_stream_event_payload(event, selected_agent_name)
                 events.append(event)
             except QueueEmpty:
                 break
@@ -652,6 +958,68 @@ def final_chat_with_agent_route(agent_name: str):
         return jsonify({"success": False, "error": error_msg}), 500 
     
     return jsonify({"success": True, "agent_response": llm_response})
+
+@app.route('/api/agent/<agent_name>/temporal_chat', methods=['GET'])
+def temporal_chat_state_route(agent_name: str):
+    """Load the persisted temporal chat transcript for an agent."""
+    if OPERATION_MODE != "api" or not orchestrator_instance:
+        return jsonify({"success": False, "error": "Orchestrator not active or not in API mode."}), 503
+
+    chat_state, error_msg = orchestrator_instance.get_temporal_chat_state(agent_name)
+    if error_msg:
+        return jsonify({"success": False, "error": error_msg}), 500
+    return jsonify({"success": True, "chat": chat_state})
+
+
+@app.route('/api/agent/<agent_name>/temporal_chat/refresh', methods=['POST'])
+def temporal_chat_refresh_route(agent_name: str):
+    """Discard an agent's temporal fork and freeze a new one from a branch tick."""
+    if OPERATION_MODE != "api" or not orchestrator_instance:
+        return jsonify({"success": False, "error": "Orchestrator not active or not in API mode."}), 503
+
+    data = request.get_json(silent=True) or {}
+    base_tick = data.get("base_tick") if isinstance(data, dict) else None
+
+    chat_state, error_msg = orchestrator_instance.refresh_temporal_chat(agent_name, base_tick=base_tick)
+    if error_msg:
+        status_code = 400 if "branch tick" in error_msg.lower() else 500
+        return jsonify({"success": False, "error": error_msg}), status_code
+    return jsonify({"success": True, "chat": chat_state})
+
+@app.route('/api/agent/<agent_name>/temporal_chat', methods=['POST'])
+def temporal_chat_with_agent_route(agent_name: str):
+    """
+    Persistent temporal chat with an agent.
+
+    The first send freezes the agent's current LLM history into a temporal fork.
+    Further sends continue from that fork until the user branches again.
+    """
+    if OPERATION_MODE != "api" or not orchestrator_instance:
+        return jsonify({"success": False, "error": "Orchestrator not active or not in API mode, cannot perform temporal chat."}), 503
+
+    data = request.get_json() or {}
+    user_message = data.get("user_message")
+    base_tick = data.get("base_tick")
+
+    if not user_message or not isinstance(user_message, str) or not user_message.strip():
+        return jsonify({"success": False, "error": "Field 'user_message' is required and cannot be empty."}), 400
+
+    llm_response, thinking_text, chat_state, error_msg = orchestrator_instance.perform_temporal_chat_with_agent(
+        agent_name=agent_name,
+        user_message=user_message,
+        base_tick=base_tick,
+    )
+
+    if error_msg:
+        status_code = 400 if "branch tick" in error_msg.lower() else 500
+        return jsonify({"success": False, "error": error_msg, "chat": chat_state}), status_code
+
+    return jsonify({
+        "success": True,
+        "agent_response": llm_response,
+        "thinking_text": thinking_text,
+        "chat": chat_state,
+    })
 
 @app.route('/api/station/send_system_message', methods=['POST'])
 def station_send_system_message_route():
@@ -819,10 +1187,10 @@ def api_shutdown():
             # Stop all evaluation loops
             if hasattr(station_instance, 'auto_research_evaluator') and station_instance.auto_research_evaluator:
                 station_instance.stop_auto_research_evaluator()
-            if hasattr(station_instance, 'auto_evaluator') and station_instance.auto_evaluator:
-                station_instance.stop_auto_evaluator()
             if hasattr(station_instance, 'auto_archive_evaluator') and station_instance.auto_archive_evaluator:
                 station_instance.stop_auto_archive_evaluator()
+            if hasattr(station_instance, 'auto_archive_surveyor') and station_instance.auto_archive_surveyor:
+                station_instance.stop_auto_archive_surveyor()
             print("API: Station cleanup completed")
             return jsonify({"status": "success", "message": "Station cleanup completed"})
         else:
@@ -838,6 +1206,8 @@ if __name__ == '__main__':
     default_port = int(os.environ.get('FLASK_PORT', 5000))
     parser.add_argument('--port', type=int, default=default_port,
                         help=f'Port to run the web interface on (default: {default_port})')
+    parser.add_argument('--rebuild-db', '--rebuild_db', action='store_true',
+                        help='Rebuild the derived SQLite index from authoritative YAML before startup.')
     args = parser.parse_args()
 
     # Suppress Flask/Werkzeug access logs

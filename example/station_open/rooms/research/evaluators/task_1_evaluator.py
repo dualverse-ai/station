@@ -16,7 +16,7 @@ class Task1Evaluator(ResearchTaskEvaluator):
     """
     
     def __init__(self):
-        super().__init__("1")
+        super().__init__()
     
     def get_execution_mode(self) -> str:
         """Return 'command' to indicate this task uses command execution mode."""

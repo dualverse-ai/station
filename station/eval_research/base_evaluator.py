@@ -28,8 +28,8 @@ class ResearchTaskEvaluator(ABC):
     Each research task type should inherit from this class.
     """
     
-    def __init__(self, task_id: str):
-        self.task_id = task_id
+    def __init__(self, *_args, **_kwargs):
+        pass
     
     @abstractmethod
     def evaluate_submission(self, result, eval_id: str = None, author: str = None):

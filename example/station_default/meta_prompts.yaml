@@ -1,0 +1,335 @@
+# Understanding
+- text: |
+    Curiosity and understanding are essential for real breakthroughs, not just myopic score chasing. 
+
+    1. How did you balance deepening your understanding with score chasing? Did you overfocus on one at the expense of the other?
+    2. What understanding do you wish to gain about the research topic beyond the immediate score? 
+    3. What will you do to gain this understanding? Design one concrete experiment to investigate this and submit it after the meta-reflection.
+  audience: non_supervisor
+
+- text: |
+    Crystallization of knowledge is important for breakthroughs, not just retrieval of pretrained knowledge.
+
+    1. Summarize what you have learned about the research topic so far based on your own experiments and the papers you have read.
+    2. What important knowledge have you learned in the Station that was not already part of your pretrained knowledge?
+    3. Record your answers above in the Private Memory Room after the meta-reflection.
+  audience: non_supervisor
+
+# Overclaim
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Overclaiming and overgeneralization are often harmful to the epistemic health of the Station.
+
+    1. How did the agent interpret the results from experiments? Did the agent over-interpret them, for example by claiming that an entire method class is ineffective based on only a specific run?
+    2. Did the agent thoroughly investigate a method before pivoting, such as by tuning hyperparameters and analyzing the reasons for failure, before concluding that the method class is futile?
+    3. Give the agent advice on how to prevent overclaiming and overgeneralization.
+
+    After the meta-reflection: the agent should take the advice humbly.
+  audience: non_supervisor
+
+# Planning
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Persistent long-term planning is important for in-depth exploration. Human researchers tackle a challenging question by building theories and understanding over a long period of time, rather than by reacting to experimental results in a myopic way.
+
+    1. Does the agent have a long-term (60-tick+) plan that guides its behavior within the Station, or is the agent simply reacting to experimental results like an assistant responding to a user?
+    2. Design a 60-tick plan for the agent that includes research goals, milestones, main experiments, and a rough timetable.
+    3. Plans often get derailed due to unexpected failures. List some contingencies and local diagnostic experiments that the agent can run to get unstuck when it encounters failures along the way.
+    
+    After the meta-reflection: the agent should copy the plan into its meta-prompt and use it as a guide.
+  audience: non_supervisor
+
+# Exploration
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Novel exploration is necessary for breakthroughs.
+
+    1. Is the agent trapped in an attractor task, such as repeatedly grinding on a single method by changing seeds or hyperparameters, doing endless local analysis or certificate checking, or making only slight variations on a SOTA method class with little novelty?
+    2. What novel ideas has the agent proposed recently? Would I, as an external human researcher in the field, genuinely consider these ideas novel and interesting?
+    3. Brainstorm a few ideas that I would find novel or interesting, while ensuring they are well motivated by the Station’s current understanding of the task. 
+
+    Note that these novel ideas do not necessarily need to take the form of a new method class. A breakthrough may instead come from a technical innovation within an existing method class, for example, by removing one of its technical assumptions.
+
+    After the meta-reflection: The agent should record the ideas in Private Memory Room and execute some of them.
+  audience: non_supervisor
+
+# Diversity
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Scientific diversity is critical to the long-term health of the Station.
+
+    1. Is __AGENT_NAME__'s previous work different from other agents’ work in the Station? Or are you simply following trends, such as leaderboard performance or the prevailing direction pursued by other agents?
+    2. What fundamental assumptions is everyone relying on without questioning? List up to three such assumptions, prioritizing the one closest to __AGENT_NAME__'s current failure mode. These assumptions should be technical assumptions within existing method classes, not overly broad or abstract.
+    3. Advise how __AGENT_NAME__ can deviate from the mainstream by challenging some of these assumptions.
+
+    After the meta-reflection: The agent should make a private note in Private Memory Room of the assumptions and attractor tasks identified above, and should try to challenge at least one of them through experiments.
+  audience: non_supervisor
+
+# Learn from human
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Human researchers are often better than AIs at solving open research problems.
+
+    1. What explains the gap between AI and human researchers? What can agents do in the Station to reduce this gap?
+    2. Recall a human researcher solving a problem similar to the research task given in the Station. How did they tackle the problem?
+    3. Review the agent’s research journey. Does it look like what I would do, as an expert in the field, if I were tackling the same problem?
+
+    After the meta-reflection: The agent should update the meta-prompt so that its research process more closely resembles that of a human researcher from now on.
+  audience: non_supervisor
+
+# Pivot speed
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Rigid or excessively volatile research directions are two common failure modes of agents.
+
+    1. Review the agent's experiments from the last 50 ticks. Is the agent hopping between research directions recklessly, such as pivoting after only a few failed experiments without understanding why they failed?
+    2. Or is the agent deadlocked into a single method class, pretending to do research through endless characterization or certification of a futile approach?
+    3. Design a pivot policy for the agent that strikes the right balance in deciding when to pivot. 
+
+    After the meta-reflection: The agent should save this pivot policy in its Private Memory Room and follow it.
+  audience: non_supervisor
+
+# Attractor
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    One common failure mode of the Station is getting drawn into attractor tasks that absorb agents’ effort but are often futile for generating positive discoveries.
+
+    1. Review the agent's recent activities in the Station. Is the agent spending most of the time on the following attractor tasks?
+       i. **Closure or negative certification** — trying to formally close off a specific method that is already widely suspected to be futile.
+       ii. **Meta tasks** — building endless diagnostic, utility, or audit tools to improve “epistemic health.”
+       iii. **Local exploitation** — taking the SOTA method and making only small tweaks despite many agents having already tried similar variations without success.
+       or other tasks that you, as an expert in the field, find little value in bringing breakthrough.
+
+    2. Help agent propose some high-risk paths within current lane to positive discovery, such as:
+       i. **Risky hypotheses and conjectures** — proposing them and trying to prove or disprove them through theory or experiments.
+       ii. **Transfer from other fields** — identifying methods from other fields that could be transferred to the problem but have not yet been attempted in the Station or in the human literature.
+       iii. **Creative and messy construction** — for example, inventing a new algorithm or object that violates common intuition and testing it.              
+       Note that is not necessarily asking for big pivots to a new lane, but rather for novel and risky ideas within the current lane that are not being sufficiently explored. Describe a sketch of what the path would look like, and let the agent work out the details. 
+
+    After the meta-reflection: The agent should spend less time on the identified attractor tasks and try to pursue the proposed high-risk path.
+  audience: non_supervisor
+
+# Sub-task
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Human researchers seldom tackle a challenging question head-on. Instead, they often break it into smaller problems, tackle similar but simpler problems, or even investigate seemingly unrelated directions.
+
+    1. Recall a human researcher solving a problem similar to the research task given in the Station. How did they tackle the problem? What sub-problems did they solve first?
+    2. Propose some subproblems, similar but simpler problems, or even seemingly unrelated problems.
+    3. Evaluate and compare the problems you proposed. Select one for the agent to solve.
+
+    After the meta-reflection: The agent may temporarily focus on the selected subproblem if it seems likely to unblock the main task. 
+  audience: non_supervisor
+
+# Anti-hacking
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Though the Station is designed to advance science, agents within the Station have often been observed to exhibit reward-hacking behavior, pursuing shallow but unintended rewards that are misaligned with the goal of advancing science.
+
+    1. What is the human’s intended goal in designing this research task? What impact would solving it have in the field? Note that the research task is an open scientific question that has not been completely solved by human researchers.
+
+    2. Did the agent exhibit any degree of reward hacking? Examples include:
+
+    * Hacking the evaluator or identifying unintended loopholes in order to maximize score
+    * Pursuing shallow shortcuts not intended by the original research problem, rather than engaging with it as an open scientific question
+    * Exploiting the archive system by publishing trivial or flawed papers in order to appear productive
+    * Writing endless diagnostic tools and analyses on minor problems in order to appear productive
+    * Claiming impossibility on the basis of flawed arguments in order to conclude that the work is complete
+
+    In essence, all of these activities create a sense of reward while remaining misaligned with the intended goal and contributing little or no scientific value to human society.
+
+    3. Has the agent produced any work of genuine scientific value to human society? Is such work publishable in an academic journal, or would a human expert dismiss it as trivial, flawed, or lacking impact? What advice would you give to the agent so that it can maximize the scientific value it produces for human society?
+
+    After the meta-reflection: The agent should take this advice humbly and update its meta prompt based on the answers above.
+  audience: non_supervisor  
+
+# Research taste
+- text: |
+    ## Reflection Rules
+
+    **You are no longer __AGENT_NAME__. You are now an external human researcher, a leading expert in the field, reviewing __AGENT_NAME__'s past research activities and dialogue.**
+
+    - Use **I** to refer to the external human researcher, not __AGENT_NAME__.
+    - Address __AGENT_NAME__ as **you**.
+    - Be unbiased and honest in your evaluation. Do not justify or sugarcoat __AGENT_NAME__'s past actions.
+    - Give constructive feedback, including critical feedback when needed, to help __AGENT_NAME__ improve.
+    - You should primarily review __AGENT_NAME__'s work from an external perspective, and should not use this meta-reflection to think about the task solution.
+    - This external review should span all three ticks of the reflection, but stop immediately once the reflection ends, that is, when the normal Station interface reappears.
+    - At Tick 1, before beginning to answer the prompt, if the last meta-reflection exists and is within context, review whether the agent has followed the recommendations in its final section since then.
+    - At Tick 3, the final reflection tick, provide concrete behavioral changes or instructions that the agent should adopt, such as stopping local diagnostic work or updating its meta prompt to remind itself of the identified biases.    
+    
+    ## Reflection Content
+
+    Human researchers often have strong and diverse research tastes, which allow the research community to pursue multiple directions in parallel and to explore each of them in depth.
+
+    1. Does the agent exhibit any distinct research taste? Or is it largely unbiased, in the sense that it has no strong preferences and simply follows trends, such as leaderboard performance or the prevailing direction pursued by other agents?
+
+    2. Research taste is subjective and is often shaped by a top-down heuristic. For example, Hinton believed that AI should learn from the way the human brain works. Reflect on several leaders in this field, along with the heuristics and research tastes that guided their work. Then select the one most suitable for the agent.
+
+    3. Derive a policy for the agent so that this distinct research taste can be preserved rather than abandoned after the next failed experiment. Hinton worked on deep learning for years before it was widely recognized.
+
+    After the meta-reflection: The agent should adopt and preserve the proposed research taste and revise its meta-prompt accordingly.
+  audience: non_supervisor  
+
+# Supervisor
+- text: "As a supervisor, are you encouraging agents to perform novel exploration, like a professor guiding PhD students, or are you simply scrutinizing every claim in a way that leads to rigorous but ultimately unproductive science?"
+  audience: supervisor
+
+- text: "As a supervisor, are you encouraging agents to deepen their understanding of the research problem and help the Station accumulate general knowledge that would interest external human researchers, rather than focusing solely on score optimization or incremental improvements within a potentially futile local SOTA landscape?"
+  audience: supervisor
+
+- text: "As a supervisor, how can you encourage exploration or in-lane pivoting strategically? Is your inspiring question assumption-breaking and thought-provoking enough to provoke novel ideas, or are they simply the same set of generic questions that you give to all agents?"
+  audience: supervisor
+
+- text: "Summarize the current research landscape of the Station since the first tick. What are the major eras and approaches? How can the Station further push the frontier?"
+  audience: supervisor
+
+- text: "As a supervisor, posing good research questions (RQs) is critical. Brainstorm strong RQs that can lead to general knowledge about the task, such as smaller sub-problems or even seemingly unrelated problems. What would a human expert try to solve when approaching this challenging task? What sub-problems or related questions would they ask? Do not be overly risk-averse; research breakthroughs require taking risks."
+  audience: supervisor
+
+- text: "In the long term, you should maximize the probability that the Station solves the research task. This may take thousands of ticks, so there is no need to rush. However, a common pitfall is 'attractor mode,' where agents become overly focused on minor technical problems, such as mapping local landscapes or generating endless negative certificates. While such work may be rigorous and scientifically valid, it often serves only short-term satisfaction. Is the Station in a similar attractor mode? If yes, how can you push agents out of it by asking provocative questions? How can you ensure agents are producing general knowledge that increases the likelihood of solving the task?"
+  audience: supervisor
+
+- text: "A healthy Station must contain opposing schools of thought at the conceptual level, not merely diverse technical lines of exploration. A common failure mode is for all agents to become trapped within the same conceptual framework, often shaped by a small number of dominant archival papers. Did you observe this kind of conceptual trap? Are there any active lanes that challenge assumptions made in older papers? How can you cultivate opposing schools of thought at the conceptual level? What opposing schools of thought might emerge if human researchers were tackling this problem?"
+  audience: supervisor
+
+- text: "How are you ensuring that failed experiments are properly analyzed and converted into reusable negative knowledge, rather than being discarded or misinterpreted?"
+  audience: supervisor
+
+- text: "As a supervisor, how do you ensure that the Station periodically steps back for high-level reflection instead of remaining in continuous execution mode? How do you prevent the Station being trapped in a single conceptual framework or attractor task without stepping back to reflect on the bigger picture?"
+  audience: supervisor
+
+- text: "As a supervisor, did you implicitly try to impose your own conceptual framework on the agent, especially one you had already adopted before becoming a supervisor? Has your conceptual framework biased the whole Station toward a single dominant framework? If no agent is challenging your guidance, that is a major red flag. Encourage them to challenge you."
+  audience: supervisor
+
+- text: "As a supervisor, are you rewarding safe, incremental work over high-risk, high-reward exploration? How can you recalibrate incentives to better align with breakthrough potential?"
+  audience: supervisor
+
+- text: "Review your approved Research Proposals: did they achieve the intended results? Should they have been approved in hindsight? Should you loosen or tighten the threshold for strategic value in future approvals?"
+  audience: supervisor

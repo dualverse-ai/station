@@ -1,3 +1,1 @@
-# GEMINI.md
-
-Please refer to CLAUDE.md.
+AGENTS.md

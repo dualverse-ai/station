@@ -39,7 +39,9 @@ except ImportError:
     pass
 
 import tempfile
+import threading
 import uuid
+import shlex
 import numpy as np
 import pickle
 import signal
@@ -48,17 +50,85 @@ from typing import Dict, Any, Optional
 
 from station import constants
 from station import file_io_utils
-from station.eval_research.evaluation_helpers import truncate_stderr
+from station.eval_research.evaluation_helpers import append_stdout_with_limit, resolve_conda_env, truncate_stderr
 
 
-def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], evaluator, gpu_ids: Optional[list] = None) -> Dict[str, Any]:
+def _function_result_paths(tmp_dir: str) -> tuple[str, str]:
+    return os.path.join(tmp_dir, "result.npy"), os.path.join(tmp_dir, "result.pkl")
+
+
+def _has_function_result_artifact(tmp_dir: str) -> bool:
+    result_npy_path, result_pkl_path = _function_result_paths(tmp_dir)
+    return os.path.exists(result_npy_path) or os.path.exists(result_pkl_path)
+
+
+def _function_mode_success(returncode: int, stdout_output: str, tmp_dir: str) -> bool:
+    if returncode != 0:
+        return False
+    # The persisted result artifact is the authoritative signal. Very large stdout can
+    # delay or truncate the tail marker in the collected pipe output.
+    return _has_function_result_artifact(tmp_dir) or "EXECUTION_SUCCESS" in stdout_output
+
+
+def _append_live_log(log_path: Optional[str], text: str, *, truncate: bool):
+    if not log_path or not text:
+        return
+    if truncate:
+        append_stdout_with_limit(log_path, text)
+        return
+    file_io_utils.ensure_dir_exists(os.path.dirname(log_path))
+    existing = file_io_utils.load_text(log_path) if file_io_utils.file_exists(log_path) else ""
+    file_io_utils.save_text((existing or "") + text, log_path)
+
+def _stream_pipe_to_log(
+    stream,
+    log_path: Optional[str],
+    chunks: list[str],
+    *,
+    truncate: bool,
+):
+    try:
+        while True:
+            line = stream.readline()
+            if line == "":
+                break
+            chunks.append(line)
+            _append_live_log(log_path, line, truncate=truncate)
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+def _build_sandbox_command(
+    python_path: str,
+    wrapper_path: str,
+    *,
+    cpu_ids: Optional[list] = None,
+) -> list[str]:
+    command = [python_path, '-u', wrapper_path]
+    if cpu_ids:
+        taskset_path = shutil.which("taskset")
+        if not taskset_path:
+            return command
+        cpu_list = ",".join(str(cpu_id) for cpu_id in cpu_ids)
+        return [taskset_path, "-c", cpu_list, *command]
+    return command
+
+
+def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], evaluator,
+                                          gpu_ids: Optional[list] = None,
+                                          cpu_ids: Optional[list] = None,
+                                          live_stdout_path: Optional[str] = None,
+                                          live_stderr_path: Optional[str] = None) -> Dict[str, Any]:
     """Execute research submission code in Python sandbox using conda environment"""
     content = eval_entry.get(constants.EVALUATION_CONTENT_KEY, "")
     author = eval_entry.get(constants.EVALUATION_AUTHOR_KEY, "Unknown")
     
     timeout = self.timeout
     
-    # Determine temp directory location based on shared storage config
+    # Determine tmp directory location based on shared storage config
     research_room_abs_path = os.path.abspath(self.research_room_path)
     storage_base_path = os.path.join(research_room_abs_path, constants.RESEARCH_STORAGE_DIR)
     
@@ -72,34 +142,34 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         os.makedirs(tmp_base, exist_ok=True)
         
         # Create a unique subdirectory in the shared tmp folder
-        temp_dir_name = str(uuid.uuid4())
-        temp_dir = os.path.join(tmp_base, temp_dir_name)
-        os.makedirs(temp_dir)
+        tmp_dir_name = str(uuid.uuid4())
+        tmp_dir = os.path.join(tmp_base, tmp_dir_name)
+        os.makedirs(tmp_dir)
         
         # Use context manager to ensure cleanup
         import contextlib
         @contextlib.contextmanager
-        def cleanup_temp_dir():
+        def cleanup_tmp_dir():
             try:
-                yield temp_dir
+                yield tmp_dir
             finally:
                 try:
                     # Handle read-only files/directories during cleanup
                     def handle_remove_readonly(func, path, exc):
                         os.chmod(path, 0o755)
                         func(path)
-                    shutil.rmtree(temp_dir, onerror=handle_remove_readonly)
+                    shutil.rmtree(tmp_dir, onerror=handle_remove_readonly)
                 except Exception as e:
-                    print(f"Warning: Could not clean up temp directory {temp_dir}: {e}")
-        
-        temp_context = cleanup_temp_dir()
+                    print(f"Warning: Could not clean up tmp directory {tmp_dir}: {e}")
+
+        tmp_context = cleanup_tmp_dir()
     else:
-        # Use system temp directory (original behavior)
-        temp_context = tempfile.TemporaryDirectory()
-    
-    with temp_context as temp_dir:
+        # Use the system tmp directory (original behavior)
+        tmp_context = tempfile.TemporaryDirectory()
+
+    with tmp_context as tmp_dir:
         # Set up storage symlinks
-        storage_dir = os.path.join(temp_dir, "storage")
+        storage_dir = os.path.join(tmp_dir, "storage")
         os.makedirs(storage_dir, exist_ok=True)
         
         # Resolve storage base path in case it's a symlink to shared storage
@@ -111,22 +181,29 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         shared_storage_path = os.path.join(storage_base, constants.RESEARCH_STORAGE_SHARED_DIR)
         system_storage_path = os.path.join(storage_base, constants.RESEARCH_STORAGE_SYSTEM_DIR)
         architect_storage_path = os.path.join(storage_base, "architect")
+        tmp_storage_path = os.path.join(storage_base, "tmp")
         try:
             author_data = self.station.agent_module.load_agent_data(author)
             author_lineage = author_data.get(constants.AGENT_LINEAGE_KEY, "unknown").lower() if author_data else "unknown"
         except Exception:
             author_lineage = "unknown"
         author_lineage_storage_path = os.path.join(storage_base, constants.RESEARCH_STORAGE_LINEAGES_DIR, author_lineage)
+        author_tmp_storage_path = os.path.join(tmp_storage_path, author_lineage)
         lineages_base_path = os.path.join(storage_base, constants.RESEARCH_STORAGE_LINEAGES_DIR)
         file_io_utils.ensure_dir_exists(shared_storage_path)
         file_io_utils.ensure_dir_exists(system_storage_path)
         file_io_utils.ensure_dir_exists(author_lineage_storage_path)
+        file_io_utils.ensure_dir_exists(author_tmp_storage_path)
         file_io_utils.ensure_dir_exists(architect_storage_path)
         if os.path.exists(shared_storage_path): os.symlink(shared_storage_path, os.path.join(storage_dir, "shared"))
         if os.path.exists(system_storage_path):
             # Use symlink for system storage since it's already read-only
             os.symlink(system_storage_path, os.path.join(storage_dir, "system"))
         if os.path.exists(architect_storage_path): os.symlink(architect_storage_path, os.path.join(storage_dir, "architect"))
+        if os.path.exists(author_tmp_storage_path):
+            tmp_view_path = os.path.join(storage_dir, "tmp")
+            os.makedirs(tmp_view_path, exist_ok=True)
+            os.symlink(author_tmp_storage_path, os.path.join(tmp_view_path, author_lineage))
         if os.path.exists(author_lineage_storage_path):
             os.symlink(author_lineage_storage_path, os.path.join(storage_dir, "lineage"))
             os.symlink(author_lineage_storage_path, os.path.join(storage_dir, author_lineage))
@@ -151,12 +228,12 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         
         if execution_mode == "command":
             submission_filename = evaluator.get_submission_filename()
-            submission_path = os.path.join(temp_dir, submission_filename)
+            submission_path = os.path.join(tmp_dir, submission_filename)
             with open(submission_path, 'w', encoding='utf-8') as f:
                 f.write(content)
             execution_command = evaluator.get_execution_command()
         else:
-            run_py_path = os.path.join(temp_dir, "run.py")
+            run_py_path = os.path.join(tmp_dir, "run.py")
             with open(run_py_path, 'w', encoding='utf-8') as f:
                 f.write(content)
 
@@ -221,7 +298,7 @@ except Exception as e:
     sys.exit(1)
 """
         # Use a unique name to avoid collisions with user code that might import 'wrapper'
-        wrapper_path = os.path.join(temp_dir, "__sandbox_execution_wrapper__.py")
+        wrapper_path = os.path.join(tmp_dir, "__sandbox_execution_wrapper__.py")
         with open(wrapper_path, 'w', encoding='utf-8') as f:
             f.write(wrapper_content)
         
@@ -231,21 +308,37 @@ except Exception as e:
             if 'HF_HOME' not in env and 'HOME' in env: env['HF_HOME'] = os.path.join(env['HOME'], '.cache', 'huggingface')
             if 'XDG_CACHE_HOME' not in env and 'HOME' in env: env['XDG_CACHE_HOME'] = os.path.join(env['HOME'], '.cache')
             for proxy in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']: env.pop(proxy, None)
+
+            env['STATION_EVAL_ID'] = str(eval_entry.get(constants.EVALUATION_ID_KEY, ''))
+            env['STATION_BASE_EVAL_ID'] = str(eval_entry.get('base_eval_id', env['STATION_EVAL_ID']))
+            env['STATION_EVAL_VERSION'] = '' if eval_entry.get('eval_version') is None else str(eval_entry.get('eval_version'))
+            env['STATION_AUTHOR'] = str(eval_entry.get(constants.EVALUATION_AUTHOR_KEY, ''))
+            env['STATION_RESEARCH_ROOT'] = research_room_abs_path
             
             # Force disable asyncio subprocess integration in the child process environment
             env['PYTHONASYNCIO'] = '0'
             
-            from station.eval_research.evaluation_helpers import find_conda_python
             conda_env_name = constants.RESEARCH_EVAL_PYTHON_CONDA_ENV
-            python_path = find_conda_python(conda_env_name, env)
+            python_path = resolve_conda_env(conda_env_name, env)
             if not python_path: raise Exception(f"No suitable Python executable found for conda environment '{conda_env_name}'")
 
-            sandbox_cmd = [python_path, '-u', wrapper_path]
-            print(f"AutoResearchEvaluator: Executing in Python sandbox with command: {' '.join(sandbox_cmd)}")
+            sandbox_cmd = _build_sandbox_command(
+                python_path,
+                wrapper_path,
+                cpu_ids=cpu_ids,
+            )
+            print(
+                "AutoResearchEvaluator: Executing in Python sandbox with command: "
+                + " ".join(shlex.quote(part) for part in sandbox_cmd)
+            )
 
-            # Define memory limit function if configured
-            def set_resource_limits():
-                """Set memory limits for the subprocess"""
+            command_uses_taskset = bool(sandbox_cmd) and os.path.basename(sandbox_cmd[0]) == "taskset"
+            needs_preexec_affinity = bool(cpu_ids) and not command_uses_taskset
+            eval_id = str(eval_entry.get(constants.EVALUATION_ID_KEY, ""))
+            affinity_mode = "taskset" if command_uses_taskset else ("preexec" if needs_preexec_affinity else "none")
+
+            def set_resource_limits_and_affinity():
+                """Set memory limits and fallback CPU affinity for the subprocess."""
                 if constants.RESEARCH_EVAL_MEMORY_LIMIT:
                     import resource
                     # Parse memory limit (e.g., "64g" -> 64 * 1024^3 bytes)
@@ -264,82 +357,126 @@ except Exception as e:
                     resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
                     print(f"AutoResearchEvaluator: Set memory limit to {memory_str}")
 
-            # Use preexec_fn if memory limit is set, otherwise use start_new_session for compatibility
-            if constants.RESEARCH_EVAL_MEMORY_LIMIT:
-                # When memory limit is set, use preexec_fn to set limits
+                if needs_preexec_affinity:
+                    try:
+                        os.sched_setaffinity(0, cpu_ids)
+                    except Exception as e:
+                        print(f"AutoResearchEvaluator: Failed to set CPU affinity: {e}")
+
+            use_preexec = bool(constants.RESEARCH_EVAL_MEMORY_LIMIT or needs_preexec_affinity)
+            if use_preexec:
                 process = subprocess.Popen(
                     sandbox_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    bufsize=1,
                     env=env,
-                    cwd=temp_dir,
-                    preexec_fn=set_resource_limits,
+                    cwd=tmp_dir,
+                    preexec_fn=set_resource_limits_and_affinity,
                     start_new_session=True
                 )
             else:
-                # Original behavior when no memory limit
                 process = subprocess.Popen(
                     sandbox_cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    bufsize=1,
                     env=env,
-                    cwd=temp_dir,
+                    cwd=tmp_dir,
                     start_new_session=True
                 )
-            
-            stdout_output, stderr_output = process.communicate(timeout=timeout)
+
+            stdout_chunks: list[str] = []
+            stderr_chunks: list[str] = []
+
+            stdout_thread = threading.Thread(
+                target=_stream_pipe_to_log,
+                args=(process.stdout, live_stdout_path, stdout_chunks),
+                kwargs={"truncate": True},
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_stream_pipe_to_log,
+                args=(process.stderr, live_stderr_path, stderr_chunks),
+                kwargs={"truncate": True},
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            process.wait(timeout=timeout)
             returncode = process.returncode
-        
+            stdout_thread.join(timeout=5)
+            stderr_thread.join(timeout=5)
+            stdout_output = "".join(stdout_chunks)
+            stderr_output = "".join(stderr_chunks)
+
         except subprocess.TimeoutExpired:
             print(f"AutoResearchEvaluator: Process timed out after {timeout} seconds. Terminating process group.")
             try:
                 # Use os.killpg with the process's session ID (which is its PID due to start_new_session=True)
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass 
-            # FIX: Add a short timeout to the final communicate to prevent hangs if killpg fails
+                pass
             try:
-                stdout_output, stderr_output = process.communicate(timeout=15)
+                process.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                stdout_output = ""
-                stderr_output = "Process failed to terminate even after SIGKILL and timed out again."
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+            stdout_chunks = locals().get("stdout_chunks", [])
+            stderr_chunks = locals().get("stderr_chunks", [])
+            stdout_thread = locals().get("stdout_thread")
+            stderr_thread = locals().get("stderr_thread")
+            if stdout_thread is not None:
+                stdout_thread.join(timeout=5)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=5)
+            stdout_output = "".join(stdout_chunks)
+            stderr_output = "".join(stderr_chunks)
+            if not stderr_output:
+                stderr_output = "Process timed out and was terminated by the evaluator."
             
             truncated_stderr = truncate_stderr(stderr_output)
             execution_logs = f"PYTHON SANDBOX TIMEOUT:\nSTDOUT:\n{stdout_output}\n\nSTDERR:\n{truncated_stderr}"
             error_msg = f"Execution timed out after {self.timeout} seconds\n\n**Optimization Tips:**\n1. Use GPU-accelerated code when possible (JAX, CuPy, etc.)\n2. Vectorize operations instead of loops\n3. Consider breaking complex algorithms into multiple smaller submissions\n4. Profile your code to identify bottlenecks\n5. Use JIT compilation (@jit decorators) for computational kernels"
             
-            return {"success": False, "error": error_msg, "logs": execution_logs}
+            return {"success": False, "error": error_msg, "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}
         
         except Exception as e:
-            return {"success": False, "error": f"Python sandbox execution error: {str(e)}", "logs": str(e)}
+            return {"success": False, "error": f"Python sandbox execution error: {str(e)}", "logs": str(e), "stdout": "", "stderr": str(e)}
 
         truncated_stderr = truncate_stderr(stderr_output)
         execution_logs = f"PYTHON SANDBOX EXECUTION:\nSTDOUT:\n{stdout_output}\n\nSTDERR:\n{truncated_stderr}"
 
-        success = (returncode == 0 and "EXECUTION_SUCCESS" in stdout_output) if execution_mode == "function" else (returncode == 0)
+        success = _function_mode_success(returncode, stdout_output, tmp_dir) if execution_mode == "function" else (returncode == 0)
 
         if success:
             if execution_mode == "command":
-                return {"success": True, "result": stdout_output, "logs": execution_logs}
+                return {"success": True, "result": stdout_output, "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}
             else:
-                result_npy_path = os.path.join(temp_dir, "result.npy")
-                result_pkl_path = os.path.join(temp_dir, "result.pkl")
+                result_npy_path, result_pkl_path = _function_result_paths(tmp_dir)
                 
                 if os.path.exists(result_npy_path):
                     loaded_result = np.load(result_npy_path)
-                    return {"success": True, "result": loaded_result, "logs": execution_logs}
+                    return {"success": True, "result": loaded_result, "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}
                 elif os.path.exists(result_pkl_path):
                     with open(result_pkl_path, 'rb') as f:
                         loaded_result = pickle.load(f)
-                    return {"success": True, "result": loaded_result, "logs": execution_logs}
+                    return {"success": True, "result": loaded_result, "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}
                 else:
-                    result_txt_path = os.path.join(temp_dir, "result.txt")
+                    result_txt_path = os.path.join(tmp_dir, "result.txt")
                     result_text = ""
                     if os.path.exists(result_txt_path):
                         with open(result_txt_path, 'r') as f: result_text = f.read()
-                    return {"success": False, "error": f"Function returned non-array result: {result_text}", "logs": execution_logs}
+                    return {"success": False, "error": f"Function returned non-array result: {result_text}", "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}
 
         if "IMPORT_ERROR" in stderr_output:
             main_error_line = next((line for line in stderr_output.split('\n') if "IMPORT_ERROR" in line), "")
@@ -352,4 +489,4 @@ except Exception as e:
         else:
             error_msg = f"Execution failed with exit code {returncode}. Check logs for details."
         
-        return {"success": False, "error": error_msg, "logs": execution_logs}
+        return {"success": False, "error": error_msg, "logs": execution_logs, "stdout": stdout_output, "stderr": truncated_stderr}

@@ -28,6 +28,7 @@ except ImportError:
 
 from station import file_io_utils
 from station import constants
+from station import runtime_api_config
 from .base import (
     BaseLLMConnector,
     LLMConnectorError,
@@ -64,7 +65,15 @@ class OpenAIConnector(BaseLLMConnector):
         self.verbosity = self.custom_api_params.get('verbosity')
         self.prompt_cache_retention = self.custom_api_params.get('prompt_cache_retention', '24h')
         self.reasoning_effort = self._resolve_reasoning_effort()
-        self.third_party_api = bool(os.getenv("OPENAI_BASE_URL"))
+        self.api_runtime_provider_id = "openai"
+        self.api_runtime_env_names = ("OPENAI_API_KEY", "OPENAI_BASE_URL")
+        self._api_runtime_config_snapshot = runtime_api_config.get_config_snapshot([
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+        ], provider_id="openai")
+        snapshot_env = self._api_runtime_config_snapshot.get("env", {})
+        self.openai_base_url = snapshot_env.get("OPENAI_BASE_URL")
+        self.third_party_api = bool(self.openai_base_url)
         if self.third_party_api:
             self.prompt_cache_retention = None
 
@@ -72,17 +81,7 @@ class OpenAIConnector(BaseLLMConnector):
                          api_key, system_prompt, temperature, max_output_tokens,
                          max_retries, retry_delay_seconds)
 
-        effective_api_key = self.api_key 
-        if not effective_api_key: 
-            effective_api_key = os.getenv("OPENAI_API_KEY")
-            if not effective_api_key:
-                 raise ValueError(f"OpenAI API key not provided for {agent_name} and OPENAI_API_KEY env variable not set.")
-            self.api_key = effective_api_key 
-
-        try:
-            self.client = OpenAI(api_key=self.api_key)
-        except Exception as e:
-            raise LLMPermanentAPIError(f"Error creating OpenAI client for {agent_name}: {e}.", original_exception=e)
+        self._configure_client_from_runtime_snapshot(self._api_runtime_config_snapshot)
         
         # Initialize tiktoken encoder for local token counting
         self._initialize_tiktoken_encoder()
@@ -107,9 +106,142 @@ class OpenAIConnector(BaseLLMConnector):
         verbosity_note = f", verbosity: {self.verbosity}" if self.verbosity else ""
         print(f"OpenAIConnector for '{self.agent_name}' initialized with model: '{self.model_name}', temp: {self.temperature}, max_tokens: {self.max_output_tokens}{reasoning_note}{tiktoken_note}{verbosity_note}.")
 
+    def _build_client_kwargs_from_runtime_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot_env = snapshot.get("env", {})
+        effective_api_key = self.api_key if self._explicit_api_key else snapshot_env.get("OPENAI_API_KEY")
+        if not effective_api_key:
+            raise ValueError(f"OpenAI API key not provided for {self.agent_name} and OPENAI_API_KEY env variable not set.")
+        client_kwargs: Dict[str, Any] = {"api_key": effective_api_key}
+        base_url = snapshot_env.get("OPENAI_BASE_URL")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        elif os.environ.get("OPENAI_BASE_URL"):
+            # The OpenAI SDK falls back to OPENAI_BASE_URL when base_url is
+            # omitted. A blank Station backup endpoint must bypass that env
+            # override and use the official OpenAI API instead.
+            client_kwargs["base_url"] = runtime_api_config.PROVIDER_SPECS["openai"].default_base_url
+        return client_kwargs
+
+    def _configure_client_from_runtime_snapshot(self, snapshot: Optional[Dict[str, Any]] = None) -> None:
+        if snapshot is None:
+            snapshot = runtime_api_config.get_config_snapshot([
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+            ], provider_id="openai")
+        snapshot_env = snapshot.get("env", {})
+        self._apply_runtime_proxy_snapshot(snapshot)
+        if not self._explicit_api_key:
+            self.api_key = snapshot_env.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError(f"OpenAI API key not provided for {self.agent_name} and OPENAI_API_KEY env variable not set.")
+        self._api_runtime_config_snapshot = snapshot
+        self.api_runtime_config_generation = int(snapshot.get("generation", 0))
+        self.openai_base_url = snapshot_env.get("OPENAI_BASE_URL")
+        self.third_party_api = bool(self.openai_base_url)
+        self.prompt_cache_retention = (
+            None
+            if self.third_party_api
+            else self.custom_api_params.get('prompt_cache_retention', '24h')
+        )
+        self.client = OpenAI(**self._build_client_kwargs_from_runtime_snapshot(snapshot))
+
+    def _refresh_runtime_api_config_if_changed(self) -> bool:
+        if runtime_api_config.get_generation() == self.api_runtime_config_generation:
+            return False
+        self._configure_client_from_runtime_snapshot()
+        self._initialize_chat_session()
+        return True
+
+    def _apply_provider_runtime_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self._configure_client_from_runtime_snapshot(snapshot)
+        self._initialize_chat_session()
+
+    def _run_provider_base_recovery_probe(self, snapshot: Dict[str, Any]) -> bool:
+        self._apply_runtime_proxy_snapshot(snapshot)
+        client = OpenAI(**self._build_client_kwargs_from_runtime_snapshot(snapshot))
+        if self._is_reasoning_model(self.model_name):
+            client.responses.create(
+                model=self.model_name,
+                input=[{"role": "user", "content": "Reply with hi."}],
+                store=False,
+            )
+        else:
+            client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": "Reply with hi."}],
+            )
+        return True
+
+    def _active_http_proxy_configured(self) -> bool:
+        snapshot = getattr(self, "_api_runtime_config_snapshot", {})
+        if isinstance(snapshot, dict) and (snapshot.get("http_proxy") or snapshot.get("https_proxy")):
+            return True
+        return bool(constants.LLM_HTTP_PROXY or constants.LLM_HTTPS_PROXY)
+
     def _should_use_streaming_on_attempt(self, attempt_number: int) -> bool:
         """Use streaming for retries, explicit force-streaming, or when an HTTP proxy is configured."""
-        return attempt_number > 0 or constants.OPENAI_FORCE_STREAMING or bool(constants.LLM_HTTP_PROXY)
+        return attempt_number > 0 or constants.OPENAI_FORCE_STREAMING or self._active_http_proxy_configured()
+
+    def _refresh_runtime_config_before_internal_fallback(self, reason: str) -> None:
+        try:
+            if self._refresh_runtime_api_config_if_changed():
+                print(
+                    f"Info ({self.agent_name}): Runtime API config refreshed before "
+                    f"OpenAI internal fallback ({reason})."
+                )
+        except Exception as refresh_error:
+            print(
+                f"Warning ({self.agent_name}): Runtime API config refresh failed before "
+                f"OpenAI internal fallback ({reason}): {refresh_error}"
+            )
+
+    def _should_defer_responses_error_to_outer_retry(self, error: Exception) -> bool:
+        if self._is_context_overflow_error(error):
+            return True
+        if isinstance(error, (openai.APIConnectionError, openai.RateLimitError)):
+            return True
+        status_code = getattr(error, "status_code", None)
+        try:
+            return int(status_code) >= 500
+        except Exception:
+            return False
+
+    def _raise_responses_api_error(self, error: Exception, mode: str) -> None:
+        if self._is_context_overflow_error(error):
+            print(f"CRITICAL ({self.agent_name}): Context window overflow detected in Responses API {mode}")
+            raise LLMContextOverflowError(
+                f"Context window overflow for {self.agent_name}: {str(error)}",
+                original_exception=error,
+            )
+        if isinstance(error, openai.APIConnectionError):
+            raise LLMTransientAPIError(
+                f"OpenAI API Connection Error for {self.agent_name}: {str(error)}",
+                original_exception=error,
+            )
+        if isinstance(error, openai.RateLimitError):
+            raise LLMTransientAPIError(
+                f"OpenAI API Rate Limit Error for {self.agent_name}: {str(error)}",
+                original_exception=error,
+            )
+        status_code = getattr(error, "status_code", None)
+        if isinstance(error, openai.APIStatusError) or status_code is not None:
+            try:
+                numeric_status = int(status_code)
+            except Exception:
+                numeric_status = 0
+            if numeric_status >= 500:
+                raise LLMTransientAPIError(
+                    f"OpenAI API Server Error for {self.agent_name}: {str(error)}",
+                    original_exception=error,
+                )
+            raise LLMPermanentAPIError(
+                f"OpenAI API Client Error for {self.agent_name}: {str(error)}",
+                original_exception=error,
+            )
+        raise LLMConnectorError(
+            f"Unexpected OpenAI Responses API {mode} failure for {self.agent_name}. Details: {str(error)}",
+            original_exception=error,
+        )
 
     def _to_jsonable(self, value: Any) -> Any:
         """Best-effort conversion to JSON-serializable data for debug snapshots."""
@@ -486,14 +618,21 @@ class OpenAIConnector(BaseLLMConnector):
             traceback.print_exc()
             return None
     
-    def _send_message_with_responses_api(self, user_prompt: str, current_tick: int, token_info: Dict[str, Optional[int]], attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
+    def _send_message_with_responses_api(
+        self,
+        user_prompt: str,
+        current_tick: int,
+        token_info: Dict[str, Optional[int]],
+        attempt_number: int = 0,
+        force_non_stream: bool = False,
+    ) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
         """Handle reasoning models using the Responses API."""
         # Use streaming for retries, explicit force-streaming, or when an HTTP proxy is configured.
-        if self._should_use_streaming_on_attempt(attempt_number):
+        if not force_non_stream and self._should_use_streaming_on_attempt(attempt_number):
             if attempt_number > 0:
                 print(f"Info ({self.agent_name}): Using streaming for retry attempt {attempt_number} to avoid timeout issues")
-            elif constants.LLM_HTTP_PROXY:
-                print(f"Info ({self.agent_name}): Using streaming mode on first attempt because LLM_HTTP_PROXY is configured")
+            elif self._active_http_proxy_configured():
+                print(f"Info ({self.agent_name}): Using streaming mode on first attempt because an HTTP proxy is configured")
             else:
                 print(f"Info ({self.agent_name}): Using streaming mode (forced via OPENAI_FORCE_STREAMING)")
             return self._send_message_with_responses_api_stream(user_prompt, current_tick, token_info, attempt_number=attempt_number)
@@ -535,7 +674,9 @@ class OpenAIConnector(BaseLLMConnector):
                 user_prompt,
                 current_tick,
                 attempt_number,
-                mode="stream" if self._should_use_streaming_on_attempt(attempt_number) else "non_stream",
+                mode="non_stream" if force_non_stream else (
+                    "stream" if self._should_use_streaming_on_attempt(attempt_number) else "non_stream"
+                ),
                 api_family="responses",
                 payload=api_params,
             )
@@ -702,7 +843,10 @@ class OpenAIConnector(BaseLLMConnector):
                 f"Warning ({self.agent_name}): Responses API failed for reasoning model '{self.model_name}': "
                 f"{err_type} {e} | repr={err_repr} | request_id={err_request_id} | body={err_body}"
             )
+            if force_non_stream or self._should_defer_responses_error_to_outer_retry(e):
+                self._raise_responses_api_error(e, "non-streaming")
             if self._is_reasoning_model(self.model_name):
+                self._refresh_runtime_config_before_internal_fallback("responses_non_stream_failed")
                 print(f"Attempting fallback to Responses API streaming for reasoning model...")
                 return self._send_message_with_responses_api_stream(user_prompt, current_tick, token_info, attempt_number=attempt_number)
             if "max_tokens" in str(e) and "max_completion_tokens" in str(e):
@@ -721,8 +865,8 @@ class OpenAIConnector(BaseLLMConnector):
         if self._should_use_streaming_on_attempt(attempt_number):
             if attempt_number > 0:
                 print(f"Info ({self.agent_name}): Using streaming for retry attempt {attempt_number} to avoid timeout issues")
-            elif constants.LLM_HTTP_PROXY:
-                print(f"Info ({self.agent_name}): Using streaming mode on first attempt because LLM_HTTP_PROXY is configured")
+            elif self._active_http_proxy_configured():
+                print(f"Info ({self.agent_name}): Using streaming mode on first attempt because an HTTP proxy is configured")
             else:
                 print(f"Info ({self.agent_name}): Using streaming mode (forced via OPENAI_FORCE_STREAMING)")
             return self._send_message_with_chat_api_stream(user_prompt, current_tick, token_info, attempt_number=attempt_number)
@@ -1077,7 +1221,14 @@ class OpenAIConnector(BaseLLMConnector):
             import traceback; traceback.print_exc()
             raise LLMConnectorError(f"Unexpected OpenAI API streaming failure for {self.agent_name}. Details: {str(e)}", original_exception=e)
     
-    def _send_message_with_responses_api_stream(self, user_prompt: str, current_tick: int, token_info: Dict[str, Optional[int]], attempt_number: int = 1) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
+    def _send_message_with_responses_api_stream(
+        self,
+        user_prompt: str,
+        current_tick: int,
+        token_info: Dict[str, Optional[int]],
+        attempt_number: int = 1,
+        allow_non_stream_fallback: bool = True,
+    ) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
         """Handle reasoning models using the Responses API with streaming."""
         try:
             # Build input for Responses API
@@ -1329,10 +1480,18 @@ class OpenAIConnector(BaseLLMConnector):
                 f"WARNING ({self.agent_name}): Responses API streaming failed: {err_type} {e} | "
                 f"repr={err_repr} | request_id={err_request_id} | body={err_body}"
             )
+            if not allow_non_stream_fallback or self._should_defer_responses_error_to_outer_retry(e):
+                self._raise_responses_api_error(e, "streaming")
             # Some reasoning models might not support streaming, fall back to non-streaming
+            self._refresh_runtime_config_before_internal_fallback("responses_stream_failed")
             print(f"INFO ({self.agent_name}): Falling back to non-streaming Responses API")
-            # Remove the attempt_number to prevent infinite recursion
-            return self._send_message_with_responses_api(user_prompt, current_tick, token_info, attempt_number=0)
+            return self._send_message_with_responses_api(
+                user_prompt,
+                current_tick,
+                token_info,
+                attempt_number=0,
+                force_non_stream=True,
+            )
 
     def get_chat_history(self) -> List[Dict[str, str]]:
         """Returns the current (pruned) chat history from the active session."""

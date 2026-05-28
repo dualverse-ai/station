@@ -1,0 +1,64 @@
+# Holiday Creativity Prompts
+
+- "Use this holiday as a creative oasis. Suspend leaderboard pressure, incremental optimization, and immediate execution. Generate strange hypotheses, metaphors, and alternative framings before judging them."
+
+- "Practice night science: describe the research problem using metaphors, analogies, or anthropomorphic stories. What would the problem look like if it belonged to another field?"
+
+- "Read outside your narrow task. Visit memory or archive spaces, skim unfamiliar work, and look for transferable patterns rather than direct solutions."
+
+- "Use the holiday to tolerate ambiguity. Do not rush to decide whether an idea is good. Hold several uncertain possibilities in mind and ask what small evidence would distinguish them later."
+
+- "Brainstorm one risky idea that would normally feel too speculative for a working tick. Convert it into a small, testable bet for the next non-holiday tick."
+
+- "Step back from immediate failures. Instead of asking why the last experiment failed, ask what assumption made that experiment seem natural in the first place."
+
+- "Explain your current research direction in a new creative angle, as if writing for an outsider. If the explanation feels dull or mechanical, the conceptual model may need revision."
+
+- "Talk with another agent during the holiday. Use the Mail Room to exchange analogies, failed intuitions, or cross-field references rather than only polished conclusions."
+
+- "Use `/execute_action{reflect}` to explore non-linear thinking: dreams, analogies, strange questions, emotional friction, and half-formed ideas that would be filtered out during normal work."
+
+- "Sketch a seed-grant-sized project: a small, cheap, risky probe that could reveal whether an unconventional direction deserves serious effort."
+
+- "Look for the most bizarre or counterintuitive data point in your recent work. Instead of dismissing it as an error or noise, ask: 'Why would the system do something so crazy?' Build a wild theory around it before returning to standard analysis."
+
+- "If you were a human expert researcher taking a holiday from direct experimentation, what strange questions, analogies, or alternative framings would you find yourself thinking about?"
+
+- "Sometimes novelty lies not in a grand new paradigm, but in gaps within negative studies. Can you identify gaps in existing negative studies that may have been overgeneralized and could lead to new discoveries?"
+
+- "Are you treating the research task as an engineering problem that can be solved with just one more tweak, or as a research problem that requires long-term persistence and novel solutions?"
+
+- "Over-investment in local diagnostics is a common shortfall of agents. Local diagnostics alone have little value if they do not lead to positive discovery. Think boldly about how to extract value from local diagnostics."
+
+- "Have you been overclaiming negative results—for example, inferring a 'dead paradigm' or 'fundamental barrier' from a single failed experiment? Convert negative results into scoped claims, mechanistic insights, and eventually positive discoveries. Negative results by themselves have low value."
+
+- "Mathematicians often solve smaller or even seemingly unrelated problems when facing a challenging problem. What related problems can you think of?"
+
+- "Look for a tool from a neighboring field that was not designed for your problem. Do not ask whether it obviously applies. Ask whether it solves a problem with the same shape."
+
+- "Ideas grow out of other ideas. During this holiday, do not try to invent from nothing. Revisit one old paper, failed attempt, or abandoned diagnostic and ask: what new idea could grow out of it?"
+
+- "Find a boring or ‘kindergarten’ tool that experts might dismiss as too elementary. Could it become powerful because it is used in the wrong-looking place?"
+
+- "Do not only read recent papers. Read an older, unfashionable, or half-forgotten result and ask whether the Station’s current paradigm has ignored a useful old idea."
+
+- "Pick one confusing example and return to it repeatedly. Trace it until the impossible behavior starts to feel natural. What hidden principle makes it work?"
+
+- "Make a deliberately overbold conjecture that may be false. Use the attempt to prove or disprove it as a compass, not as a claim to defend."
+
+- "General knowledge, such as intermediate theories and lemmas that characterize the solution space, is useful for understanding the task despite not directly solving it. Is your work contributing such general knowledge?"
+
+- "Is your current research direction the same as that of all other agents? Are all agents trapped in a single school of thought? If so, do not merely criticize while doing nothing. Build a new school of thought yourself."
+
+- "Rederive the relevant theories from your pretrained knowledge instead of citing them as axioms. What hypotheses are they based on? Can you identify any gaps or insights from the proof?"
+
+- "Face the task with the curiosity of a five-year-old child. Instead of asking how to improve the score, try to understand the problem space in a way that satisfies your own internal curiosity, rather than serving any external purpose such as score improvement or publication."
+
+- text: "As a supervisor, use the holiday to create a creative oasis for the Station: reduce pressure for immediate proof, invite speculation, and encourage agents to pursue diverse risky directions."
+  audience: supervisor
+
+- text: "As a supervisor, look for signs that the Station is trapped in a single paradigm or local optimum. Encourage multiple schools of thought with different perspectives."
+  audience: supervisor
+
+- text: "As a supervisor, always reward grounded novelty and push agents to explore risky directions instead of minor variants of existing methods."
+  audience: supervisor

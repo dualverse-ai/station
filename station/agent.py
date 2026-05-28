@@ -21,13 +21,15 @@ Lobby help is reset on ascension.
 """
 
 import os
+import errno
 import re # For _generate_unique_guest_name
 import random
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Set
 import traceback
 import fcntl
 import time
 import json
+from contextlib import contextmanager
 
 from station import constants
 from station import file_io_utils
@@ -98,36 +100,382 @@ def _deep_update(source: Dict, overrides: Dict) -> Dict:
             source[key] = value
     return source
 
-def _load_random_system_prompts() -> List[str]:
-    """Load random system prompts from YAML file"""
+def _load_init_role_definitions() -> List[str]:
+    """Load initial role definitions from YAML file with legacy fallback."""
     try:
-        random_sys_prompts_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.RANDOM_SYS_PROMPT_FILENAME)
-        if file_io_utils.file_exists(random_sys_prompts_path):
-            return file_io_utils.load_yaml(random_sys_prompts_path) or []
+        init_role_def_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.INIT_ROLE_DEFINITION_FILENAME)
+        legacy_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.LEGACY_RANDOM_SYS_PROMPT_FILENAME)
+        target_path = init_role_def_path if file_io_utils.file_exists(init_role_def_path) else legacy_path
+        if file_io_utils.file_exists(target_path):
+            prompts = file_io_utils.load_yaml(target_path) or []
+            return [p for p in prompts if isinstance(p, str)]
     except Exception:
         pass
     return []
 
-def _process_system_prompt_with_random(original_prompt: Optional[str]) -> Optional[str]:
+def _load_departed_next_role_definitions() -> List[str]:
+    """Load descendant role definitions left by departed agents."""
+    role_definitions: List[str] = []
+    agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
+    if not file_io_utils.dir_exists(agents_dir):
+        return role_definitions
+
+    try:
+        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
+    except Exception:
+        return role_definitions
+
+    for agent_file_name in agent_files:
+        if not agent_file_name.endswith(constants.YAML_EXTENSION):
+            continue
+        agent_name = agent_file_name[:-len(constants.YAML_EXTENSION)]
+        try:
+            agent_data = load_agent_data(
+                agent_name,
+                include_ascended=True,
+                include_ended=True,
+            )
+        except Exception:
+            continue
+        if not isinstance(agent_data, dict):
+            continue
+        if not agent_data.get(constants.AGENT_SESSION_ENDED_KEY, False):
+            continue
+        if agent_data.get(constants.AGENT_ROLE_KEY) in {
+            constants.ROLE_SUPERVISOR,
+            constants.ROLE_THEORIST,
+        }:
+            continue
+
+        if constants.AGENT_NEXT_ROLE_DEFINITION_KEY not in agent_data:
+            continue
+
+        role_definition = agent_data.get(constants.AGENT_NEXT_ROLE_DEFINITION_KEY)
+        if isinstance(role_definition, str):
+            role_definitions.append(role_definition.strip())
+
+    return role_definitions
+
+def get_role_definition_sampling_pool() -> List[str]:
+    """Return the full pool used when a fresh guest has no explicit role."""
+    return _load_init_role_definitions() + _load_departed_next_role_definitions()
+
+def pick_random_init_role_definition() -> Optional[str]:
     """
-    Process system prompt with random override logic:
-    1. If blank/None -> use random
-    2. If original came from random file + 20% chance -> use new random
+    Pick an initial role definition from the full fresh-guest sampling pool:
+    init role definitions plus descendant role definitions left by departed agents.
     """
-    # Load random system prompts
-    random_sys_prompts = _load_random_system_prompts()
-    if not random_sys_prompts:
-        return original_prompt
+    role_definitions = get_role_definition_sampling_pool()
+    if not role_definitions:
+        return None
+    return random.choice(role_definitions)
 
-    # Case 1: Blank system prompt
-    if not original_prompt or original_prompt.strip() == "":
-        return random.choice(random_sys_prompts)
+def resolve_guest_role_definition(role_definition: Optional[str]) -> Optional[str]:
+    """
+    Resolve the role definition for a newly created guest.
 
-    # Case 2: Check if original is from random file + 20% chance
-    if original_prompt in random_sys_prompts and random.random() < constants.RANDOM_SYS_PROMPT_OVERRIDE_PROB:
-        return random.choice(random_sys_prompts)
+    Passing an explicit string, including an empty string, is a caller override.
+    When no explicit role definition is supplied, sample from the fresh-guest
+    role pool. The pool may intentionally include an empty string entry.
+    """
+    if isinstance(role_definition, str):
+        return role_definition.strip()
+    sampled_role_definition = pick_random_init_role_definition()
+    if isinstance(sampled_role_definition, str):
+        return sampled_role_definition.strip()
+    return None
 
-    return original_prompt
+def get_agent_role_definition(agent_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Read role definition with legacy fallback."""
+    if not isinstance(agent_data, dict):
+        return None
+    role_definition = agent_data.get(constants.AGENT_ROLE_DEFINITION_KEY)
+    if role_definition is None:
+        role_definition = agent_data.get(constants.LEGACY_AGENT_LLM_SYSTEM_PROMPT_KEY)
+    if not isinstance(role_definition, str):
+        return None
+    role_definition = role_definition.strip()
+    return role_definition or None
+
+def get_agent_next_role_definition(agent_data: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Read next role definition."""
+    if not isinstance(agent_data, dict):
+        return None
+    role_definition = agent_data.get(constants.AGENT_NEXT_ROLE_DEFINITION_KEY)
+    if not isinstance(role_definition, str):
+        return None
+    return role_definition.strip()
+
+
+def _select_spawn_role() -> Optional[str]:
+    """Return the role assigned to a freshly spawned agent."""
+    if random.random() < getattr(constants, "THEORIST_SPAWN_PROBABILITY", 0.0):
+        return constants.ROLE_THEORIST
+    return None
+
+
+def _coerce_tick(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact_optional_string(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalized_protection_records(agent_data: Optional[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    if not isinstance(agent_data, dict):
+        return []
+    raw_records = agent_data.get(key, [])
+    if not isinstance(raw_records, list):
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for raw_record in raw_records:
+        if not isinstance(raw_record, dict):
+            continue
+        tick = _coerce_tick(raw_record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
+        reason = _compact_optional_string(raw_record.get(constants.PROTECTED_DIALOGUE_REASON_KEY))
+        if key == constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY and tick is None:
+            continue
+        if not reason:
+            continue
+        record: Dict[str, Any] = {
+            constants.PROTECTED_DIALOGUE_REASON_KEY: reason,
+        }
+        if tick is not None:
+            record[constants.PROTECTED_DIALOGUE_TICK_KEY] = tick
+        source = _compact_optional_string(raw_record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY))
+        if source:
+            record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source
+        metadata = raw_record.get(constants.PROTECTED_DIALOGUE_METADATA_KEY)
+        if isinstance(metadata, dict) and metadata:
+            record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
+        records.append(record)
+    return records
+
+
+def _meta_reflection_protected_tick_limit() -> Optional[int]:
+    raw_limit = getattr(constants, "REFLECTION_META_PROTECTED_TICK_LIMIT", 4)
+    if raw_limit is None:
+        return None
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError):
+        return 4
+    if limit < 0:
+        return None
+    return limit
+
+
+def _sort_protection_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        records,
+        key=lambda item: (
+            int(item.get(constants.PROTECTED_DIALOGUE_TICK_KEY, 0)),
+            str(item.get(constants.PROTECTED_DIALOGUE_REASON_KEY, "")),
+            str(item.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "")),
+        ),
+    )
+
+
+def _limit_meta_reflection_protection_records(
+    records: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    limit = _meta_reflection_protected_tick_limit()
+    if limit is None:
+        return records
+
+    meta_tick_set: Set[int] = set()
+    for record in records:
+        if (
+            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY)
+            != constants.PROTECTED_DIALOGUE_REASON_META_REFLECTION
+        ):
+            continue
+        tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
+        if tick is not None:
+            meta_tick_set.add(tick)
+    meta_ticks = sorted(meta_tick_set, reverse=True)
+    protected_meta_ticks = set(meta_ticks[:limit])
+
+    limited_records: List[Dict[str, Any]] = []
+    for record in records:
+        if (
+            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY)
+            == constants.PROTECTED_DIALOGUE_REASON_META_REFLECTION
+        ):
+            tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
+            if tick not in protected_meta_ticks:
+                continue
+        limited_records.append(record)
+    return limited_records
+
+
+def protect_dialogue_tick(
+    agent_data: Dict[str, Any],
+    tick: int,
+    reason: str,
+    source: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Mark a whole Station dialogue tick as not prunable in agent YAML."""
+    if not isinstance(agent_data, dict):
+        return False
+    tick_int = _coerce_tick(tick)
+    reason_text = _compact_optional_string(reason)
+    source_text = _compact_optional_string(source)
+    if tick_int is None or not reason_text:
+        return False
+
+    records = _normalized_protection_records(
+        agent_data,
+        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY,
+    )
+    original_records = list(records)
+    for record in records:
+        if (
+            record.get(constants.PROTECTED_DIALOGUE_TICK_KEY) == tick_int
+            and record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) == reason_text
+            and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") == source_text
+        ):
+            limited_records = _limit_meta_reflection_protection_records(
+                _sort_protection_records(records)
+            )
+            agent_data[constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY] = limited_records
+            return limited_records != original_records
+
+    new_record: Dict[str, Any] = {
+        constants.PROTECTED_DIALOGUE_TICK_KEY: tick_int,
+        constants.PROTECTED_DIALOGUE_REASON_KEY: reason_text,
+    }
+    if source_text:
+        new_record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source_text
+    if isinstance(metadata, dict) and metadata:
+        new_record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
+    records.append(new_record)
+    records = _limit_meta_reflection_protection_records(_sort_protection_records(records))
+    agent_data[constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY] = records
+    return records != original_records
+
+
+def queue_dialogue_tick_protection(
+    agent_data: Dict[str, Any],
+    reason: str,
+    source: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Queue a protection to be applied to the next rendered Station response."""
+    if not isinstance(agent_data, dict):
+        return False
+    reason_text = _compact_optional_string(reason)
+    source_text = _compact_optional_string(source)
+    if not reason_text:
+        return False
+
+    records = _normalized_protection_records(
+        agent_data,
+        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY,
+    )
+    for record in records:
+        if (
+            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) == reason_text
+            and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") == source_text
+        ):
+            agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = records
+            return False
+
+    new_record: Dict[str, Any] = {
+        constants.PROTECTED_DIALOGUE_REASON_KEY: reason_text,
+    }
+    if source_text:
+        new_record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source_text
+    if isinstance(metadata, dict) and metadata:
+        new_record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
+    records.append(new_record)
+    agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = records
+    return True
+
+
+def apply_pending_dialogue_tick_protections(agent_data: Dict[str, Any], tick: int) -> bool:
+    """Apply queued protection records to the current Station response tick."""
+    if not isinstance(agent_data, dict):
+        return False
+    pending = _normalized_protection_records(
+        agent_data,
+        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY,
+    )
+    if not pending and constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY not in agent_data:
+        return False
+
+    changed = False
+    for record in pending:
+        changed = protect_dialogue_tick(
+            agent_data,
+            tick,
+            str(record.get(constants.PROTECTED_DIALOGUE_REASON_KEY, "")),
+            source=str(record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "")),
+            metadata=record.get(constants.PROTECTED_DIALOGUE_METADATA_KEY),
+        ) or changed
+    agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = []
+    return changed or bool(pending)
+
+
+def has_dialogue_tick_protection(
+    agent_data: Optional[Dict[str, Any]],
+    *,
+    reason: Optional[str] = None,
+    source: Optional[str] = None,
+    include_pending: bool = True,
+) -> bool:
+    """Return whether agent YAML already has a matching protection record."""
+    reason_text = _compact_optional_string(reason)
+    source_text = _compact_optional_string(source)
+    keys = [constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY]
+    if include_pending:
+        keys.append(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY)
+
+    for key in keys:
+        for record in _normalized_protection_records(agent_data, key):
+            if reason_text and record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) != reason_text:
+                continue
+            if source_text and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") != source_text:
+                continue
+            return True
+    return False
+
+
+def get_protected_dialogue_ticks(
+    agent_data: Optional[Dict[str, Any]],
+    raw_entries: Optional[List[Dict[str, Any]]] = None,
+) -> Set[int]:
+    """Return Station dialogue ticks that pruning must preserve.
+
+    ``raw_entries`` is accepted for compatibility with older call sites, but
+    protection is now read only from explicit agent YAML records. Legacy keyword
+    migration happens once at startup.
+    """
+    _ = raw_entries
+    protected_ticks: Set[int] = set()
+    records = _limit_meta_reflection_protection_records(
+        _normalized_protection_records(
+            agent_data,
+            constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY,
+        )
+    )
+    for record in records:
+        tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
+        if tick is not None:
+            protected_ticks.add(tick)
+    return protected_ticks
+
+
+def _message_is_architect_message(message: str) -> bool:
+    return "**Architect Message**" in message
 
 # --- Public API ---
 # ... (load_agent_data, save_agent_data remain the same) ...
@@ -152,6 +500,45 @@ def save_agent_data(agent_name: str, agent_data: Dict[str, Any]) -> bool:
         print(f"Error saving agent data for {agent_name}: {e}")
         return False
 
+
+@contextmanager
+def _agent_file_lock(agent_name: str, max_wait_seconds: float = 30.0):
+    """
+    Acquire an advisory lock for an agent YAML file.
+
+    The lock file is only the inode used for flock. Its existence is not lock
+    ownership, so a process killed after creating the file cannot block future
+    writers.
+    """
+    file_path = _get_agent_file_path(agent_name)
+    lock_path = file_path + ".lock"
+    file_io_utils.ensure_dir_exists(os.path.dirname(lock_path))
+
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    started_at = time.monotonic()
+    delay = 0.05
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as e:
+                if e.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() - started_at >= max_wait_seconds:
+                    raise TimeoutError(
+                        f"Timed out acquiring lock for {agent_name} after {max_wait_seconds:.1f}s"
+                    )
+                time.sleep(delay)
+                delay = min(delay * 1.5, 0.5)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+
 def update_agent_fields_atomic(agent_name: str, delta_updates: Dict[str, Any], max_retries: int = 5) -> bool:
     """
     Atomically update agent fields with file locking to prevent race conditions.
@@ -159,63 +546,30 @@ def update_agent_fields_atomic(agent_name: str, delta_updates: Dict[str, Any], m
     """
     if not delta_updates:
         return True
-        
-    file_path = _get_agent_file_path(agent_name)
-    lock_path = file_path + ".lock"
-    
-    for attempt in range(max_retries):
-        try:
-            # Create lock file
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
-            try:
-                # Acquire exclusive lock
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                
-                # Load current data
-                agent_data = load_agent_data(agent_name)
+
+    max_wait_seconds = max(1.0, float(max_retries) * 6.0)
+    try:
+        with _agent_file_lock(agent_name, max_wait_seconds=max_wait_seconds):
+            # Load current data
+            agent_data = load_agent_data(agent_name)
+            if not agent_data:
+                # Try loading including inactive agents
+                agent_data = load_agent_data(agent_name, include_ended=True, include_ascended=True)
                 if not agent_data:
-                    # Try loading including inactive agents
-                    agent_data = load_agent_data(agent_name, include_ended=True, include_ascended=True)
-                    if not agent_data:
-                        print(f"Cannot update fields: Agent '{agent_name}' not found.")
-                        return False
-                
-                # Apply updates
-                _deep_update(agent_data, delta_updates)
-                
-                # Save updated data
-                success = save_agent_data(agent_name, agent_data)
-                
-                return success
-                
-            finally:
-                # Always release lock and close file descriptor
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-                # Remove lock file
-                try:
-                    os.unlink(lock_path)
-                except OSError:
-                    pass
-                    
-        except OSError as e:
-            if e.errno == 17:  # File exists (lock is held by another process)
-                if attempt < max_retries - 1:
-                    # Wait a bit and retry
-                    time.sleep(0.1 * (attempt + 1))  # Exponential backoff
-                    continue
-                else:
-                    print(f"Failed to acquire lock for {agent_name} after {max_retries} attempts")
+                    print(f"Cannot update fields: Agent '{agent_name}' not found.")
                     return False
-            else:
-                print(f"Error updating agent fields atomically for {agent_name}: {e}")
-                return False
-                
-        except Exception as e:
-            print(f"Unexpected error updating agent fields for {agent_name}: {e}")
-            return False
-    
-    return False
+
+            # Apply updates
+            _deep_update(agent_data, delta_updates)
+
+            # Save updated data
+            return save_agent_data(agent_name, agent_data)
+    except TimeoutError as e:
+        print(f"Failed to acquire lock for {agent_name}: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error updating agent fields for {agent_name}: {e}")
+        return False
     
 def update_agent_fields(agent_name: str, delta_updates: Dict[str, Any]) -> bool:
     """Update agent fields atomically with file locking to prevent race conditions."""
@@ -225,7 +579,12 @@ def update_agent_fields(agent_name: str, delta_updates: Dict[str, Any]) -> bool:
     # Use the new atomic update function
     return update_agent_fields_atomic(agent_name, delta_updates)
 
-def add_pending_notification_atomic(agent_name: str, message: str) -> bool:
+def add_pending_notification_atomic(
+    agent_name: str,
+    message: str,
+    protection_reason: Optional[str] = None,
+    protection_source: str = "",
+) -> bool:
     """
     Add a notification to an agent's pending notifications list atomically.
     This prevents race conditions when multiple threads try to add notifications simultaneously.
@@ -239,8 +598,56 @@ def add_pending_notification_atomic(agent_name: str, message: str) -> bool:
         current_notifications = agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, [])
         if not isinstance(current_notifications, list):
             current_notifications = []
+        if message in current_notifications:
+            agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications
+            return
+
+        shown_notifications = agent_data.get(constants.AGENT_SHOWN_NOTIFICATIONS_KEY, [])
+        if not isinstance(shown_notifications, list):
+            shown_notifications = []
+        if message in shown_notifications:
+            agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications
+            return
+
         agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications + [message]
+        if protection_reason:
+            queue_dialogue_tick_protection(
+                agent_data,
+                protection_reason,
+                source=protection_source,
+            )
+        elif _message_is_architect_message(message):
+            queue_dialogue_tick_protection(
+                agent_data,
+                constants.PROTECTED_DIALOGUE_REASON_ARCHITECT_MESSAGE,
+                source="architect_message_notification",
+            )
     
+    return update_agent_with_function(agent_name, update_func)
+
+
+def remove_pending_notification_atomic(agent_name: str, message: str) -> bool:
+    """
+    Remove a notification from an agent's pending/shown notification lists atomically.
+    """
+    if not message:
+        return True
+
+    def update_func(agent_data: Dict[str, Any]) -> None:
+        current_notifications = agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, [])
+        if not isinstance(current_notifications, list):
+            current_notifications = []
+        agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY] = [
+            item for item in current_notifications if item != message
+        ]
+
+        shown_notifications = agent_data.get(constants.AGENT_SHOWN_NOTIFICATIONS_KEY, [])
+        if not isinstance(shown_notifications, list):
+            shown_notifications = []
+        agent_data[constants.AGENT_SHOWN_NOTIFICATIONS_KEY] = [
+            item for item in shown_notifications if item != message
+        ]
+
     return update_agent_with_function(agent_name, update_func)
 
 def update_agent_with_function(agent_name: str, update_func, max_retries: int = 5) -> bool:
@@ -248,62 +655,29 @@ def update_agent_with_function(agent_name: str, update_func, max_retries: int = 
     Atomically update agent data using a custom update function.
     The update_func receives the agent_data dict and should modify it in place.
     """
-    file_path = _get_agent_file_path(agent_name)
-    lock_path = file_path + ".lock"
-    
-    for attempt in range(max_retries):
-        try:
-            # Create lock file
-            lock_fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
-            try:
-                # Acquire exclusive lock
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                
-                # Load current data
-                agent_data = load_agent_data(agent_name)
+    max_wait_seconds = max(1.0, float(max_retries) * 6.0)
+    try:
+        with _agent_file_lock(agent_name, max_wait_seconds=max_wait_seconds):
+            # Load current data
+            agent_data = load_agent_data(agent_name)
+            if not agent_data:
+                # Try loading including inactive agents
+                agent_data = load_agent_data(agent_name, include_ended=True, include_ascended=True)
                 if not agent_data:
-                    # Try loading including inactive agents
-                    agent_data = load_agent_data(agent_name, include_ended=True, include_ascended=True)
-                    if not agent_data:
-                        print(f"Cannot update: Agent '{agent_name}' not found.")
-                        return False
-                
-                # Apply custom update function
-                update_func(agent_data)
-                
-                # Save updated data
-                success = save_agent_data(agent_name, agent_data)
-                
-                return success
-                
-            finally:
-                # Always release lock and close file descriptor
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-                # Remove lock file
-                try:
-                    os.unlink(lock_path)
-                except OSError:
-                    pass
-                    
-        except OSError as e:
-            if e.errno == 17:  # File exists (lock is held by another process)
-                if attempt < max_retries - 1:
-                    # Wait a bit and retry
-                    time.sleep(0.1 * (attempt + 1))  # Exponential backoff
-                    continue
-                else:
-                    print(f"Failed to acquire lock for {agent_name} after {max_retries} attempts")
+                    print(f"Cannot update: Agent '{agent_name}' not found.")
                     return False
-            else:
-                print(f"Error updating agent with function for {agent_name}: {e}")
-                return False
-                
-        except Exception as e:
-            print(f"Unexpected error updating agent {agent_name}: {e}")
-            return False
-    
-    return False
+
+            # Apply custom update function
+            update_func(agent_data)
+
+            # Save updated data
+            return save_agent_data(agent_name, agent_data)
+    except TimeoutError as e:
+        print(f"Failed to acquire lock for {agent_name}: {e}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error updating agent {agent_name}: {e}")
+        return False
 
 def _set_default_archive_pins(agent_data: Dict[str, Any]):
     """Sets default pinned archive capsules (ID 1) if not already set."""
@@ -330,17 +704,16 @@ def create_guest_agent(model_name: str,
                        initial_tokens_max: Optional[int] = None,
                        # ADD LLM CONFIG PARAMS FOR NEW GUESTS
                        model_provider_class: Optional[str] = None,
-                       llm_system_prompt: Optional[str] = None,
+                       role_definition: Optional[str] = None,
                        llm_temperature: Optional[float] = None,
                        llm_max_tokens: Optional[int] = None,
-                       llm_custom_api_params: Optional[Dict[str, Any]] = None
+                       llm_custom_api_params: Optional[Dict[str, Any]] = None,
+                       role: Optional[str] = None
                        ) -> Optional[Dict[str, Any]]:
     agent_name = _generate_unique_guest_name(guest_prefix)
     default_location = getattr(constants, "AGENT_DEFAULT_STARTING_LOCATION", constants.ROOM_LOBBY)
     max_budget = initial_tokens_max if initial_tokens_max is not None else constants.DEFAULT_GUEST_MAX_TOKENS
-
-    # Process system prompt with random override logic
-    llm_system_prompt = _process_system_prompt_with_random(llm_system_prompt)
+    resolved_role_definition = resolve_guest_role_definition(role_definition)
 
     agent_data = {
         constants.AGENT_NAME_KEY: agent_name,
@@ -359,15 +732,18 @@ def create_guest_agent(model_name: str,
         constants.AGENT_IS_ASCENDED_KEY: False, 
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
+        constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
+        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: [],
+        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: [],
         # Tick tracking fields
         constants.AGENT_TICK_BIRTH_KEY: current_tick,
         constants.AGENT_TICK_ASCEND_KEY: None,
         constants.AGENT_TICK_EXIT_KEY: None,
         constants.AGENT_MAX_AGE_KEY: constants.AGENT_MAX_LIFE,
-        constants.AGENT_ROLE_KEY: None,  # Default role is None (normal agent)
+        constants.AGENT_ROLE_KEY: _select_spawn_role() if role is None else role,
         # LLM Config fields
         constants.AGENT_MODEL_PROVIDER_CLASS_KEY: model_provider_class or "Gemini", # Default
-        constants.AGENT_LLM_SYSTEM_PROMPT_KEY: llm_system_prompt,
+        constants.AGENT_ROLE_DEFINITION_KEY: resolved_role_definition,
         constants.AGENT_LLM_TEMPERATURE_KEY: llm_temperature,
         constants.AGENT_LLM_MAX_TOKENS_KEY: llm_max_tokens,
         constants.AGENT_LLM_CUSTOM_API_PARAMS_KEY: llm_custom_api_params,
@@ -382,18 +758,24 @@ def create_recursive_agent(model_name: str,
                            lineage: str,
                            generation: int,
                            current_tick: int,
+                           agent_name: Optional[str] = None,
                            agent_name_override: Optional[str] = None,
                            description: Optional[str] = None,
                            internal_note: str = "",
                            initial_tokens_max: Optional[int] = None,
                            # ADD LLM CONFIG PARAMS
                            model_provider_class: Optional[str] = None,
-                           llm_system_prompt: Optional[str] = None,
+                           role_definition: Optional[str] = None,
                            llm_temperature: Optional[float] = None,
                            llm_max_tokens: Optional[int] = None,
-                           llm_custom_api_params: Optional[Dict[str, Any]] = None
+                           llm_custom_api_params: Optional[Dict[str, Any]] = None,
+                           role: Optional[str] = None
                            ) -> Optional[Dict[str, Any]]:
-    final_agent_name = agent_name_override
+    if str(lineage or "").strip().lower() in constants.RESEARCH_STORAGE_RESERVED_NAMES:
+        print(f"Cannot create recursive agent: Lineage name '{lineage}' is reserved.")
+        return None
+
+    final_agent_name = agent_name_override or agent_name
     if final_agent_name is None:
         if not lineage or generation is None: return None
         final_agent_name = f"{lineage} {_int_to_roman(generation)}"
@@ -422,15 +804,18 @@ def create_recursive_agent(model_name: str,
         constants.AGENT_IS_ASCENDED_KEY: False,
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
+        constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
+        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: [],
+        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: [],
         # Tick tracking fields
         constants.AGENT_TICK_BIRTH_KEY: current_tick,
         constants.AGENT_TICK_ASCEND_KEY: current_tick,  # Recursive agents are born ascended
         constants.AGENT_TICK_EXIT_KEY: None,
         constants.AGENT_MAX_AGE_KEY: constants.AGENT_MAX_LIFE,
-        constants.AGENT_ROLE_KEY: None,  # Default role is None (normal agent)
+        constants.AGENT_ROLE_KEY: _select_spawn_role() if role is None else role,
         # LLM Config fields
         constants.AGENT_MODEL_PROVIDER_CLASS_KEY: model_provider_class or "Gemini", # Default
-        constants.AGENT_LLM_SYSTEM_PROMPT_KEY: llm_system_prompt,
+        constants.AGENT_ROLE_DEFINITION_KEY: role_definition,
         constants.AGENT_LLM_TEMPERATURE_KEY: llm_temperature,
         constants.AGENT_LLM_MAX_TOKENS_KEY: llm_max_tokens,
         constants.AGENT_LLM_CUSTOM_API_PARAMS_KEY: llm_custom_api_params,
@@ -447,7 +832,12 @@ def ascend_agent(guest_agent_name: str,
                  new_generation: int,
                  current_tick: int,
                  new_description: Optional[str] = None,
-                 ascension_notification: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                 ascension_notification: Optional[str] = None,
+                 role_definition: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if str(new_lineage or "").strip().lower() in constants.RESEARCH_STORAGE_RESERVED_NAMES:
+        print(f"Cannot ascend: Lineage name '{new_lineage}' is reserved.")
+        return None
+
     original_guest_data = load_agent_data(guest_agent_name, include_ascended=True, include_ended=True)     
     
     if not original_guest_data:
@@ -497,6 +887,13 @@ def ascend_agent(guest_agent_name: str,
         constants.AGENT_IS_ASCENDED_KEY: False,
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
+        constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
+        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: list(
+            original_guest_data.get(constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY, [])
+        ),
+        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: list(
+            original_guest_data.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY, [])
+        ),
         # Tick tracking fields - carry over birth, set ascend
         constants.AGENT_TICK_BIRTH_KEY: original_guest_data.get(constants.AGENT_TICK_BIRTH_KEY),
         constants.AGENT_TICK_ASCEND_KEY: current_tick,
@@ -506,18 +903,21 @@ def ascend_agent(guest_agent_name: str,
         # Carry over role from original guest
         constants.AGENT_ROLE_KEY: original_guest_data.get(constants.AGENT_ROLE_KEY),
     }
+
+    if role_definition is not None:
+        new_recursive_agent_data[constants.AGENT_ROLE_DEFINITION_KEY] = role_definition.strip()
     
     # --- MODIFICATION: Carry over LLM configuration ---
     llm_config_keys_to_carry = [
         constants.AGENT_MODEL_PROVIDER_CLASS_KEY,
-        constants.AGENT_LLM_SYSTEM_PROMPT_KEY,
         constants.AGENT_LLM_TEMPERATURE_KEY,
         constants.AGENT_LLM_MAX_TOKENS_KEY,
         constants.AGENT_LLM_CUSTOM_API_PARAMS_KEY
     ]
     for key in llm_config_keys_to_carry:
-        if key in original_guest_data:
-            new_recursive_agent_data[key] = original_guest_data[key]
+        if key not in original_guest_data:
+            continue
+        new_recursive_agent_data[key] = original_guest_data[key]
     
     # Carry over other room-specific UI states
     for short_room_name_key_asc in constants.SHORT_ROOM_NAME_TO_FULL_MAP.keys():
@@ -604,7 +1004,7 @@ def ascend_agent(guest_agent_name: str,
     if save_agent_data(new_recursive_name, new_recursive_agent_data):
         print(f"New recursive agent '{new_recursive_name}' created successfully via ascension.")
         # Note: The Orchestrator will need to update its connector map.
-        # The Station will update its turn order config via the TestChamber calling a station method.
+        # The Station will update its turn order config via a station-level method.
         return new_recursive_agent_data
     else:
         # Rollback guest status if save fails (critical error)
@@ -704,7 +1104,12 @@ def update_agent_token_budget(agent_data: Dict[str, Any], cost: int) -> bool:
     if current_budget >= cost: agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_KEY] = current_budget - cost; return True
     return False
 
-def add_pending_notification(agent_data: Dict[str, Any], notification_message: str) -> None: # MODIFIED type hint
+def add_pending_notification(
+    agent_data: Dict[str, Any],
+    notification_message: str,
+    protection_reason: Optional[str] = None,
+    protection_source: str = "",
+) -> None: # MODIFIED type hint
     """Adds a message string to the agent's pending notification list."""
     if constants.AGENT_NOTIFICATIONS_PENDING_KEY not in agent_data or \
        not isinstance(agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY), list):
@@ -717,6 +1122,20 @@ def add_pending_notification(agent_data: Dict[str, Any], notification_message: s
         # Fallback or error for unexpected type, though station.py sends a string for warnings
         print(f"Warning: Attempted to add non-string notification: {type(notification_message)}. Converting to string.")
         agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY].append(str(notification_message))
+
+    message_text = notification_message if isinstance(notification_message, str) else str(notification_message)
+    if protection_reason:
+        queue_dialogue_tick_protection(
+            agent_data,
+            protection_reason,
+            source=protection_source,
+        )
+    elif _message_is_architect_message(message_text):
+        queue_dialogue_tick_protection(
+            agent_data,
+            constants.PROTECTED_DIALOGUE_REASON_ARCHITECT_MESSAGE,
+            source="architect_message_notification",
+        )
 
 
 def get_pending_notifications(agent_data: Dict[str, Any]) -> List[Dict[str, Any]]:

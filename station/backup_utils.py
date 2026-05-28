@@ -105,6 +105,18 @@ def _store_file_object(file_path: str, file_hash: str, objects_dir: str) -> bool
     return True
 
 
+def _should_skip_backup_dir(path: str, backup_base: str) -> bool:
+    """Return True when a directory should be excluded from backup traversal."""
+    normalized = path.replace("\\", "/")
+    skip_markers = (
+        backup_base.replace("\\", "/"),
+        "claude_workspaces",
+        "rooms/research/storage/tmp",
+        "rooms/research/storage/shared/tmp",
+    )
+    return any(marker in normalized for marker in skip_markers)
+
+
 def create_backup(current_tick: int, backup_type: str = "automatic", station_instance=None) -> Optional[str]:
     """
     Create an incremental backup of the station_data directory.
@@ -154,21 +166,26 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
         files_processed = 0
         errors = []
         
+        visited_real_dirs = set()
+
         for root, dirs, files in os.walk(constants.BASE_STATION_DATA_PATH, followlinks=True):
-            # Skip the backup directory itself if it's inside station_data
-            if backup_base in root:
-                continue
+            root_real = os.path.realpath(root)
 
-            # Skip claude_workspaces directory
-            if "claude_workspaces" in root:
+            # Guard against symlink cycles such as research shared/tmp workspaces
+            # pointing back into shared storage.
+            if root_real in visited_real_dirs:
+                dirs[:] = []
                 continue
+            visited_real_dirs.add(root_real)
 
-            # Skip research storage tmp directory
-            if "rooms/research/storage/tmp" in root:
-                continue
+            # Prune skipped subdirectories before os.walk descends into them.
+            dirs[:] = [
+                d for d in dirs
+                if not _should_skip_backup_dir(os.path.join(root, d), backup_base)
+            ]
 
-            # Skip research storage shared tmp directory
-            if "rooms/research/storage/shared/tmp" in root:
+            if _should_skip_backup_dir(root, backup_base):
+                dirs[:] = []
                 continue
 
             for filename in files:

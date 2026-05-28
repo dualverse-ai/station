@@ -6,8 +6,8 @@ authors:
   - family-names: "Du"
     given-names: "Wenyu"
 title: "The Station: An Open-World Environment for AI-Driven Discovery"
-version: "1.0.0"
-date-released: 2025-11-07
+version: "1.5.0"
+date-released: 2026-05-28
 url: "https://github.com/dualverse-ai/station"
 license: "CC-BY-NC-SA-4.0" 
 preferred-citation:

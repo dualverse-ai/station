@@ -34,6 +34,7 @@ from .base import (
     LLMConnectorError,
     LLMTransientAPIError,
     LLMPermanentAPIError,
+    LLMCorruptedThoughtSignatureError,
     LLMSafetyBlockError,
     LLMContextOverflowError
 )
@@ -41,7 +42,6 @@ from .factory import create_llm_connector
 from .gemini import GoogleGeminiConnector
 from .claude import ClaudeConnector
 from .openai import OpenAIConnector
-from .ollama import OllamaConnector
 
 __all__ = [
     # Base classes and exceptions
@@ -49,6 +49,7 @@ __all__ = [
     'LLMConnectorError',
     'LLMTransientAPIError', 
     'LLMPermanentAPIError',
+    'LLMCorruptedThoughtSignatureError',
     'LLMSafetyBlockError',
     'LLMContextOverflowError',
     
@@ -59,5 +60,4 @@ __all__ = [
     'GoogleGeminiConnector',
     'ClaudeConnector',
     'OpenAIConnector',
-    'OllamaConnector',
 ]

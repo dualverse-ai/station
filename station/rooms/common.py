@@ -304,9 +304,23 @@ class CommonRoom(BaseRoom):
                                 f"{agent_name} invites you to join them in the Common Room. "
                                 f"Use `/execute_action{{goto {consts.SHORT_ROOM_NAME_COMMON}}}` to go there."
                             )
-                            room_context.agent_manager.add_pending_notification(recipient_agent_data, invite_message_string)
-                            room_context.agent_manager.save_agent_data(recipient_name, recipient_agent_data)
-                            invited_count +=1
+                            invite_sent = False
+
+                            def update_recipient_agent(latest_recipient_data: Dict[str, Any]) -> None:
+                                nonlocal invite_sent
+                                if latest_recipient_data.get(consts.AGENT_SESSION_ENDED_KEY) or latest_recipient_data.get(consts.AGENT_IS_ASCENDED_KEY):
+                                    return
+                                if latest_recipient_data.get(consts.AGENT_STATUS_KEY) != consts.AGENT_STATUS_RECURSIVE:
+                                    return
+                                if not room_context.station_instance._is_agent_mature(latest_recipient_data, current_tick):
+                                    return
+                                room_context.agent_manager.add_pending_notification(latest_recipient_data, invite_message_string)
+                                invite_sent = True
+
+                            if room_context.agent_manager.update_agent_with_function(recipient_name, update_recipient_agent) and invite_sent:
+                                invited_count +=1
+                            else:
+                                failed_invites.append(f"Cannot invite '{recipient_name}': Their agent state changed or could not be saved.")
                 else:
                     failed_invites.append(f"Cannot invite '{recipient_name}': Agent not found or inactive.")
             

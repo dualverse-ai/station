@@ -384,7 +384,7 @@ def simple_cpu_validation():
         'trial_number': 0
     }
 
-    # Call complete function - let exceptions pass through for debugger
+    # Call complete function and let exceptions surface clearly
     funcs['complete'](new_params, new_opt_state, dummy_trial_data)
     print("✓ Complete function works")
 

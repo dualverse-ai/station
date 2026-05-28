@@ -24,6 +24,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <script src="{{ url_for('static', filename='js/theme.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <style>
         /* Scrollbar styling from your style.css is applied via the linked sheet */
@@ -32,7 +33,7 @@
             flex: 1;
             overflow: hidden; 
         }
-        aside { /* Sidebar specific scroll, if needed */
+        aside:not(.dashboard-sidebar) { /* Sidebar specific scroll, if needed */
             overflow-y: auto; /* This is correct for sidebar content potentially exceeding height */
         }
         main.flex-col > div.log-container { /* Target log containers specifically */
@@ -40,25 +41,25 @@
             flex: 1; /* Allow them to take up available space */
         }
         .sidebar-section {
-            border-bottom: 1px solid #374151; /* gray-700 */
+            border-bottom: 1px solid var(--border-primary);
             padding-bottom: 1.5rem;
             margin-bottom: 1.5rem;
         }
         .sidebar-section:last-child { border-bottom: none; margin-bottom: 0; }
         .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
-        .status-prepared { background-color: #3b82f6; /* blue-500 */ }
-        .status-running { background-color: #10b981; /* emerald-600 */ }
-        .status-paused { background-color: #f59e0b; /* amber-500 */ }
-        .status-waiting { background-color: #8b5cf6; /* violet-500 */ }
-        .status-idle { background-color: #6b7280; /* gray-500 */ }
-        .status-error { background-color: #ef4444; /* red-500 */ }
+        .status-prepared { background-color: var(--accent-blue); }
+        .status-running { background-color: var(--accent-green); }
+        .status-paused { background-color: var(--accent-amber); }
+        .status-waiting { background-color: var(--accent-purple); }
+        .status-idle { background-color: var(--text-muted); }
+        .status-error { background-color: var(--accent-red); }
 
         /* Ensure pre tags within the new log containers handle overflow correctly */
         #global-notification-bubble-log pre,
         #agent-specific-bubble-log pre {
-            background-color: #1f2937; /* Tailwind gray-800 */
-            border: 1px solid #374151; /* Tailwind gray-700 */
-            color: #e5e7eb; /* Tailwind gray-200 */
+            background-color: var(--code-bg);
+            border: 1px solid var(--code-border);
+            color: var(--code-text);
             padding: 1rem;
             border-radius: 0.375rem; /* rounded-md */
             overflow-x: auto; /* Crucial for horizontal scroll on pre */
@@ -76,7 +77,7 @@
 <body class="bg-gray-900 text-slate-300 flex flex-col h-screen" data-operation-mode="{{ operation_mode }}">
 
     <header class="bg-gray-950 text-slate-200 p-4 shadow-lg">
-        <div class="container mx-auto flex justify-between items-center" style="padding-left: 15px; padding-right: 15px;">
+        <div class="dashboard-header-inner flex justify-between items-center">
             <div class="flex items-center">
                 <img src="{{ url_for('static', filename='logo.png') }}" alt="Station Logo" class="h-6 opacity-90">
                 <!-- Navigation commented out for single page app - uncomment when adding more pages -->
@@ -86,18 +87,38 @@
                     </ul>
                 </nav> -->
             </div>
-            <div class="text-lg">
-                <span style="margin-right: 5px;">Station Version: <span id="station-version-dashboard" class="font-semibold">N/A</span> |</span>
-                <span>Station Tick: <span id="station-tick-dashboard" class="font-semibold">N/A</span></span>
+            <div class="flex items-center space-x-4">
+                <div id="header-stats-block" class="flex flex-wrap items-center gap-2 text-lg text-right justify-end">
+                    <span>Station Version:</span>
+                    <span id="station-version-dashboard" class="font-semibold">N/A</span>
+                    <span class="text-slate-500">|</span>
+                    <span>Station Tick:</span>
+                    <span id="station-tick-dashboard" class="font-semibold">N/A</span>
+                    <span class="text-slate-500">|</span>
+                    <span>Sync:</span>
+                    <span id="station-sync-mode-dashboard" class="font-semibold">Sequential</span>
+                    <span class="text-slate-500">|</span>
+                    <span>Status:</span>
+                    <span id="station-status-dashboard" class="font-semibold">Unknown</span>
+                </div>
+                <label class="theme-selector-shell" for="dashboard-theme-selector">
+                    <span>Theme</span>
+                    <select id="dashboard-theme-selector" aria-label="Dashboard theme">
+                        <option value="light">White</option>
+                        <option value="dark">Dark</option>
+                        <option value="sci-fi">Sci-Fi</option>
+                    </select>
+                </label>
+                <a href="{{ url_for('logout') }}" class="text-sm text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md px-3 py-1 transition-colors">Logout</a>
             </div>
         </div>
     </header>
 
-    <div class="flex-1 container mx-auto p-4 flex flex-col lg:flex-row gap-6 overflow-hidden">
-        <aside class="lg:w-1/3 xl:w-1/4 glass-surface p-6 rounded-xl shadow-2xl flex flex-col gap-4">
-            
+    <div class="dashboard-shell flex-1 overflow-hidden">
+        <aside class="dashboard-sidebar glass-surface shadow-2xl flex flex-col">
+
             <div class="sidebar-section">
-                <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Control</h2>
+                <h2 class="text-lg font-semibold mb-3 text-sky-400">Station Control</h2>
                 <div class="mb-2 flex items-center">
                     <span id="orchestrator-status-dot" class="status-dot status-idle"></span>
                     Status: <span id="orchestrator-status-display" class="font-semibold ml-1">Idle</span>
@@ -105,36 +126,7 @@
                 <div id="orchestrator-pause-reason-display" class="text-sm text-slate-400 mb-1 min-h-[1.2em]"></div>
                 <div id="orchestrator-next-agent-display" class="text-sm text-slate-400 mb-3 min-h-[1.2em]"></div>
 
-                <!-- Station Statistics -->
-                <div class="glass-elevated p-4 rounded-lg mb-6 border border-slate-700">
-                    <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Statistics</h2>
-                    <div class="space-y-2 text-sm">
-                        <div class="flex justify-between items-center">
-                            <span class="text-slate-400">Pending Human Requests:</span>
-                            <span id="pending-requests-count" class="text-slate-200 font-medium">-</span>
-                        </div>
-                        <div id="pending-requests-details" class="ml-4 text-xs text-slate-500 hidden">
-                            <!-- Will be populated with request IDs and agents -->
-                        </div>
-                        <div class="flex justify-between items-center mt-3">
-                            <span class="text-slate-400">Running Experiments:</span>
-                            <span id="running-experiments-count" class="text-slate-200 font-medium">-</span>
-                        </div>
-                        <div id="running-experiments-details" class="ml-4 text-xs text-slate-500 hidden">
-                            <!-- Will be populated with running experiment details -->
-                        </div>
-                        <div class="flex justify-between items-center mt-3">
-                            <span class="text-slate-400">Top Research Submission:</span>
-                            <span id="top-research-score" class="text-slate-200 font-medium">-</span>
-                        </div>
-                        <div id="top-research-details" class="ml-4 text-xs text-slate-500 hidden">
-                            <!-- Will be populated with submission details -->
-                        </div>
-                    </div>
-                </div>
-
                 <div class="space-y-2 mb-3">
-                    
                     <button id="start-loop-button" class="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Launch Station</button>
                 </div>
                 <div class="grid grid-cols-2 gap-3">
@@ -143,38 +135,102 @@
                 </div>
             </div>
 
+            <!-- Station Statistics -->
             <div class="sidebar-section">
-                <h2 class="text-xl font-semibold mb-3 text-sky-400">Agent Management</h2>
+                <h2 class="text-lg font-semibold mb-3 text-sky-400">Station Statistics</h2>
+                <div class="dashboard-metrics-grid text-sm">
+                    <div id="pending-requests-metric-card" class="dashboard-metric-card">
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Pending Human Requests:</span>
+                            <span id="pending-requests-count" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="pending-requests-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with request IDs and agents -->
+                        </div>
+                    </div>
+                    <div id="running-experiments-metric-card" class="dashboard-metric-card">
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Jobs:</span>
+                            <span id="running-experiments-count" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="running-experiments-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with job details -->
+                        </div>
+                    </div>
+                    <div id="queued-experiments-metric-card" class="dashboard-metric-card">
+                        <div class="metric-row metric-row-split">
+                            <span class="text-slate-400">Time since last tick:</span>
+                            <span id="queued-experiments-count" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="queued-experiments-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with tick timing details -->
+                        </div>
+                    </div>
+                    <div id="top-research-metric-card" class="dashboard-metric-card">
+                        <div class="flex justify-between items-center">
+                            <span class="text-slate-400">Top Score:</span>
+                            <span id="top-research-score" class="text-slate-200 font-medium">-</span>
+                        </div>
+                        <div id="top-research-details" class="ml-4 text-xs text-slate-500 hidden">
+                            <!-- Will be populated with submission details -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sidebar-section">
+                <h2 class="text-lg font-semibold mb-3 text-sky-400">Agent Management</h2>
                 <label for="agent-selector-dashboard" class="block text-sm font-medium text-slate-400 mb-1">Log View / Target Agent:</label>
                 <select id="agent-selector-dashboard" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
                     <option value="all">Global Notifications</option>
                 </select>
-                <button id="open-direct-message-modal-button" class="w-full bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3" disabled>Direct Message</button>
-                <button id="resolve-human-intervention-button" class="w-full bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3 hidden">Resolve Request</button>
-                <button id="end-api-agent-session-button" class="w-full bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">End Selected Agent</button>
+                <div class="sidebar-agent-actions">
+                    <button id="end-api-agent-session-button" class="w-full bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">End Agent</button>
+                    <button id="resolve-human-intervention-button" class="w-full bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md hidden">Resolve Request</button>
+                </div>
             </div>
 
-            <div class="sidebar-section">
-                <h2 class="text-xl font-semibold mb-3 text-sky-400">Station Tools</h2>
-                <button id="create-api-agent-modal-button" class="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Create New Agent</button>
-                <button id="open-send-system-message-modal-button" class="w-full bg-teal-600 hover:bg-teal-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Send System Message</button>
-                <button id="open-speak-common-room-modal-button" class="w-full bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Speak in Common Room</button>
-                <button id="update-station-config-button" class="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Update Station Config</button>
-                <button id="create-backup-button" class="w-full disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md mb-3">Create Backup</button>
+            <div class="sidebar-section sidebar-tools-section">
+                <h2 class="text-lg font-semibold mb-3 text-sky-400">Station Tools</h2>
+                <div class="sidebar-primary-tools">
+                    <button id="create-api-agent-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Agent</button>
+                    <button id="open-archive-papers-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Archive Papers</button>
+                    <button id="open-temporal-chat-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Incognito Chat</button>
+                    <div class="more-tools-container">
+                        <button id="more-tools-button" type="button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" aria-expanded="false" aria-controls="more-tools-popover">More Tools</button>
+                        <div id="more-tools-popover" class="more-tools-popover" role="menu" aria-label="More station tools">
+                            <button id="open-send-system-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Send System Message</button>
+                            <button id="open-speak-common-room-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Speak in Common Room</button>
+                            <button id="update-station-config-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Update Station Config</button>
+                            <button id="open-api-runtime-config-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Set API Keys</button>
+                            <button id="create-backup-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Backup</button>
+                            <button id="open-direct-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Intervene</button>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            
-
-            <div id="dashboard-status-messages" class="mt-auto p-3 glass-surface rounded-md text-sm text-slate-300 min-h-[50px] border border-slate-600">
+            <div id="dashboard-status-messages" class="dashboard-status-overlay is-hidden p-3 glass-surface rounded-md text-sm text-slate-300 border border-slate-600" role="status" aria-live="polite" aria-label="Dashboard status. Click to dismiss." aria-hidden="true" tabindex="-1">
                 UI status messages will appear here...
             </div>
         </aside>
 
-        <main class="lg:w-2/3 xl:w-3/4 glass-surface p-6 rounded-xl shadow-2xl flex flex-col overflow-hidden">
+        <main class="dashboard-main glass-surface shadow-2xl flex flex-col overflow-hidden">
             <div class="flex justify-between items-center mb-4 border-b border-slate-700 pb-2">
                 <h2 id="log-view-title" class="text-xl font-semibold text-sky-400">Global Notifications</h2>
-                <div class="flex gap-2">
-                    <button id="load-full-history-button" class="text-xs bg-indigo-600 hover:bg-indigo-500 py-1 px-3 rounded-md transition-colors hidden">Load Full Response</button>
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                    <select id="history-window-selector" class="text-xs bg-slate-800 border border-slate-700 text-slate-200 py-1 px-2 rounded-md">
+                        <option value="recent">Recent 50 ticks</option>
+                        <option value="earliest">Earliest 50 ticks</option>
+                    </select>
+                    <div id="log-display-mode-controls" class="flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900/70 p-1">
+                        <button id="log-mode-full-button" class="text-xs bg-slate-800 hover:bg-slate-700 py-1 px-3 rounded-md transition-colors" data-log-mode="full">Full</button>
+                        <button id="log-mode-collapsed-button" class="text-xs bg-slate-800 hover:bg-slate-700 py-1 px-3 rounded-md transition-colors" data-log-mode="collapsed">Collapsed</button>
+                    </div>
+                    <button id="toggle-agent-log-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md transition-colors">Collapse Agent</button>
+                    <button id="toggle-station-log-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md transition-colors">Collapse Station</button>
+                    <button id="copy-system-prompt-button" class="text-xs bg-sky-600 hover:bg-sky-500 py-1 px-3 rounded-md transition-colors" disabled>Copy System Prompt</button>
+                    <button id="load-full-history-button" class="text-xs bg-indigo-600 hover:bg-indigo-500 py-1 px-3 rounded-md transition-colors hidden">Load Full History</button>
                     <button id="clear-log-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md">Clear Current View</button>
                 </div>
             </div>
@@ -188,7 +244,7 @@
             </div>
 
             <div class="text-center -mt-1 -mb-4">
-                <p class="text-xs text-slate-500 opacity-70">© 2025 DualverseAI</p>
+                <p class="text-xs text-slate-500 opacity-70">© 2026 DualverseAI</p>
             </div>
         </main>
     </div>
@@ -211,7 +267,6 @@
                             <option value="Gemini">Google Gemini</option>
                             <option value="Claude">Anthropic Claude</option>
                             <option value="OpenAI">OpenAI</option>
-                            <option value="Ollama">Ollama (OpenAI-compatible)</option>
                             <option value="Grok">Grok</option>
                         </select>
                     </div>
@@ -222,6 +277,10 @@
                     <div>
                         <label for="api-agent-name" class="block text-sm font-medium text-slate-400 mb-1">Agent Name (Optional):</label>
                         <input type="text" id="api-agent-name" name="agent_name" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="Auto-generated if blank">
+                    </div>
+                    <div>
+                        <label for="api-agent-count" class="block text-sm font-medium text-slate-400 mb-1">Number of Agents:</label>
+                        <input type="number" id="api-agent-count" name="agent_count" min="1" step="1" value="1" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3">
                     </div>
                     <div>
                         <label for="api-agent-type" class="block text-sm font-medium text-slate-400 mb-1">Agent Type:</label>
@@ -257,8 +316,8 @@
                         </div>
                     </div>
                     <div class="mt-4">
-                        <label for="api-llm-system-prompt" class="block text-sm font-medium text-slate-400 mb-1">System Prompt:</label>
-                        <textarea id="api-llm-system-prompt" name="llm_system_prompt" rows="3" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3 resize-y" placeholder="Enter system prompt for the LLM..."></textarea>
+                        <label for="api-llm-system-prompt" class="block text-sm font-medium text-slate-400 mb-1">Role Definition:</label>
+                        <textarea id="api-llm-system-prompt" name="llm_system_prompt" rows="3" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3 resize-y" placeholder="Enter a role definition for the agent..."></textarea>
                     </div>
                     <!-- OpenAI-specific parameters -->
                     <div id="openai-specific-params" class="mt-4 hidden">
@@ -292,7 +351,6 @@
                     </div>
                 </div>
                 <div class="flex justify-end gap-3 mt-8">
-                    <button type="button" id="cancel-create-api-agent-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
                     <button type="submit" class="bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 px-4 rounded-md">Create Agent</button>
                 </div>
             </form>
@@ -302,16 +360,19 @@
     <div id="direct-message-modal" class="modal">
         <div class="modal-content glass-elevated text-slate-300">
             <span class="close-button" id="close-direct-message-modal-button">&times;</span>
-            <h3 id="direct-message-modal-title" class="text-xl font-semibold mb-4 text-sky-400">Send Direct Message</h3>
-            <p class="mb-1 text-sm">To: <strong id="direct-message-modal-agent-name" class="text-teal-300">N/A</strong></p>
-            <p id="direct-message-modal-description" class="mb-4 text-xs text-slate-400">Your message will be sent directly to the agent.</p>
+            <h3 id="direct-message-modal-title" class="text-xl font-semibold mb-4 text-sky-400">Intervene With Agent</h3>
+            <div class="mb-4">
+                <label for="direct-message-agent-selector" class="block text-sm font-medium text-slate-400 mb-1">Select Target Agent:</label>
+                <select id="direct-message-agent-selector" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200">
+                </select>
+            </div>
+            <p id="direct-message-modal-description" class="mb-4 text-xs text-slate-400">Your message below will be sent directly to the agent. This is highly discouraged because it can disrupt the agent's normal station workflow. Ended agents are usually fine.</p>
             <div>
-                <label for="direct-message-input" class="block text-sm font-medium text-slate-400 mb-1">Your Message:</label>
-                <textarea id="direct-message-input" rows="5" class="w-full p-3 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y placeholder-slate-400" placeholder="Type your message to the agent..."></textarea>
+                <label for="direct-message-input" class="block text-sm font-medium text-slate-400 mb-1">Intervention:</label>
+                <textarea id="direct-message-input" rows="5" class="w-full p-3 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y placeholder-slate-400" placeholder="Type your intervention..."></textarea>
             </div>
             <div class="flex justify-end gap-3 mt-6">
-                <button id="cancel-direct-message-button" type="button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
-                <button id="confirm-send-direct-message-button" type="button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send Message</button>
+                <button id="confirm-send-direct-message-button" type="button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send Intervention</button>
             </div>
             <div id="direct-message-response-area" class="mt-4 p-3 glass-surface border border-slate-600 rounded-md text-sm hidden min-h-[50px]">
                 <p class="font-semibold mb-1 text-teal-300">Agent's Response:</p>
@@ -327,6 +388,13 @@
             <h3 class="text-xl font-semibold mb-4 text-sky-400">Resolve Human Request</h3>
 
             <div class="mb-4">
+                <div id="request-selector-wrapper" class="mb-3 hidden">
+                    <label for="request-selector" class="block text-sm font-medium text-slate-400 mb-1">Pending Requests:</label>
+                    <select id="request-selector"
+                        class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-amber-500 focus:border-amber-500 text-slate-200">
+                    </select>
+                    <p class="text-xs text-slate-500 mt-1">Select a request to review before resolving.</p>
+                </div>
                 <div class="glass-surface p-3 rounded-md border border-slate-600">
                     <div class="grid grid-cols-2 gap-2 text-sm mb-3">
                         <div>
@@ -369,10 +437,6 @@
             </div>
 
             <div class="flex justify-end gap-3">
-                <button id="cancel-resolve-request-button" type="button"
-                    class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">
-                    Cancel
-                </button>
                 <button id="confirm-resolve-request-button" type="button"
                     class="bg-amber-600 hover:bg-amber-500 text-white font-semibold py-2 px-4 rounded-md">
                     Resolve Request
@@ -400,11 +464,105 @@
             <div class="mb-6">
                 <label for="system-message-content" class="block text-sm font-medium text-slate-400 mb-1">Message Content:</label>
                 <textarea id="system-message-content" name="message_content" rows="6" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y" placeholder="Enter the system message..."></textarea>
+                <label class="mt-3 flex items-center gap-2 text-sm text-slate-300">
+                    <input type="checkbox" id="system-message-architect-checkbox" class="rounded border-slate-600 bg-slate-700 text-teal-500 focus:ring-teal-500">
+                    <span>Mark as architect message (not prunable by agent)</span>
+                </label>
             </div>
 
             <div class="flex justify-end gap-3">
-                <button type="button" id="cancel-send-system-message-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
                 <button type="button" id="confirm-send-system-message-button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send Message</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="temporal-chat-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 temporal-chat-modal-content">
+            <span class="close-button" id="close-temporal-chat-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-2 text-sky-400">Chat</h3>
+            <p class="text-xs text-slate-500 mb-3">
+                This branched chat will not disrupt the agent's Station workflow. To clear the current chat and start fresh, click Branch Again. To branch from a specific Station tick instead of the current one, enter that tick before branching.
+            </p>
+
+            <div class="mb-3 temporal-chat-transcript-wrapper">
+                <div class="temporal-chat-dialogue-header">
+                    <label id="temporal-chat-base-tick" class="block text-sm font-medium text-slate-400">Dialogue (not started):</label>
+                    <div class="temporal-chat-copy-controls">
+                        <button type="button" id="copy-temporal-chat-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md transition-colors">Copy</button>
+                        <button type="button" id="copy-temporal-chat-without-thinking-button" class="text-xs bg-slate-700 hover:bg-slate-600 py-1 px-3 rounded-md transition-colors">Copy Without Thinking</button>
+                    </div>
+                </div>
+                <div id="temporal-chat-transcript" class="w-full bg-slate-800 border border-slate-700 rounded-md p-3 overflow-y-auto text-sm"></div>
+            </div>
+
+            <div class="mb-4">
+                <textarea id="temporal-chat-input" rows="4" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200 resize-y" placeholder="Enter your message..."></textarea>
+            </div>
+
+            <div class="temporal-chat-actions">
+                <div class="temporal-chat-agent-control temporal-chat-agent-select-control">
+                    <label for="temporal-chat-agent-selector" class="text-sm font-medium text-slate-400 whitespace-nowrap">To Agent:</label>
+                    <select id="temporal-chat-agent-selector" class="p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200">
+                    </select>
+                </div>
+                <div class="temporal-chat-agent-control temporal-chat-branch-control">
+                    <label for="temporal-chat-branch-tick-input" class="text-sm font-medium text-slate-400 whitespace-nowrap">Branch Tick:</label>
+                    <input id="temporal-chat-branch-tick-input" type="number" min="0" step="1" class="w-28 p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-teal-500 focus:border-teal-500 text-slate-200" placeholder="Current">
+                </div>
+                <div class="temporal-chat-action-buttons">
+                    <button type="button" id="branch-temporal-chat-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Branch</button>
+                    <button type="button" id="confirm-temporal-chat-send-button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="archive-papers-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 archive-papers-modal-content">
+            <span class="close-button" id="close-archive-papers-modal-button">&times;</span>
+            <div id="archive-papers-list-view" class="archive-papers-pane">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4 pr-12">
+                    <div>
+                        <h3 class="text-xl font-semibold text-sky-400">Archive Papers</h3>
+                        <p class="text-xs text-slate-500 mt-1">Scrollable table. Click any row to open the paper in rendered markdown.</p>
+                    </div>
+                    <div class="flex gap-3">
+                        <button type="button" id="copy-all-archive-abstracts-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Copy All Abstracts</button>
+                    </div>
+                </div>
+                <div class="archive-table-shell">
+                    <table class="archive-papers-table">
+                        <thead>
+                            <tr>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="numeric_id">ID</button></th>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="title">Title</button></th>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="author">Author</button></th>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="accepted_tick">Accepted Tick</button></th>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="reviewer_score">Reviewer Score</button></th>
+                                <th><button type="button" class="archive-sort-button" data-sort-key="word_count">Words</button></th>
+                            </tr>
+                        </thead>
+                        <tbody id="archive-papers-table-body">
+                            <tr>
+                                <td colspan="6" class="archive-empty-state">Loading archive papers...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="archive-paper-detail-view" class="archive-papers-pane hidden">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
+                    <div>
+                        <h3 id="archive-paper-detail-title" class="text-xl font-semibold text-sky-400">Archive Paper</h3>
+                        <p id="archive-paper-detail-meta" class="text-xs text-slate-500 mt-1"></p>
+                    </div>
+                    <div class="flex gap-3">
+                        <button type="button" id="back-to-archive-papers-list-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Back to List</button>
+                        <button type="button" id="copy-archive-paper-markdown-button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Copy Markdown</button>
+                    </div>
+                </div>
+                <div id="archive-paper-markdown-container" class="archive-paper-markdown markdown-content-host"></div>
             </div>
         </div>
     </div>
@@ -425,7 +583,6 @@
             </div>
 
             <div class="flex justify-end gap-3">
-                <button type="button" id="cancel-speak-common-room-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
                 <button type="button" id="confirm-speak-common-room-button" class="bg-purple-600 hover:bg-purple-500 text-white font-semibold py-2 px-4 rounded-md">Speak</button>
             </div>
         </div>
@@ -440,6 +597,11 @@
                 <div class="mb-4">
                     <label for="update-station-id" class="block text-sm font-medium text-slate-400 mb-1">Station ID (read-only):</label>
                     <input type="text" id="update-station-id" readonly class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm text-slate-300 cursor-not-allowed opacity-75" placeholder="Loading...">
+                </div>
+
+                <div class="mb-4">
+                    <label for="update-station-sync-mode" class="block text-sm font-medium text-slate-400 mb-1">Sync Mode (read-only):</label>
+                    <input type="text" id="update-station-sync-mode" readonly class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm text-slate-300 cursor-not-allowed opacity-75" placeholder="Loading...">
                 </div>
 
                 <div class="mb-4">
@@ -461,8 +623,27 @@
                 </div>
 
                 <div class="flex justify-end gap-3">
-                    <button type="button" id="cancel-update-station-config-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Cancel</button>
                     <button type="submit" id="confirm-update-station-config-button" class="bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2 px-4 rounded-md">Update Configuration</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="api-runtime-config-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300">
+            <span class="close-button" id="close-api-runtime-config-modal-button">&times;</span>
+            <h3 class="text-xl font-semibold mb-6 text-sky-400">Set API Keys</h3>
+
+            <form id="api-runtime-config-form">
+                <div class="mb-4">
+                    <label for="api-runtime-target-select" class="block text-sm font-medium text-slate-400 mb-1">Target</label>
+                    <select id="api-runtime-target-select" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 text-slate-200"></select>
+                </div>
+
+                <div id="api-runtime-config-body" class="space-y-4"></div>
+
+                <div class="flex justify-end gap-3 mt-6">
+                    <button type="submit" id="save-api-runtime-config-button" class="bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2 px-4 rounded-md">Save</button>
                 </div>
             </form>
         </div>
@@ -471,10 +652,10 @@
     <script>
         // Configuration for API base path (empty for standard deployment)
         window.STATION_CONFIG = {
-            apiBasePath: ""
+            apiBasePath: "",
+            modelPresets: {{ model_presets|tojson }}
         };
     </script>
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
-    <script src="{{ url_for('static', filename='js/model_presets.js') }}"></script>
 </body>
 </html>

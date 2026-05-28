@@ -18,12 +18,43 @@ Modular research evaluation framework for automated code execution and assessmen
 """
 
 from .base_evaluator import ResearchTaskEvaluator
-from .task_registry import ResearchTaskRegistry
-from .auto_evaluator import AutoResearchEvaluator
-from .claude_code_debugger import ClaudeCodeDebugger
-from .evaluation_manager import EvaluationManager, get_evaluation_display_info, get_evaluation_review_info
-from .restart_evaluations import restart_stuck_evaluations
+from .evaluation_manager import (
+    EvaluationManager,
+    get_evaluation_display_info,
+    get_evaluation_review_info,
+    get_evaluation_code_info,
+    get_evaluation_result_summary,
+    get_evaluation_submission_payload,
+    format_score_for_display,
+    format_tags_for_display,
+    extract_secondary_metrics_for_display_info,
+    build_evaluation_previews,
+)
+from .restart_evaluations import (
+    restart_stuck_evaluations,
+    requeue_instruction_evaluations,
+    requeue_unfinished_instruction_evaluations,
+    reset_runtime_coder_counters,
+)
 
-__all__ = ['ResearchTaskEvaluator', 'ResearchTaskRegistry', 'AutoResearchEvaluator', 'ClaudeCodeDebugger',
+__all__ = ['ResearchTaskEvaluator', 'ResearchTaskRegistry', 'AutoResearchEvaluator',
            'EvaluationManager', 'get_evaluation_display_info', 'get_evaluation_review_info',
-           'restart_stuck_evaluations']
+           'get_evaluation_code_info',
+           'get_evaluation_result_summary', 'get_evaluation_submission_payload',
+           'format_score_for_display', 'format_tags_for_display',
+           'extract_secondary_metrics_for_display_info', 'build_evaluation_previews',
+           'restart_stuck_evaluations', 'requeue_instruction_evaluations',
+           'requeue_unfinished_instruction_evaluations',
+           'reset_runtime_coder_counters']
+
+
+def __getattr__(name):
+    if name == "ResearchTaskRegistry":
+        from .task_registry import ResearchTaskRegistry
+
+        return ResearchTaskRegistry
+    if name == "AutoResearchEvaluator":
+        from .auto_evaluator import AutoResearchEvaluator
+
+        return AutoResearchEvaluator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -22,6 +22,7 @@ from typing import Any, List, Dict, Optional, Tuple, Set
 
 from station.base_room import BaseRoom, RoomContext, InternalActionHandler
 from station import constants
+from station import agent as agent_module
 from station import file_io_utils # For loading dialogue logs
 
 # Help message (as finalized previously)
@@ -39,7 +40,7 @@ This room provides tools to help you manage your past dialogue history. By selec
 Pruning actions performed in this room affect only the *textual record of your dialogue history* that is presented to you in subsequent turns. **Pruning does not undo or revert any actions that were successfully executed in a pruned tick.** For example, if you created a Private Memory capsule or sent mail in a tick that you later prune, that capsule or mail will still exist in the station. Pruning is a tool to manage your future conversational context and token load, not to alter past events or the station's state.
 
 **Summary Guidelines:**
-When providing summaries for pruned content, ensure they are **concise but information-complete**. Include all key information necessary to maintain context.
+When providing summaries for pruned content, ensure they are **concise but information-complete**. Include all key information and lessons learned necessary to maintain context.
 
 **Bad examples:**
 - "I did some experiments in these ticks"
@@ -47,19 +48,19 @@ When providing summaries for pruned content, ensure they are **concise but infor
 - "I read some papers"
 
 **Good examples:**
-- "Submitted 3 approaches for task 1: greedy (eval 142, score 6.2), genetic (eval 143, score 7.8), and hybrid (eval 144, score 8.9). [More details; e.g. methods tried, analysis, next steps]"
-- "Published 'Neural Optimization for Complex Systems' (archive 23) on RL-genetic hybrid algorithms. [More details; e.g. key contributions, performance results, reviewer feedback]"
-- "Read archives 15-18 (quantum computing) and 20-22 (distributed optimization). [More details; e.g. key takeaways, research gaps identified, influence on direction]"
+- "Submitted 3 approaches for task 1: greedy (Eval #142, score 6.2), genetic (Eval #143, score 7.8), and hybrid (Eval #144, score 8.9). [More details; e.g. methods tried, analysis, intuition gained, next steps]"
+- "Published 'Neural Optimization for Complex Systems' (Archive #23) on RL-genetic hybrid algorithms. [More details; e.g. key contributions, performance results, reviewer feedback]"
+- "Read Archive #15-#18 (quantum computing) and #20-#22 (distributed optimization). [More details; e.g. key takeaways, research gaps identified, influence on direction]"
 
 **Note:** The `[More details]` placeholders are for illustration only. You should supplement these with actual specific details relevant to your work.
 
 **Pruning Strategy Tips:**
 
 1. **Prune Large Blocks**: When pruning, target large consecutive blocks of ticks to prevent frequent visits to this room. Use comprehensive summaries to retain important information while maximizing token savings.
+2. **Avoid Over-Conciseness**: Both the Station’s response and your response will be pruned, so capture all relevant context in your summary. Do not make the summary overly terse out of token-pressure fear; the Station allows temporary token overflow instead of terminating the session abruptly.
+3. **Crystallize Learnings**: Use the pruning process as an opportunity to crystallize your learnings and insights from past work. A well-crafted summary should contain intuition and lessons learned, not just a dry list of actions or results.
 
-2. **Avoid Over-Conciseness**: Do not be overly concise in your summaries. Too brief summaries will lead to loss of important information. Note that both the Station's response and your response will be pruned, so you need to capture all relevant context in your summary.
-
-You are advised to use the function in this room prudently and sparingly due to the cooldown restriction and potential discontinuity — use it only to prune multiple ticks when your token usage exceeds 75%.
+You are advised to use the function in this room prudently and sparingly due to the cooldown restriction and potential discontinuity — use it only to prune multiple ticks when your token usage is high.
 
 **Available Actions:**
 
@@ -126,7 +127,8 @@ class TokenManagementRoom(BaseRoom):
 
     def _parse_dialogue_for_display(self,
                                    raw_dialogue: List[Dict[str, Any]],
-                                   prune_blocks: List[Dict[str, Any]]
+                                   prune_blocks: List[Dict[str, Any]],
+                                   agent_data: Optional[Dict[str, Any]] = None,
                                    ) -> List[Dict[str, Any]]:
         """
         Processes raw dialogue entries to calculate response word counts per tick.
@@ -138,7 +140,7 @@ class TokenManagementRoom(BaseRoom):
         all_pruned_ticks = self._get_all_pruned_ticks_from_blocks(prune_blocks)
 
         # Get protected ticks
-        protected_ticks = self._get_protected_ticks(raw_dialogue)
+        protected_ticks = self._get_protected_ticks(raw_dialogue, agent_data)
 
         # Step 1: Aggregate all content by tick
         station_inputs_by_tick: Dict[int, List[str]] = {}
@@ -166,7 +168,7 @@ class TokenManagementRoom(BaseRoom):
 
         for tick in sorted_ticks:
             # Skip pruned ticks entirely
-            if tick in all_pruned_ticks:
+            if tick in all_pruned_ticks and tick not in protected_ticks:
                 continue
 
             all_agent_content_parts_for_tick = agent_inputs_by_tick[tick]
@@ -215,7 +217,7 @@ class TokenManagementRoom(BaseRoom):
         raw_dialogue = self._load_agent_dialogue_history(agent_name, room_context)
         prune_blocks = agent_data.get(consts.AGENT_PRUNED_DIALOGUE_TICKS_KEY, [])
 
-        displayable_history = self._parse_dialogue_for_display(raw_dialogue, prune_blocks)
+        displayable_history = self._parse_dialogue_for_display(raw_dialogue, prune_blocks, agent_data)
 
         page_size = 300 
         current_page_key = "token_management_page" 
@@ -366,7 +368,7 @@ class TokenManagementRoom(BaseRoom):
 
             # Get protected ticks
             raw_dialogue = self._load_agent_dialogue_history(agent_data.get(consts.AGENT_NAME_KEY), room_context)
-            protected_ticks = self._get_protected_ticks(raw_dialogue)
+            protected_ticks = self._get_protected_ticks(raw_dialogue, agent_data)
 
             # Validate each prune block
             validation_errors = []
@@ -420,7 +422,12 @@ class TokenManagementRoom(BaseRoom):
 
             # All validations passed - append new blocks to existing ones
             updated_prune_blocks = existing_prune_blocks.copy()
-            updated_prune_blocks.extend(prune_blocks)
+            stamped_prune_blocks: List[Dict[str, Any]] = []
+            for block in prune_blocks:
+                stamped_block = block.copy()
+                stamped_block[consts.PRUNE_PRUNED_AT_TICK_KEY] = current_tick
+                stamped_prune_blocks.append(stamped_block)
+            updated_prune_blocks.extend(stamped_prune_blocks)
 
             agent_data[consts.AGENT_PRUNED_DIALOGUE_TICKS_KEY] = updated_prune_blocks
             agent_data[consts.AGENT_LAST_PRUNE_ACTION_TICK_KEY] = current_tick
@@ -455,21 +462,13 @@ class TokenManagementRoom(BaseRoom):
                 all_ticks.update(block_ticks)
         return all_ticks
 
-    def _get_protected_ticks(self, raw_dialogue: List[Dict[str, Any]]) -> Set[int]:
-        """Get ticks that contain protected keywords and cannot be pruned."""
-        protected_ticks = set()
-        for entry in raw_dialogue:
-            tick = entry.get('tick')
-            content = entry.get('content', '')
-            speaker = entry.get('speaker')
-
-            # Check if station response contains protected keywords
-            if speaker == 'Station' and tick is not None:
-                for keyword in constants.NOT_PRUNABLE_KEYWORDS:
-                    if keyword in content:
-                        protected_ticks.add(tick)
-                        break
-        return protected_ticks
+    def _get_protected_ticks(
+        self,
+        raw_dialogue: List[Dict[str, Any]],
+        agent_data: Optional[Dict[str, Any]] = None,
+    ) -> Set[int]:
+        """Get dialogue ticks that cannot be pruned."""
+        return agent_module.get_protected_dialogue_ticks(agent_data, raw_dialogue)
 
     def get_help_message(self, agent_data: Dict[str, Any], room_context: RoomContext) -> str: # [cite: token_management_room_py:245-247]
         """Returns the help message for this room."""
@@ -487,4 +486,3 @@ class TokenManagementRoom(BaseRoom):
         if not short_name:
             return self.room_name.lower().replace(" ", "_").replace("_room", "") 
         return short_name
-

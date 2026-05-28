@@ -58,6 +58,58 @@ class ActionParser:
         self.neutralized_action_prefix = "_action{" 
 
         self.thought_block_pattern_compiled = constants.THOUGHT_BLOCK_PATTERN
+        self.yaml_open_fence_pattern = re.compile(r"^([ \t]*)```yaml\b")
+        self.yaml_close_fence_pattern = re.compile(r"^([ \t]*)```(.*)$")
+
+    def _split_line_end(self, line: str) -> Tuple[str, str]:
+        if line.endswith("\r\n"):
+            return line[:-2], "\r\n"
+        if line.endswith("\n"):
+            return line[:-1], "\n"
+        if line.endswith("\r"):
+            return line[:-1], "\r"
+        return line, ""
+
+    def _normalize_yaml_block_closings(self, text: str) -> str:
+        """
+        Ensure closing ``` in YAML blocks is on its own line.
+        If a closing fence has trailing text, move that text to the next line.
+        """
+        lines = text.splitlines(keepends=True)
+        output_lines = []
+        in_yaml_block = False
+        yaml_open_indent = ""
+
+        for line in lines:
+            body, line_ending = self._split_line_end(line)
+            if not in_yaml_block:
+                output_lines.append(line)
+                open_match = self.yaml_open_fence_pattern.match(body)
+                if open_match:
+                    in_yaml_block = True
+                    yaml_open_indent = open_match.group(1)
+                continue
+
+            close_match = self.yaml_close_fence_pattern.match(body)
+            if close_match:
+                indent = close_match.group(1)
+                trailing = close_match.group(2)
+                if indent == yaml_open_indent or indent == "":
+                    if trailing.strip():
+                        default_ending = line_ending if line_ending else "\n"
+                        output_lines.append(f"{indent}```{default_ending}")
+                        if trailing.startswith(" "):
+                            trailing = trailing[1:]
+                        output_lines.append(f"{trailing}{line_ending or ''}")
+                    else:
+                        output_lines.append(line)
+                    in_yaml_block = False
+                else:
+                    output_lines.append(line)
+            else:
+                output_lines.append(line)
+
+        return "".join(output_lines)
 
     def _neutralize_actions_in_yaml_blocks(self, text: str) -> str:
         output_parts = []
@@ -99,7 +151,8 @@ class ActionParser:
                 data[constants.TAGS_KEY] = [str(tag).strip() for tag in tags_value if str(tag).strip()]
 
     def parse(self, response_text: str) -> List[ParsedActionInfo]:
-        processed_response_text = self._neutralize_actions_in_yaml_blocks(response_text)
+        processed_response_text = self._normalize_yaml_block_closings(response_text)
+        processed_response_text = self._neutralize_actions_in_yaml_blocks(processed_response_text)
         processed_response_text = self._remove_blocks(
             processed_response_text, self.thought_block_pattern_compiled
         )
@@ -200,7 +253,7 @@ if __name__ == '__main__':
 
     test_cases = [
         (f"  {parser.action_prefix}{{goto lobby}}", "Plain action", "goto", "lobby", None, None),
-        (f"`{parser.action_prefix}{{help test}}`", "Action with backticks", "help", "test", None, None),
+        (f"`{parser.action_prefix}{{help lobby}}`", "Action with backticks", "help", "lobby", None, None),
         (f"  `{parser.action_prefix}{{create}}`\n```yaml\ntitle: Test\n```", "Action with backticks and YAML", "create", None, {"title": "Test"}, None),
         (f"{parser.action_prefix}{{speak}}\n  ```yaml\n  message: Hello\n  ```", "Action no backticks, indented YAML", "speak", None, {"message": "Hello"}, None),
         (f"Not an action: {parser.action_prefix}{{ignored}}", "Mid-line action (ignored)", None, None, None, None),

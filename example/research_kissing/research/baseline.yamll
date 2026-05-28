@@ -1,0 +1,90 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: "Stochastic SoftMin(d^2) + Exponential Beta Annealing + Langevin Grad-Noise (4-tuple margins)"
+tags: ['baseline', 'softmin', 'annealing', 'langevin-noise', 'projection', 'gradient descent']
+abstract: "Baseline copied from a strong historical agent submission (previous station generation): SoftMin(d^2) surrogate, exponential beta annealing, decaying Langevin gradient noise, strict projection, and pre-update margin return."
+content: |
+  import jax
+  import jax.numpy as jnp
+  import optax
+  
+  # This baseline was submitted by an agent in a previous station generation.
+  
+  N = 593
+  MAX_STEPS = 1_000_000.0
+  
+  def _define_hyperparameters():
+      from ray import tune
+      return {
+          "learning_rate": tune.loguniform(1e-3, 1e-2),
+          "init_scale": tune.uniform(0.3, 0.7),
+          "beta_start": tune.uniform(5.0, 15.0),
+          "beta_end": tune.uniform(200.0, 400.0),
+          "noise_scale": tune.loguniform(1e-5, 1e-3),
+          "noise_decay": tune.uniform(0.5, 1.0),
+      }
+  
+  def _get_optimizer(hparams):
+      return optax.adam(hparams["learning_rate"])
+  
+  def _get_init_fn(hparams):
+      init_scale = hparams["init_scale"]
+      def init_fn(key, shape, dtype=jnp.float32):
+          # Keep scale DOF in params; normalization happens inside the loss.
+          return jax.random.normal(key, shape, dtype=dtype) * init_scale
+      return init_fn
+  
+  def _update_func(sphere_centers, opt_state, global_step, rng,
+                   optimizer, constraints_data, hparams):
+      step = jnp.asarray(global_step, dtype=jnp.float32)
+      progress = jnp.clip(step / MAX_STEPS, 0.0, 1.0)
+  
+      # Exponential annealing schedule (liquid -> solid).
+      beta = hparams["beta_start"] * jnp.power(hparams["beta_end"] / hparams["beta_start"], progress)
+  
+      # Decaying gradient noise (vanishes as we solidify).
+      current_noise = hparams["noise_scale"] * jnp.power(1.0 - progress, hparams["noise_decay"])
+  
+      def loss_and_margins(params):
+          # Normalize inside the loss (matches intended geometry).
+          norms = jnp.linalg.norm(params, axis=-1, keepdims=True)
+          norms = jnp.maximum(norms, 1e-10)
+          u = params / norms  # (B,N,11), approximately unit vectors
+  
+          # Pairwise dots and squared distances on the unit sphere: d^2 = 2 - 2 dot.
+          dots = jnp.einsum("bid,bjd->bij", u, u)  # (B,N,N)
+          d2 = 2.0 - 2.0 * dots
+  
+          # Mask diagonal (self-distances).
+          eye = jnp.eye(N, dtype=d2.dtype)[None, :, :]
+          d2_masked = d2 + eye * 1e6
+  
+          # SoftMin loss: (1/beta) log sum exp(-beta * d^2)  ~  -min(d^2) + const/beta
+          flat = d2_masked.reshape((d2_masked.shape[0], -1))
+          loss_per = jax.nn.logsumexp(-beta * flat, axis=1) / jnp.maximum(beta, 1e-6)
+          loss = jnp.mean(loss_per)
+  
+          # Exact pre-update margins for runner best-tracking (hard max-dot).
+          mask = ~jnp.eye(N, dtype=bool)
+          masked_dots = jnp.where(mask[None, :, :], dots, -jnp.inf)
+          max_dot = jnp.max(masked_dots, axis=(1, 2))  # (B,)
+          margins = jnp.sqrt(jnp.maximum(2.0 - 2.0 * max_dot, 1e-20)) - 1.0
+  
+          return loss, margins
+  
+      (loss, pre_update_margins), grads = jax.value_and_grad(loss_and_margins, has_aux=True)(sphere_centers)
+  
+      # Langevin-style noise in gradient space.
+      grads = grads + jax.random.normal(rng, grads.shape, dtype=grads.dtype) * current_noise
+  
+      updates, opt_state = optimizer.update(grads, opt_state, sphere_centers)
+      sphere_centers = optax.apply_updates(sphere_centers, updates)
+  
+      # Strict projection after update (as in Metis Archive #1).
+      sphere_centers = sphere_centers / jnp.maximum(jnp.linalg.norm(sphere_centers, axis=-1, keepdims=True), 1e-8)
+  
+      return sphere_centers, opt_state, loss, pre_update_margins

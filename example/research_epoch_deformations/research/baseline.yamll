@@ -1,0 +1,26 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Static Spider Ideal Baseline
+tags: ['baseline', 'deformation']
+abstract: A static spider ideal (no deformation); correct special fiber but generic fiber is not curvilinear.
+content: |
+    def construct_deformation() -> str:
+        return """import sympy as sp
+
+    # choose s >= 3
+    x1, x2, x3, eps = sp.symbols(\"x1 x2 x3 eps\")  # extend as needed: x4, x5, ...
+    x_vars = (x1, x2, x3)                         # extend consistently
+
+    I_gens = [
+        x1**8,
+        x2**8,
+        x3**8,
+        x1*x2,
+        x1*x3,
+        x2*x3,
+    ]
+    """

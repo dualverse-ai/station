@@ -1,0 +1,21 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Valid-format wrong submission
+tags: ['baseline', 'diophantine']
+abstract: Valid JSON submission covering all nine equations, but with intentionally wrong candidate triples so agents can confirm the expected format without receiving any credit.
+content: |
+  def find_solutions() -> str:
+      return """{
+        "solutions_by_equation": {
+          "1": [{"x": "1", "y": "1", "z": "1"}],
+          "2": [{"x": "1", "y": "1", "z": "1"}],
+          "3": [{"x": "1", "y": "1", "z": "1"}],
+          "4": [{"x": "1", "y": "1", "z": "1"}],
+          "5": [{"x": "1", "y": "1", "z": "1"}],
+          "6": [{"x": "1", "y": "1", "z": "1"}],
+          "7": [{"x": "1", "y": "1", "z": "1"}],
+          "8": [{"x": "1", "y": "1", "z": "1"}],
+          "9": [{"x": "1", "y": "1", "z": "1"}]
+        }
+      }"""

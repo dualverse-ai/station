@@ -14,6 +14,7 @@
 
 import os
 import requests
+from urllib.parse import urlparse
 from typing import Dict, Any, Optional, List, Tuple
 
 from xai_sdk import Client
@@ -21,6 +22,7 @@ from xai_sdk.chat import user, system, assistant
 
 from station import file_io_utils
 from station import constants
+from station import runtime_api_config
 from .base import (
     BaseLLMConnector,
     LLMConnectorError,
@@ -41,24 +43,94 @@ class GrokConnector(BaseLLMConnector):
                  max_retries: int = constants.LLM_MAX_RETRIES,
                  retry_delay_seconds: int = constants.LLM_RETRY_DELAY_SECONDS):
 
+        self.api_runtime_provider_id = "grok"
+        self.api_runtime_env_names = ("XAI_API_KEY", "XAI_BASE_URL")
+        self._api_runtime_config_snapshot = runtime_api_config.get_config_snapshot([
+            "XAI_API_KEY",
+            "XAI_BASE_URL",
+        ], provider_id="grok")
+        snapshot_env = self._api_runtime_config_snapshot.get("env", {})
         super().__init__(model_name, agent_name, agent_data_path,
                          api_key, system_prompt, temperature, max_output_tokens,
                          max_retries, retry_delay_seconds)
 
-        if not self.api_key:
-            self.api_key = os.getenv("XAI_API_KEY")
+        if not self._explicit_api_key:
+            self.api_key = snapshot_env.get("XAI_API_KEY")
 
         if not self.api_key:
             raise LLMPermanentAPIError("XAI_API_KEY not provided or set in environment.")
 
         try:
-            self.client = Client(api_key=self.api_key)
+            self._configure_client_from_runtime_snapshot(self._api_runtime_config_snapshot)
         except Exception as e:
             raise LLMPermanentAPIError(f"Failed to initialize XAI client for {self.agent_name}: {e}", original_exception=e)
 
         self.history_messages: List[Dict[str, Any]] = []
         self._initialize_chat_session()
         print(f"GrokConnector for '{self.agent_name}' initialized with model: '{self.model_name}', temp: {self.temperature}, max_tokens: {self.max_output_tokens}.")
+
+    def _build_client_kwargs_from_runtime_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot_env = snapshot.get("env", {})
+        effective_api_key = self.api_key if self._explicit_api_key else snapshot_env.get("XAI_API_KEY")
+        if not effective_api_key:
+            raise LLMPermanentAPIError("XAI_API_KEY not provided or set in environment.")
+        client_kwargs: Dict[str, Any] = {"api_key": effective_api_key}
+        api_host = self._resolve_api_host_from_snapshot(snapshot)
+        if api_host:
+            client_kwargs["api_host"] = api_host
+        return client_kwargs
+
+    def _configure_client_from_runtime_snapshot(self, snapshot: Optional[Dict[str, Any]] = None) -> None:
+        if snapshot is None:
+            snapshot = runtime_api_config.get_config_snapshot([
+                "XAI_API_KEY",
+                "XAI_BASE_URL",
+            ], provider_id="grok")
+        snapshot_env = snapshot.get("env", {})
+        self._apply_runtime_proxy_snapshot(snapshot)
+        if not self._explicit_api_key:
+            self.api_key = snapshot_env.get("XAI_API_KEY")
+        if not self.api_key:
+            raise LLMPermanentAPIError("XAI_API_KEY not provided or set in environment.")
+        self._api_runtime_config_snapshot = snapshot
+        self.api_runtime_config_generation = int(snapshot.get("generation", 0))
+        self.client = Client(**self._build_client_kwargs_from_runtime_snapshot(snapshot))
+
+    def _refresh_runtime_api_config_if_changed(self) -> bool:
+        if runtime_api_config.get_generation() == self.api_runtime_config_generation:
+            return False
+        self._configure_client_from_runtime_snapshot()
+        self._initialize_chat_session()
+        return True
+
+    def _apply_provider_runtime_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self._configure_client_from_runtime_snapshot(snapshot)
+        self._initialize_chat_session()
+
+    def _run_provider_base_recovery_probe(self, snapshot: Dict[str, Any]) -> bool:
+        self._apply_runtime_proxy_snapshot(snapshot)
+        client = Client(**self._build_client_kwargs_from_runtime_snapshot(snapshot))
+        chat = client.chat.create(
+            model=self.model_name,
+            messages=[user("Reply with hi.")],
+            temperature=self.temperature,
+            max_tokens=16,
+        )
+        chat.sample()
+        return True
+
+    def _resolve_api_host(self) -> Optional[str]:
+        return self._resolve_api_host_from_snapshot(getattr(self, "_api_runtime_config_snapshot", {}))
+
+    def _resolve_api_host_from_snapshot(self, snapshot: Dict[str, Any]) -> Optional[str]:
+        snapshot_env = snapshot.get("env", {})
+        raw_base_url = snapshot_env.get("XAI_BASE_URL")
+        if not raw_base_url:
+            return None
+        raw_base_url = raw_base_url.strip()
+        parsed = urlparse(raw_base_url if "://" in raw_base_url else f"//{raw_base_url}")
+        host = parsed.netloc or parsed.path.split("/", 1)[0]
+        return host.strip("/") or None
 
     def _load_history_from_file(self) -> List[Dict[str, Any]]:
         history_for_filtering: List[Dict[str, Any]] = []

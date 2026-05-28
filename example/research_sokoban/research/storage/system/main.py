@@ -356,7 +356,7 @@ def simple_cpu_validation():
     # Initialize optimizer state
     opt_state = optimizer.init(params)
 
-    # Test training_step - let exceptions pass through for debugger
+    # Test training_step and let exceptions surface clearly
     new_params, new_opt_state = funcs['training_step'](
         network, optimizer, params, opt_state, dummy_batch, hparams
     )
@@ -379,7 +379,7 @@ def simple_cpu_validation():
         'trial_number': 0
     }
 
-    # Call complete function - let exceptions pass through for debugger
+    # Call complete function and let exceptions surface clearly
     funcs['complete'](params, opt_state, dummy_trial_data)
     print("✓ Complete function works")
 

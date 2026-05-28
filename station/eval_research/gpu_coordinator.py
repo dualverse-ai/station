@@ -346,12 +346,12 @@ class GPUCoordinator:
                     "mode": "in-memory"
                 }
 
-    def cleanup_stale_allocations(self, max_age_seconds: float = 3600):
+    def cleanup_stale_allocations(self, stale_run_seconds: float = 3600):
         """
-        Clean up allocations older than max_age_seconds.
+        Clean up allocations that have been held too long.
 
         Args:
-            max_age_seconds: Maximum age in seconds before considering allocation stale
+            stale_run_seconds: Age in seconds after which a run is assumed crashed and its slot reclaimed
         """
         if not self.coord_file or not os.path.exists(self.coord_file):
             return
@@ -368,7 +368,7 @@ class GPUCoordinator:
 
                     for key, info in data.get("allocations", {}).items():
                         age = current_time - info.get("start_time", current_time)
-                        if age > max_age_seconds:
+                        if age > stale_run_seconds:
                             removed_count += 1
                             print(f"GPUCoordinator: Removing stale allocation {key} "
                                   f"(age: {age:.1f}s, GPUs: {info.get('gpus')})")

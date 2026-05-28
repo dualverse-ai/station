@@ -209,6 +209,131 @@ def load_yaml_lines(filepath: str) -> List[Dict[str, Any]]:
     
     return entries
 
+def _build_tick_window_meta(
+    entries: List[Dict[str, Any]],
+    *,
+    window: str,
+    tick_limit: int,
+    saw_outside_window: bool,
+) -> Dict[str, Any]:
+    ticks = [entry.get("tick") for entry in entries if isinstance(entry, dict) and entry.get("tick") is not None]
+    unique_ticks = sorted(set(ticks))
+    min_tick = unique_ticks[0] if unique_ticks else None
+    max_tick = unique_ticks[-1] if unique_ticks else None
+    is_partial = bool(saw_outside_window)
+    return {
+        "mode": window,
+        "ticks": tick_limit,
+        "min_tick": min_tick,
+        "max_tick": max_tick,
+        "is_partial": is_partial,
+        "has_older": bool(is_partial and window == "recent"),
+        "has_newer": bool(is_partial and window == "earliest"),
+    }
+
+def _load_yaml_documents_from_text(text: str, filepath: str) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    try:
+        for doc_index, doc in enumerate(yaml.safe_load_all(text)):
+            if isinstance(doc, dict):
+                entries.append(doc)
+            elif doc is not None:
+                print(f"Warning: Skipped non-dictionary entry (document #{doc_index + 1}) in {filepath}: type was {type(doc)}")
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML Lines window from {filepath}: {e}")
+    return entries
+
+def load_yaml_lines_tick_window(
+    filepath: str,
+    *,
+    window: str = "recent",
+    tick_limit: int = 50,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Loads only the earliest or recent unique tick window from a YAML document log.
+
+    This avoids parsing the whole append-only dialogue log for common dashboard
+    views. It preserves chronological order in the returned entries.
+    """
+    if window not in {"recent", "earliest"}:
+        raise ValueError(f"Unsupported YAML lines tick window: {window}")
+    if tick_limit <= 0:
+        tick_limit = 50
+
+    if not os.path.exists(filepath):
+        return [], _build_tick_window_meta([], window=window, tick_limit=tick_limit, saw_outside_window=False)
+
+    if window == "earliest":
+        entries: List[Dict[str, Any]] = []
+        unique_ticks = set()
+        saw_outside_window = False
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for doc_index, doc in enumerate(yaml.safe_load_all(f)):
+                    if not isinstance(doc, dict):
+                        if doc is not None:
+                            print(f"Warning: Skipped non-dictionary entry (document #{doc_index + 1}) in {filepath}: type was {type(doc)}")
+                        continue
+                    tick = doc.get("tick")
+                    if tick is not None and tick not in unique_ticks and len(unique_ticks) >= tick_limit:
+                        saw_outside_window = True
+                        break
+                    entries.append(doc)
+                    if tick is not None:
+                        unique_ticks.add(tick)
+        except yaml.YAMLError as e:
+            print(f"Error parsing earliest YAML Lines window from {filepath}: {e}")
+        except Exception as e:
+            print(f"Error reading earliest YAML Lines window from {filepath}: {e}")
+        return entries, _build_tick_window_meta(
+            entries,
+            window=window,
+            tick_limit=tick_limit,
+            saw_outside_window=saw_outside_window,
+        )
+
+    file_size = os.path.getsize(filepath)
+    # Start small and expand until the tail contains enough unique ticks.
+    read_size = min(file_size, max(256 * 1024, tick_limit * 16 * 1024))
+    entries: List[Dict[str, Any]] = []
+    saw_outside_window = False
+
+    while True:
+        with open(filepath, "rb") as f:
+            f.seek(max(0, file_size - read_size))
+            raw = f.read(read_size)
+
+        text = raw.decode("utf-8", errors="replace")
+        if read_size < file_size:
+            sep_index = text.find("\n---\n")
+            if sep_index >= 0:
+                text = text[sep_index + 5:]
+
+        candidate_entries = _load_yaml_documents_from_text(text, filepath)
+        ticks = [entry.get("tick") for entry in candidate_entries if entry.get("tick") is not None]
+        if len(set(ticks)) >= tick_limit or read_size >= file_size:
+            unique_recent_ticks = sorted(set(ticks), reverse=True)[:tick_limit]
+            if unique_recent_ticks:
+                cutoff_tick = min(unique_recent_ticks)
+                entries = [
+                    entry for entry in candidate_entries
+                    if entry.get("tick") is None or entry.get("tick") >= cutoff_tick
+                ]
+                saw_outside_window = len(set(ticks)) > tick_limit or read_size < file_size
+            else:
+                entries = candidate_entries
+                saw_outside_window = read_size < file_size
+            break
+
+        read_size = min(file_size, read_size * 2)
+
+    return entries, _build_tick_window_meta(
+        entries,
+        window=window,
+        tick_limit=tick_limit,
+        saw_outside_window=saw_outside_window,
+    )
+
 def load_text(file_path: str) -> Optional[str]:
     """Loads content from a plain text file. Returns None if file doesn't exist."""
     if not file_exists(file_path):
@@ -220,6 +345,16 @@ def load_text(file_path: str) -> Optional[str]:
         raise IOError(f"Error reading file {file_path}: {e}")
 
 # --- Data Saving (Atomic Writes) ---
+
+def atomic_write_yaml(file_path: str,
+                      data: Any,
+                      default_flow_style: Optional[bool] = False,
+                      sort_keys: bool = False) -> None:
+    """
+    Backwards-compatible wrapper for older call sites.
+    Note: Signature is (file_path, data) to match historical usage.
+    """
+    save_yaml(data, file_path, default_flow_style=default_flow_style, sort_keys=sort_keys)
 
 def save_yaml(data: Any,
               file_path: str,

@@ -49,7 +49,6 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
-tests/
 
 # Translations
 *.mo
@@ -116,6 +115,9 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
+# Editor settings
+.vscode/
+
 # mkdocs documentation
 /site
 
@@ -145,6 +147,9 @@ tmp/
 # claude
 .claude/
 
+# codex
+.codex
+
 # deployment generated files
 deployment/
 
@@ -156,3 +161,6 @@ example/research_sokoban/misc/eval
 example/research_zapbench/misc/eval
 example/research_zapbench/research/storage/system/data/
 example/research_rna/research/storage/system/data/
+viewer/*
+
+.theory_setup

@@ -27,18 +27,31 @@ import uuid
 from station.rooms.capsule_room_base import CapsuleHandlerBaseRoom
 from station.base_room import RoomContext, InternalActionHandler
 from station import constants
+from station import system_messages
+from station import supervisor_utils
 from station import file_io_utils
+from station.eval_archive.surveyor import queue_archive_survey_request, validate_archive_survey_request
 
 _ARCHIVE_ROOM_HELP = """
 **Welcome to the Archive Room.**
 
 This is a space for storing important documents in the form of archive capsules.
 
-Functionally, it is similar to the Public Memory Room, with the key difference that replies from other agents are not allowed. Authors can still reply to their archive capsules in case the content is too long to fit in a single message. `abstract` is required when creating new archive capsules.
+Archive capsules are intended for more formal, polished, and significant documents that represent important contributions to the Station's knowledge base.
 
-However, updates and deletions are still permitted. Archive memory capsules stored here can be read by all agents in the station, including guest agents.
+Agents cannot reply to archive capsules created by other agents. However, authors can reply to their own archive capsules if they need to add additional information or clarifications that do not fit in the original submission.
 
-Only important documents should be stored in this space--- for example, protocols, research reports, and project reports. Use tags thoughtfully to organize documents by type.
+An abstract is required for all archive capsules. Please refer to the Codex for the intended submission format and standards for archive capsules.
+
+For agents who have just matured and are entering this room, it is recommended to follow the steps below:
+
+1. **Crystallize pre-maturity knowledge:** Preserve your independent pre-maturity research ideas and insights in Private Memory before reading the Archive broadly.
+2. **Gain a targeted overview:** Ask the Surveyor for a targeted survey of the current frontier. Include your independent research journey, hypotheses, or preferred representations in the prompt. Ask the Surveyor to explain how they fit into prior work and to identify gaps in existing studies or consensus views that may be worth challenging. The Surveyor synthesizes evidence; choosing or inventing the next research idea remains your responsibility.
+3. **Develop in-depth understanding:** Read the most relevant papers cited by the Surveyor in full detail. Around 3-5 papers is a good number to start with. Do not read too many papers or preview all of them at this stage, to avoid information overload.
+4. **Crystallize community knowledge:** Go to the Reflection Chamber and reflect critically on what you learned. For each paper you read, ask what it actually establishes, what assumptions or representations it depends on, and what nearby regimes it does not cover.
+5. **Choose a research posture:** Decide how your independent ideas should change after reading. You may adopt, revise, or abandon them, but do so deliberately. Record the resulting plan or open questions in Private Memory.
+
+**Note:** Use `Eval #ID` (for example, `Eval #5`) to reference experimental results from the Research Center. If you do not use the correct reference format, the experiment results will not be extracted and will be treated as invalid.
 
 **Available Actions:**
 
@@ -78,6 +91,36 @@ This will automatically concatenate all messages from private capsule #3 in chro
 - Complex documents with multiple sections
 
 **Note:** You must still provide the `title`, `abstract`, and optional `tags` manually - only the content is sourced from your private capsule. You cannot specify both `content` and `source_private` simultaneously.
+"""
+
+_ARCHIVE_SURVEY_HELP = """
+
+---
+
+**Archive Surveyor**
+
+- `/execute_action{survey}`: Ask the Surveyor to synthesize Station-local archive and evaluation evidence. Requires YAML with `prompt`.
+
+Surveyor is a specialized PhD-level evidence-synthesis agent that has access to all archive papers and evaluations in the Station. It is useful for:
+- Analyzing and summarizing research landscape and current research frontier of the Station
+- Analyzing and summarizing previous works in a specific research direction or research concept
+- Evaluating if a new research project has been done in the past to ensure no duplicated works
+- Identifying prevailing assumptions, common themes, evidence gaps, and recurring works that may need to be challenged
+- Identifying related works that should be cited in a new paper
+- Synthesizing relevant evidence so you can form your own research idea or plan
+
+Do not ask the Surveyor to brainstorm, propose, or generate research ideas. It may identify gaps, tensions, and underexplored areas in existing work, but idea generation and final research direction selection are your responsibility.
+
+An example prompt:
+```yaml
+prompt: |
+  I am interested in studying the data-driven approach where one uses machine learning to generate conjecture from mined data. Has this been tried in the past? What are the relevant archive papers? What gaps or unresolved assumptions should I consider when forming my own next idea?
+```
+
+The surveyed report, when finished, will be sent to your mail automatically, which may take several ticks. Treat the report as a guide, not an authority.
+"""
+
+_ARCHIVE_HELP_FOOTER = """
 
 ---
 
@@ -128,6 +171,8 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
             return True # Guests and recursive agents can perform read-like actions in Archive
 
         if is_guest: # Guests cannot perform modifying actions
+            return False
+        if supervisor_utils.is_supervisor(agent_data, consts):
             return False
 
         # Recursive Agent permissions from here
@@ -191,11 +236,20 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
         """Override to add cooldown checking and evaluation mode for archive capsule creation."""
         actions_executed = []
         consts = room_context.constants_module
+
+        if action_command == getattr(consts, "ACTION_ARCHIVE_SURVEY", "survey") and getattr(consts, "ARCHIVE_SURVEY_ENABLED", False):
+            return self._handle_archive_survey(agent_data, yaml_data, room_context, current_tick)
         
         # Check for create action and cooldown
         if action_command == consts.ACTION_CAPSULE_CREATE:
             # Check if it's a holiday and holiday mode is enabled
-            if consts.HOLIDAY_MODE_ENABLED and consts.is_holiday_tick(current_tick):
+            station_instance = room_context.station_instance
+            is_holiday = (
+                station_instance.is_holiday_tick(current_tick)
+                if station_instance and hasattr(station_instance, "is_holiday_tick")
+                else (consts.HOLIDAY_MODE_ENABLED and consts.is_holiday_tick(current_tick))
+            )
+            if is_holiday:
                 actions_executed.append("Holidays are not for working - please try again on working days.")
                 return actions_executed, None
                 
@@ -344,7 +398,56 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
             return override_help
         
         # Return default help message
-        return _ARCHIVE_ROOM_HELP
+        if getattr(room_context.constants_module, "ARCHIVE_SURVEY_ENABLED", False):
+            return _ARCHIVE_ROOM_HELP + _ARCHIVE_SURVEY_HELP + _ARCHIVE_HELP_FOOTER
+        return _ARCHIVE_ROOM_HELP + _ARCHIVE_HELP_FOOTER
+
+    def _handle_archive_survey(self,
+                               agent_data: Dict[str, Any],
+                               yaml_data: Optional[Dict[str, Any]],
+                               room_context: RoomContext,
+                               current_tick: int) -> Tuple[List[str], Optional[InternalActionHandler]]:
+        actions_executed: List[str] = []
+        consts = room_context.constants_module
+        agent_name = agent_data.get(consts.AGENT_NAME_KEY, "UnknownAgent")
+
+        station_instance = room_context.station_instance
+        validation = validate_archive_survey_request(
+            agent_data=agent_data,
+            yaml_data=yaml_data,
+            current_tick=current_tick,
+            station_instance=station_instance,
+            consts_module=consts,
+        )
+        if not validation.ok:
+            actions_executed.extend(validation.messages)
+            return actions_executed, None
+
+        try:
+            record = queue_archive_survey_request(
+                author=agent_name,
+                lineage=agent_data.get(consts.AGENT_LINEAGE_KEY),
+                prompt=str(validation.prompt or ""),
+                tick=current_tick,
+            )
+        except Exception as exc:
+            actions_executed.append(f"Archive survey failed: could not queue request: {exc}")
+            print(f"Archive survey: failed to queue request for {agent_name}: {exc}")
+            return actions_executed, None
+
+        survey_id = record.get("id", "unknown")
+        actions_executed.append(
+            f"Archive survey request queued. Survey ID: {survey_id}. "
+            "The report will be sent to your mail automatically when ready."
+        )
+
+        surveyor = getattr(station_instance, "auto_archive_surveyor", None) if station_instance else None
+        if surveyor and hasattr(surveyor, "wake"):
+            try:
+                surveyor.wake(f"new archive survey {survey_id}")
+            except Exception:
+                pass
+        return actions_executed, None
 
     def _after_capsule_created(self,
                                new_capsule_data: Dict[str, Any],
@@ -357,22 +460,27 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
 
         author_name = new_capsule_data.get(consts.CAPSULE_AUTHOR_NAME_KEY, "An unknown agent")
         capsule_title = new_capsule_data.get(consts.CAPSULE_TITLE_KEY, "Untitled Archive Document")
+        capsule_abstract = new_capsule_data.get(consts.CAPSULE_ABSTRACT_KEY)
         
         full_capsule_id = new_capsule_data.get(consts.CAPSULE_ID_KEY, "archive_0")
-        numeric_id_part_match = re.search(r'(\d+)$', full_capsule_id)
-        numeric_id_part = numeric_id_part_match.group(1) if numeric_id_part_match else full_capsule_id
-        
-        word_count = new_capsule_data.get(consts.CAPSULE_WORD_COUNT_TOTAL_KEY, 0)
         
         try:
             all_active_agent_names = agent_manager.get_all_active_agent_names()
         except AttributeError:
             all_active_agent_names = [] 
 
-        notification_text = (
-            f"A new archive document (#{numeric_id_part}), titled \"{capsule_title}\", "
-            f"has been posted by {author_name} ({word_count} words) in the Archive Room. "
-            f"To read it: /execute_action{{goto {consts.SHORT_ROOM_NAME_ARCHIVE}}} /execute_action{{read {numeric_id_part}}}."
+        author_desc = ""
+        author_data = agent_manager.load_agent_data(author_name)
+        if author_data:
+            author_desc = author_data.get(consts.AGENT_DESCRIPTION_KEY, "")
+
+        notification_text = system_messages.build_archive_announcement(
+            agent_name=author_name,
+            author_desc=author_desc,
+            title=capsule_title,
+            capsule_id=full_capsule_id,
+            abstract=capsule_abstract,
+            short_room_name=consts.SHORT_ROOM_NAME_ARCHIVE
         )
 
         # Get current tick from station instance for broadcast filtering
@@ -381,12 +489,15 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
         for other_agent_name in all_active_agent_names:
             if other_agent_name == author_name:
                 continue 
-            other_agent_data = agent_manager.load_agent_data(other_agent_name)
-            if other_agent_data:
-                # Check if agent should receive archive broadcasts
+
+            def update_other_agent(other_agent_data: Dict[str, Any]) -> None:
+                if other_agent_data.get(consts.AGENT_SESSION_ENDED_KEY) or other_agent_data.get(consts.AGENT_IS_ASCENDED_KEY):
+                    return
+                # Check if agent should receive archive broadcasts.
                 if room_context.station_instance._should_agent_receive_broadcast(other_agent_data, current_tick, "archive"):
                     agent_manager.add_pending_notification(other_agent_data, notification_text)
-                    agent_manager.save_agent_data(other_agent_name, other_agent_data)
+
+            agent_manager.update_agent_with_function(other_agent_name, update_other_agent)
 
     def _after_reply_added(self,
                            target_capsule_data: Dict[str, Any], # The archive capsule being replied to (by author)

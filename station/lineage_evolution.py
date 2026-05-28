@@ -28,64 +28,14 @@ The evolution mode uses utility scores based on:
 """
 
 import os
-import json
 import random
 import math
 from typing import Dict, List, Optional, Tuple, Set, Any
 from collections import defaultdict
 
-from station import agent as agent_module
 from station import constants
 from station import file_io_utils
-
-
-def get_score_and_success_from_evaluation(eval_data: Dict[str, Any]) -> Tuple[float, bool, Optional[Tuple]]:
-    """
-    Extract score, success, and sort_key from evaluation data using evaluation manager logic.
-    
-    Returns:
-        Tuple of (score, success, sort_key) where score is float, success is bool, and sort_key is optional tuple
-    """
-    try:
-        # Use the same logic as evaluation manager for display score
-        notification = eval_data.get("notification", {})
-        
-        # Determine display score based on notification status
-        if notification.get("sent", False):
-            # Show the version that was notified
-            version_notified = notification.get("version_notified", "original")
-            if version_notified == "original":
-                result = eval_data["original_submission"]["evaluation_result"]
-                score = result.get("score", "n.a.")
-                success = result.get("success", False)
-                sort_key = result.get("sort_key")
-            else:
-                result = eval_data["versions"][version_notified]["evaluation_result"]
-                score = result.get("score", "n.a.")
-                success = result.get("success", False)
-                sort_key = result.get("sort_key")
-        else:
-            # Not notified yet - check original submission
-            if "original_submission" in eval_data and "evaluation_result" in eval_data["original_submission"]:
-                result = eval_data["original_submission"]["evaluation_result"]
-                score = result.get("score", "n.a.")
-                success = result.get("success", False)
-                sort_key = result.get("sort_key")
-            else:
-                score = "n.a."
-                success = False
-                sort_key = None
-        
-        # Convert to numeric score
-        if success and score != "n.a." and score != "pending":
-            try:
-                return float(score), True, sort_key
-            except (TypeError, ValueError):
-                return 0.0, False, None
-        return 0.0, False, None
-        
-    except Exception as e:
-        return 0.0, False, None
+from station.eval_research.evaluation_manager import EvaluationManager
 
 
 class LineageEvolutionManager:
@@ -191,7 +141,7 @@ class LineageEvolutionManager:
                     
         return inheritable
     
-    def __init__(self, agent_module):
+    def __init__(self, agent_module, eval_manager=None):
         """
         Initialize manager with agent module.
         
@@ -213,6 +163,7 @@ class LineageEvolutionManager:
             constants.SHORT_ROOM_NAME_ARCHIVE,
             "evaluations"
         )
+        self.eval_manager = eval_manager or EvaluationManager(self.evaluations_dir)
         
         # Cache for utility scores to avoid recomputation
         self._utility_cache = {}
@@ -248,33 +199,7 @@ class LineageEvolutionManager:
     def _load_all_breakthroughs(self) -> Dict[str, int]:
         """Load and compute all breakthrough data at once."""
         lineage_breakthroughs = defaultdict(int)
-        
-        # Build list of all evaluations
-        all_evaluations = []
-        
-        if os.path.exists(self.evaluations_dir):
-            for filename in os.listdir(self.evaluations_dir):
-                if filename.startswith('evaluation_') and filename.endswith('.json'):
-                    try:
-                        eval_id = int(filename.split('_')[1].split('.')[0])
-                        filepath = os.path.join(self.evaluations_dir, filename)
-                        with open(filepath, 'r') as f:
-                            data = json.load(f)
-                        
-                        author = data.get('author', '')
-                        if not author:
-                            continue
-                            
-                        score, success, sort_key = get_score_and_success_from_evaluation(data)
-                        if not success:
-                            continue
-                            
-                        author_lineage = self._extract_lineage_from_agent_name(author)
-                        if author_lineage:
-                            all_evaluations.append((eval_id, author_lineage, score, sort_key))
-                            
-                    except Exception:
-                        continue
+        all_evaluations = self._collect_scored_evaluations()
         
         # Sort by evaluation ID
         all_evaluations.sort(key=lambda x: x[0])
@@ -431,32 +356,7 @@ class LineageEvolutionManager:
         NOTE: This tracks global SOTA across all lineages, not per-lineage SOTA.
         Only counts when this lineage achieves a new global best.
         """
-        # First pass: build a list of all successful evaluations with scores
-        all_evaluations = []
-        
-        if os.path.exists(self.evaluations_dir):
-            for filename in os.listdir(self.evaluations_dir):
-                if filename.startswith('evaluation_') and filename.endswith('.json'):
-                    try:
-                        eval_id = int(filename.split('_')[1].split('.')[0])
-                        filepath = os.path.join(self.evaluations_dir, filename)
-                        with open(filepath, 'r') as f:
-                            data = json.load(f)
-                        
-                        author = data.get('author', '')
-                        if not author:
-                            continue
-                            
-                        score, success, sort_key = get_score_and_success_from_evaluation(data)
-                        if not success:
-                            continue
-                            
-                        author_lineage = self._extract_lineage_from_agent_name(author)
-                        if author_lineage:
-                            all_evaluations.append((eval_id, author_lineage, score, sort_key))
-                            
-                    except Exception:
-                        continue
+        all_evaluations = self._collect_scored_evaluations()
         
         # Sort by evaluation ID to process chronologically
         all_evaluations.sort(key=lambda x: x[0])
@@ -474,6 +374,41 @@ class LineageEvolutionManager:
                 current_sota = score
                 
         return breakthroughs
+
+    def _collect_scored_evaluations(self) -> List[Tuple[int, str, float, Optional[Tuple]]]:
+        """Collect successful Research Center evaluations through the public evaluation manager API."""
+        all_evaluations: List[Tuple[int, str, float, Optional[Tuple]]] = []
+
+        for eval_id in self.eval_manager.get_all_evaluation_ids():
+            try:
+                numeric_eval_id = int(str(eval_id))
+            except (TypeError, ValueError):
+                continue
+
+            summary = self.eval_manager.get_result_summary(str(eval_id))
+            if not summary or not summary.get("success"):
+                continue
+
+            author = summary.get("author", "")
+            if not author:
+                continue
+
+            try:
+                score = float(summary.get("score"))
+            except (TypeError, ValueError):
+                continue
+
+            author_lineage = self._extract_lineage_from_agent_name(author)
+            if not author_lineage:
+                continue
+
+            sort_key = summary.get("sort_key")
+            if isinstance(sort_key, list):
+                sort_key = tuple(sort_key)
+            all_evaluations.append((numeric_eval_id, author_lineage, score, sort_key))
+
+        all_evaluations.sort(key=lambda item: item[0])
+        return all_evaluations
     
     def _count_lineage_high_quality_papers(self, lineage_name: str) -> int:
         """

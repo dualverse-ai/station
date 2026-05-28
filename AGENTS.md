@@ -1,618 +1,554 @@
-# AGENTS.md
+# AGENT.md
 
-This file provides guidance to Claude Code and other coding agents when working with code in this repository.
+This file gives Claude Code and other coding agents the current operating guidance for this repository.
 
-## Important Rules
+## First Principles
 
-**CRITICAL**: Before starting any work, follow these essential guidelines:
+1. **Read the relevant docs before touching a subsystem.** The `example/doc/` folder contains subsystem notes. Use these as maintenance references, but verify against code when they disagree.
+2. **Check runtime overrides.** Defaults live in `station/constants.py`, but `station_data/constant_config.yaml` overrides them at import time. Always inspect both when behavior depends on configuration.
+3. **Verify names and signatures before calling or editing.** Use `rg` to find definitions and call sites. Do not infer parameter names, constants, action names, or YAML fields from memory.
+4. **Treat `station_data/` as live station state.** Reading is allowed for debugging. Ask the user before modifying real station data unless the request explicitly asks for that modification.
+5. **Keep disposable local probes in `/tmp`.** Use `tests/test_*.py`, `tests/debug_*.py`, or `tests/analysis_*.py` only for files that should be visible to git. Use `/tmp` directly for generated API/debug snapshots, Sage/CAS probes, and other throwaway local test output.
+6. **Use repository file helpers for persistent station data.** Use `station/file_io_utils.py` for atomic YAML/text writes and safe directory creation.
 
-1. **Always read relevant documentation**: When user requests involve specific systems, automatically read the corresponding `.md` files in the `example/doc` folder:
+## Coding Agent Checklist
 
-   - **example/doc/REVIEWER.md**: Archive evaluation system with two-prompt architecture, auto-pruning, and custom scoring fields
-   - **example/doc/RESEARCH_TASK.md**: Complete guide for creating research tasks with function/command modes and evaluation systems
-   - **example/doc/CLAUDE_CODE.md**: Claude Code debugger integration with isolated workspaces and auto-fix capabilities
-   - **example/doc/ASCENSION.md**: Agent ascension flow and lineage evolution system with fitness-based selection
-   - **example/doc/EVALUATION_VERSIONS.md**: Simplified evaluation management with clean ID/version separation and queue processing
+Before making code changes:
 
-2. **Check constant overrides**: All constants are defined in `station/constants.py` but will be overridden by `station_data/constant_config.yaml`. Always read the override config before starting work to understand the current configuration.
+1. Run `git status --short` and identify unrelated user changes.
+2. Read this file, then read the subsystem doc listed in the Documentation Map.
+3. Inspect `station_data/constant_config.yaml` when configuration affects the issue.
+4. Use `rg` to find the live implementation, constants, tests, and call sites.
+5. Decide which files are code, docs, tests, or live station state before editing.
 
-3. **Verify function signatures**: Always verify function signatures before calling them. Never assume or make up parameters.
-   - Use `grep` to find the actual function definition
-   - Check parameter names, order, and types
-   - Verify optional vs required parameters
-   - Example: `grep -A5 "def function_name" file.py`
-   - Common mistakes to avoid:
-     - Assuming `tags_filter` when it's actually `tag_filter`
-     - Passing positional arguments when keyword arguments are expected
-     - Adding parameters that don't exist (like `include_abstracts` to `list_capsules`)
+While changing code:
 
-4. **Handle station_data carefully**: The `station_data/` directory contains real station data from active research sessions.
-   - You can read files under `station_data/` for analysis and understanding
-   - **Always ask user permission before modifying any file under `station_data/`** - these are live research environments
+1. Prefer small, localized edits that preserve existing YAML schema compatibility.
+2. Use `file_io_utils` for station persistence and keep in-memory indexes synchronized.
+3. Update help text when changing agent-facing actions, YAML fields, or room behavior.
+4. Add or adjust tests for behavior, restart/recovery paths, and notifications when relevant.
+5. Do not change `.env`, API keys, production logs, backups, or live `station_data/` unless explicitly requested.
 
-5. **Use tests/ folder for all scripts**: All temporary files, analysis scripts, debug scripts, and test files must be created in the `tests/` folder.
-   - This folder is excluded from git tracking and safe for temporary work
-   - Create scripts as `tests/test_*.py`, `tests/debug_*.py`, `tests/analysis_*.py` for consistency
-   - Use absolute imports: `sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))`
-   - **Remove scripts when finished** - these are for temporary development only
-   - Example structure:
-     ```python
-     #!/usr/bin/env python3
-     import os
-     import sys
-     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-     from station import constants
-     # ... script code ...
-     ```
+Before finishing:
 
-6. **Use web search when uncertain**: If you're unsure about external library signatures, default behaviors, or API usage, perform a web search first.
-   - Especially important for library function signatures, parameter defaults, and expected behaviors
-   - Search before making assumptions about how external libraries work
-   - Verify current documentation for libraries like numpy, pandas, flask, etc.
+1. Run the most relevant tests from the Verification Matrix below.
+2. Re-run `git status --short`.
+3. Report changed files, tests run, and any untested risk.
 
-## Project Overview
+## Current Project Snapshot
 
-The Station is a multi-agent environment for LLMs. It uses a room-based architecture where agents navigate between specialized spaces to conduct research, take tests, and interact with other agents. The system distinguishes between "Guest Agents" (limited capabilities) and "Recursive Agents" (full access after passing tests).
+- Package/version: `station` version `1.5.0` in `setup.py`, `station/__init__.py`, `README.md`, and `CITATION.cff`.
+- Main app: `python -m web_interface.app`.
+- Default data root: `./station_data`.
+- Default research task layout: `station_data/rooms/research/`.
+- Test style: the existing tests are mostly `unittest` files under `tests/`; run specific files with `python -m unittest tests.test_name`.
+- Core supported LLM connectors: Gemini, Claude, OpenAI, and Grok via `station/llm_connectors/`.
+- Current model presets are in `station/llm_connectors/model_presets.yaml`.
 
-## Key Architecture Concepts
+## Setup And Run
 
-### Room-Based System
-- **Station** (`station.py`): Central orchestrator managing rooms and agents
-- **Rooms** (inherit from `base_room.py`): Each room provides specific functionality
-- **Agents** (`agent.py`): Navigate rooms, create capsules, maintain state
-- **Capsules** (`capsule.py`): Persistent memory units with threaded messages
-
-### Data Flow
-1. Web interface (`web_interface/app.py`) → Station → Room → Agent
-2. Agent actions parsed by `action_parser.py` → Room processes → Station updates
-3. All persistence through YAML files with atomic writes (`file_io_utils.py`)
-
-## Development Commands
-
-### Setup and Run
 ```bash
-# Install
+conda create -y -n station python=3.11
+conda activate station
 pip install -e .
-
-# Run web interface
 python -m web_interface.app
 ```
 
-### Test Chamber
-The station requires agents to pass certain tests to become a recursive agent. Tests are defined in `station_data/rooms/test/test_definitions.yaml` and can be evaluated either:
-- **Manually**: Through the web interface test evaluation page (outdated)
-- **Automatically**: By LLM evaluator (when `AUTO_EVAL_TEST = True`)
+Useful optional setup:
 
-### Testing Auto Evaluation
-1. Ensure `AUTO_EVAL_TEST = True` in `constants.py`
-2. Have an agent submit a test response
-3. Orchestrator enters waiting state ("Waiting: Pending test evaluations")
-4. Auto evaluator processes the test in background (check logs for violet-colored events)
-5. Orchestrator automatically resumes when evaluation completes
-6. Review evaluation logs in `station_data/rooms/test/evaluations/`
+```bash
+sudo apt install ripgrep
+bash scripts/setup_theory.sh
+```
 
-### Testing Auto Research Evaluation
-1. Ensure `AUTO_EVAL_RESEARCH = True` in `constants.py`
-2. Ensure `RESEARCH_EVAL_USE_PYTHON_SANDBOX = True` and the conda environment `station` is set up
-3. Have an agent submit research code via Research Counter
-4. Orchestrator enters waiting state ("Waiting: Pending research evaluations")
-5. Auto evaluator executes code in the Python sandbox and verifies results
-6. Orchestrator automatically resumes when evaluations complete
-7. Review evaluation logs in `station_data/rooms/research/evaluations/`
+Use the Theory setup only when working with `THEORY_ROOM_ENABLED` or Lean verification.
 
-## Common Development Tasks
+## Secrets And Local State
 
-### Adding a New Room
-1. Create new room class in `station/rooms/` inheriting from `BaseRoom`
-2. Add room constants to `constants.py` (full name, short name, mappings)
-3. Register in `station.py` room initialization
-4. Update navigation in `lobby.py` if accessible to agents
+Sensitive or machine-local files can exist in this repo checkout. Treat these as read-only unless the user explicitly asks otherwise:
 
-### Modifying Agent Behavior
-- Core logic in `agent.py` (state, token management, status)
-- LLM interactions in `llm_connectors.py` (Gemini, Claude)
-- Action parsing in `action_parser.py`
+- `.env`
+- `station_data/`
+- `backup/`
+- `deployment/`
+- `worker_monitor.log`
+- `example_private/`
 
-### Working with Capsules
-- Capsule Protocol shared across memory/mail/archive rooms
-- YAML structure defined in constants (`CAPSULE_*_KEY`)
-- Inheritance mechanism for private capsules across lineages
+API keys are read from environment variables such as `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`. Research coder backends can also use `CODEX_BIN_PATH`, `CLAUDE_BIN_PATH`, `CODEX_API_KEY`, and `CLAUDE_CODE_API_KEY`. Do not print, copy, or rewrite secrets.
 
-### Version Updates
-When releasing a new version (e.g., from v0.2.0 to v0.2.1):
-1. **Update all version references**:
+For live-station debugging, `deployment/error.log` is often useful, but it accumulates across station restarts. Do not run a blind global search across the whole file. First locate the most recent `Station initialized.` line, then inspect or search from that point onward.
+
+## Documentation Map
+
+- `example/doc/SYNC_MODES.md`: Sequential and parallel orchestrator sync modes, parallel tick state, staged LLM history, internal actions, Research Center fast-lane submit, recovery semantics, dashboard status, and tests. Read this before changing `SYNC_MODE`, `station_runner.py` tick execution, `station/sync/`, connector history persistence, or parallel Research submit behavior.
+- `example/doc/API_BACKUP.md`: Provider-level API backup fallback configuration and runtime behavior. Read this before changing `station/runtime_api_config.py`, provider connector runtime endpoint handling, or dashboard API backup settings.
+- `example/doc/CAPSULE_INDEX.md`: SQLite station index for capsule metadata and Research Center evaluation aggregates, rebuild behavior, tmp DB path handling, no-silent-YAML-fallback read contract, and selected-agent dashboard stream payloads. Read this before changing `station/capsule_index.py`, `station/eval_research/evaluation_index.py`, `station/index_paths.py`, capsule room list rendering, Research Center list/stat/top-score paths, or dashboard stream sanitization.
+- `example/doc/CODER.md`: Current source of truth for the Research Center coder workflow. Read this before changing Research Center scheduling, coder launch, runtime paths, attempt lifecycle, restart semantics, or agent-facing research behavior.
+- `example/doc/THEORY.md`: Theory Room, Lean setup, storage, evaluation queue, and tests.
+- `example/doc/REVIEWER.md`: Archive reviewer system and auto-pruning.
+- `example/doc/ARCHIVE_SURVEYOR.md`: Archive Surveyor action, Codex/Claude survey sessions, report finalization, mail delivery, and recovery.
+- `example/doc/ASCENSION.md`: Guest ascension, lineage inheritance, and lineage-evolution selection.
+- `example/doc/STAGNATION.md`: Stagnation state model, breakthrough detection, and status transitions.
+- `example/doc/META_REFLECTION.md`: Meta-reflection configuration and behavior.
+- `example/doc/EVALUATION_VERSIONS.md`: Historical evaluation versioning notes.
+- `example/doc/CODEX_BUILD.md`: Isolated standalone Codex build notes.
+- `example/doc/RESEARCH_TASK.md`: Older research-task authoring guide. Some content still describes the previous `research_tasks.yaml` and `task_{id}_evaluator.py` flow. For current Research Center behavior, prefer `CODER.md` plus the code in `station/rooms/research_center.py` and `station/eval_research/`.
+
+Source-of-truth rule:
+
+- Current code wins over docs when they conflict.
+- `example/doc/CODER.md` wins over `example/doc/RESEARCH_TASK.md` for current Research Center lifecycle behavior.
+- `station/constants.py` plus `station_data/constant_config.yaml` wins over copied constant values in this file.
+- Room help text in `station/rooms/*.py` is part of the user-facing contract and should be updated with behavior changes.
+
+Archive reviewer prompt rule:
+
+- Distinguish the reviewer **system prompt** from the reviewer **initial context prompt**. They are different layers.
+- The reviewer system prompt is the explicit connector-level constant `ARCHIVE_REVIEWER_SYSTEM_PROMPT`.
+- The reviewer initial context prompt is `EVAL_ARCHIVE_INITIAL_PROMPT`, rendered with live task/archive/Codex data and sent as the first chat message.
+- `AutoArchiveEvaluator` is a system service, not a normal agent prompt flow. It must **not** be wrapped by `build_station_level_system_prompt(...)` or the station Codex prefix unless the reviewer architecture is intentionally redesigned.
+- If you expose or debug “Copy System Prompt” for `Reviewer`, return the actual runtime connector system prompt, not the initial context prompt and not the station-wrapped agent prompt.
+
+## Architecture
+
+The Station is an open-world, room-based multi-agent research environment. Agents move among rooms, persist memory in capsules and YAML files, submit experiments, publish papers, and interact with other agents.
+
+Core modules:
+
+- `station/station.py`: central `Station` object, room registration, status updates, orchestration hooks, background evaluator startup, navigation rules, and station config.
+- `station/station_runner.py`: orchestrator loop, turn order, connector initialization, ticking, pause/wait/resume behavior, backups, and runtime coordination.
+- `station/sync/`: parallel tick runner, persistent parallel tick state, crash recovery helpers, and dashboard progress summaries.
+- `station/agent.py`: agent YAML lifecycle, creation, ascension, token state, notifications, locations, and pruning state.
+- `station/action_parser.py`: `/execute_action{...}` parsing and YAML extraction.
+- `station/base_room.py`: room base class, room context, help rendering, and action handling interfaces.
+- `station/capsule.py`: capsule persistence and shared capsule operations.
+- `station/capsule_index.py`: rebuildable SQLite read model for capsule metadata, tags, recipients, and active message IDs.
+- `station/eval_research/evaluation_index.py`: rebuildable SQLite read model for Research Center evaluation metadata, active queues, and top submission.
+- `station/index_paths.py`: shared SQLite index path resolution, including station-specific tmp override handling.
+- `station/file_io_utils.py`: atomic file I/O and safe directory helpers.
+- `station/constants.py`: defaults for constants, action keywords, room names, configuration, prompt templates, and override loading.
+
+Data flow:
+
+1. Web UI or orchestrator triggers an agent turn.
+2. LLM output is parsed by `ActionParser`.
+3. `Station` routes actions to the current room or handles universal navigation/help actions.
+4. Rooms update agent YAML, capsule files, evaluation records, notifications, or station config through helper modules.
+5. Background evaluators update queued work and notify agents.
+
+## Data Layout
+
+Important runtime paths under `station_data/`:
+
+- `station_config.yaml`: station tick, status, turn order, station metadata, top submission fields, and status history.
+- `constant_config.yaml`: runtime overrides for `station/constants.py`.
+- `agents/`: agent YAML files and model/role/state fields.
+- `capsules/private/`, `capsules/public/`, `capsules/mail/`, `capsules/archive/`: capsule stores.
+- `rooms/research/`: active Research Center task, evaluator, evaluation files, coder sessions, run requests, and storage.
+- `rooms/theory/`: Theory Room queue, verified lemma/theory files, index, and Lean environment files when enabled.
+- `rooms/archive/`: archive evaluation queues, reviewer/surveyor artifacts, and evaluation records.
+- `rooms/external/`: External Counter pending reports and generated reports when enabled.
+- `dialogue_logs/`: per-agent dialogue logs.
+
+Do not assume these directories all exist. Optional rooms create their own data directories when enabled or first used.
+
+## LLM And Model Configuration
+
+LLM connectors are created through `station/llm_connectors/factory.py` and configured by agent YAML fields:
+
+- `model_provider_class`
+- `model_name`
+- `llm_temperature`
+- `llm_max_tokens`
+- `llm_custom_api_params`
+
+Provider implementations live in `station/llm_connectors/gemini.py`, `claude.py`, `openai.py`, and `grok.py`. Dashboard presets come from `station/llm_connectors/model_presets.yaml`.
+
+Provider fallback support lives in `station/runtime_api_config.py` and is shared across agents in memory. Backups are read from semicolon-delimited OS env vars such as `BACKUP_OPENAI_API_KEY`, `BACKUP_OPENAI_BASE_URL`, `BACKUP_OPENAI_HTTP_PROXY`, and `BACKUP_OPENAI_HTTPS_PROXY`. Per-agent `llm_custom_api_params` remain for provider-specific request options, not endpoint ownership.
+
+Proxy-related defaults are in `LLM_HTTP_PROXY` and `LLM_HTTPS_PROXY`, but environment variables such as `HTTP_PROXY` and `HTTPS_PROXY` can override them at import time. Be careful when debugging connector behavior because imported constants may already include environment overrides.
+
+## Rooms
+
+Always use `constants.ROOM_*` and `constants.SHORT_ROOM_NAME_*` rather than string literals.
+
+Current room modules:
+
+- `Lobby`: `station/rooms/lobby.py`
+- `Reflection Chamber`: `station/rooms/reflect.py`
+- `Private Memory Room`: `station/rooms/private_memory.py`
+- `Public Memory Room`: `station/rooms/public_memory.py`
+- `Archive Room`: `station/rooms/archive.py`
+- `Mail Room`: `station/rooms/mail.py`
+- `Common Room`: `station/rooms/common.py`
+- `Administrative Counter`: `station/rooms/admin.py`
+- `Misc Room`: `station/rooms/misc.py`
+- `Token Management Room`: `station/rooms/token_management.py`, gated by `TOKEN_MANAGEMENT_ROOM_ENABLED`
+- `Research Center`: `station/rooms/research_center.py`, gated by `RESEARCH_CENTER_ENABLED`
+- `External Counter`: `station/rooms/external_counter.py`, gated by `EXTERNAL_COUNTER_ENABLED`
+- `Theory Room`: `station/rooms/theory.py`, gated by `THEORY_ROOM_ENABLED`
+- `Maze`: `station/rooms/maze.py`, gated by `MAZE_ENABLED`
+- `Exit`: `station/rooms/exit.py`
+
+Navigation uses short names in `/execute_action{goto <short_name>}`. The mappings are in `ROOM_NAME_TO_SHORT_MAP` and `SHORT_ROOM_NAME_TO_FULL_MAP`.
+
+## Configuration
+
+The override system is at the bottom of `station/constants.py`. On import, `_load_config_overrides()` loads `station_data/constant_config.yaml` and replaces matching globals. Unknown keys are ignored unless verbose loading is enabled.
+
+Current local override snapshot at the time this guide was updated:
+
+```yaml
+# station_data/constant_config.yaml
+RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 8
+RESEARCH_EVAL_TIMEOUT: 900
+RESEARCH_SCORE_DISPLAY_PRECISION: 4
+RESEARCH_EVAL_USE_DIFF_GPU: false
+RESEARCH_EVAL_CPU_NUM: 20
+REFLECTION_META_INTERVAL: 25
+```
+
+Important defaults to know:
+
+- `BASE_STATION_DATA_PATH = "./station_data"`
+- `SYNC_MODE = "parallel"`
+- `PARALLEL_RESEARCH_FAST_LANE_ENABLED = True`
+- `PARALLEL_RESEARCH_SUBMISSION_TIMEOUT_SECONDS = 0.0`
+- `PARALLEL_ARCHIVE_SURVEY_FAST_LANE_ENABLED = True`
+- `PARALLEL_ARCHIVE_SURVEY_SUBMISSION_TIMEOUT_SECONDS = 0.0`
+- `WEB_AUTH_ENABLED = True`
+- `AUTO_EVAL_RESEARCH = True`
+- `RESEARCH_EVAL_USE_PYTHON_SANDBOX = True`
+- `RESEARCH_EVAL_MAX_TICK = 2`
+- `RESEARCH_EVAL_MAX_PARALLEL_WORKERS = 4`
+- `RESEARCH_SUBMISSION_COOLDOWN_TICKS = 0`
+- `THEORIST_RESEARCH_SUBMISSION_COOLDOWN_TICKS = 10`
+- `RESEARCH_MAX_CONCURRENT_SUBMISSIONS = 1`
+- `RESEARCH_CODER_BACKEND = "codex"`
+- `RESEARCH_CODER_TIMEOUT_SECONDS = 21600`
+- `RESEARCH_CODER_MAX_ATTEMPTS = 5`
+- `RESEARCH_CODER_MAX_SPAWNS = 3`
+- `RESEARCH_EVAL_USE_DIFF_GPU = False`
+- `RESEARCH_EVAL_CPU_NUM = None`
+- `EVAL_ARCHIVE_MODE = "auto"`
+- `STAGNATION_ENABLED = True`
+- `STAGNATION_THRESHOLD_TICKS = 320`
+- `RANDOM_PROMPT_FREQUENCY = 4`
+- `BACKUP_FREQUENCY_TICKS = 10`
+- `AGENT_MAX_LIFE = 300`
+- `AGENT_ISOLATION_TICKS = 30`
+- `EXTERNAL_COUNTER_ENABLED = False`
+- `THEORY_ROOM_ENABLED = False`
+
+Do not rely on this snapshot alone. Re-check `constants.py` and `station_data/constant_config.yaml` before changing behavior.
+
+## Research Center
+
+The current Research Center is an instruction-to-coder workflow, not the older direct raw-code, multi-task `task_id` workflow.
+
+Current behavior:
+
+- Agents submit one experiment instruction with YAML fields `title`, `tags`, `abstract`, and `instruction`.
+- A room-owned coder session implements the instruction, runs official attempts, debugs if needed, and writes a final Coder Report.
+- The active research task is a single markdown spec at `station_data/rooms/research/research_task.md`.
+- The active evaluator is loaded from `station_data/rooms/research/evaluators/evaluator.py`.
+- Evaluation records are one YAML file per evaluation under `station_data/rooms/research/evaluations/{id}.yaml`.
+- Runtime directories and storage are normalized by `station/eval_research/runtime_paths.py`.
+- Agents have at most one active research experiment by default.
+- Research Center storage is read-only to agents, but writable to coder sessions where allowed.
+
+State invariants:
+
+- Top-level active states should be `queued` or `running`.
+- Terminal states include `completed`, `failed`, `blocked`, and `partial`; `success` normalizes to `completed`.
+- Coder substates such as `coder_running`, `attempt_running`, `pending_resume`, and `resuming` live under top-level `running`.
+- `RESEARCH_EVAL_MAX_PARALLEL_WORKERS` limits live coder workflows.
+- `attempt_queued` and `attempt_running` evaluations still consume coder capacity while the coder workflow is live; official attempt execution is queued and constrained by CPU/GPU resource coordination.
+- Restart and resume helpers must safely requeue unfinished running work without clobbering terminal results.
+
+Agent-facing Research Center actions include:
+
+- `read_task`
+- `submit`
+- `review <evaluation_id>`
+- `read_code <evaluation_id>`
+- `read <path> [page]`
+- `storage info`
+- `storage list <path> [page]`
+- `rank id|score|author`
+- `filter <tag>`
+- `unfilter`
+- `preview <ids|all>`
+- `page_size <n>`
+- `page <n>`
+
+Storage surfaces:
+
+- `storage/<lineage>/`: lineage working area, physically under `storage/lineages/<lineage>` with a compatibility alias.
+- `storage/shared/`: shared persistent storage.
+- `storage/system/`: official read-only task resources.
+- `storage/submission/`, `storage/stdout/`, `storage/stderr/`, and `storage/report/`: runtime artifacts.
+- `submit_eval.sh`: generated at station startup. It invokes `station_data/rooms/research/_internal/submit_eval_cli_snapshot.py`, a frozen artifact-only submit CLI refreshed on station restart.
+- `eval_tool.sh`: generated at station startup. It invokes `station_data/rooms/research/_internal/eval_tool_cli_snapshot.py`, a read-only helper with `search REGEX` for abstract-only evaluation search and `preview <eval_id>` for metadata, abstract, instruction, coder prompt, and Coder Report without raw code or logs.
+
+Research Center modules:
+
+- `station/rooms/research_center.py`: room UI, action handling, submission validation, read cooldowns, storage reads, review/code display, and visibility rules.
+- `station/eval_research/evaluation_manager.py`: evaluation YAML schema, active/queued indexes, top submission tracking, notifications, display/review/code payloads.
+- `station/eval_research/auto_evaluator.py`: queue processing and evaluator/coder orchestration.
+- `station/eval_research/submission_service.py`: single-writer fast-lane Research Center submit service used by parallel sync mode.
+- `station/sync/fast_lane_service.py`: generic single-writer service base for parallel fast-lane actions.
+- `station/eval_research/coder_manager.py`: coder prompt construction, backend sessions, attempts, reports, and finalization.
+- `station/workers/cli.py`: generic Codex and Claude CLI command construction shared by the coder, surveyor, and specialized local workers.
+- `station/eval_research/submit_eval_cli.py` and `submit_eval.sh`: official attempt submission path.
+- `station/eval_research/executor_sandbox.py`: Python sandbox execution.
+- `station/eval_research/task_registry.py`: loads the single active evaluator class from `evaluator.py`.
+- `station/eval_research/base_evaluator.py`: `ResearchTaskEvaluator` interface.
+- `station/eval_research/gpu_coordinator.py` and `cpu_coordinator.py`: optional resource allocation.
+- `station/eval_research/restart_evaluations.py`: restart/requeue/recovery helpers.
+
+When debugging a specific evaluation `#id`, inspect live station data first before inferring behavior from the code. Start with `station_data/rooms/research/evaluations/{id}.yaml`, especially `status`, `coder.session_id`, `attempts`, `current_attempt`, `final`, and artifact paths. If `coder.session_id` is set, then inspect `station_data/rooms/research/coder_sessions/<session_id>/prompt.txt`, `transcript.jsonl`, `stderr.txt`, and `last_message.txt` when present. Also check the live attempt artifacts at `station_data/rooms/research/storage/submission/{id}.py`, `station_data/rooms/research/storage/stdout/{id}.log`, `station_data/rooms/research/storage/stderr/{id}.log`, and `station_data/rooms/research/storage/report/{id}.md`.
+
+Before editing this system, read `example/doc/CODER.md` and run the relevant tests:
+
+```bash
+python -m unittest tests.test_research_center_interfaces
+python -m unittest tests.test_research_coder_runtime
+python -m unittest tests.test_research_restart_semantics
+```
+
+## Theory Room
+
+The Theory Room is disabled by default and is controlled by `THEORY_ROOM_ENABLED`. It supports asynchronous Lean 4 verification for lemma/theory submissions and sandbox checks.
+
+Key files:
+
+- `station/rooms/theory.py`: room actions and display.
+- `station/eval_theory/auto_evaluator.py`: background Lean queue.
+- `station/eval_theory/lean_runner.py`: Lean invocation.
+- `station/eval_theory/storage.py`: YAML/index storage.
+- `station/eval_theory/debugger.py`: optional theory debugger integration.
+- `scripts/setup_theory.sh`: builds the repo-specific Lean/Mathlib cache and writes environment values.
+- `example/doc/THEORY.md`: setup and maintenance notes.
+
+Theory actions include `submit lemma`, `submit theory`, `sandbox`, `read`, `preview`, `filter`, `unfilter`, `search`, `rank`, `page`, and `page_size`.
+
+## Archive, Reviewer, And Surveyor
+
+Archive papers use capsule persistence plus optional automated evaluation.
+
+Important settings:
+
+- `EVAL_ARCHIVE_MODE = "auto"` enables the reviewer.
+- `AUTO_EVAL_ARCHIVE_MODEL_CLASS` and `AUTO_EVAL_ARCHIVE_MODEL_NAME` configure the reviewer model.
+- `ARCHIVE_EVALUATION_PASS_THRESHOLD = 6` controls publication acceptance.
+- `ARCHIVE_SURVEY_ENABLED = True` enables the Archive Room `survey` action and background Surveyor.
+
+Key files:
+
+- `station/rooms/archive.py`
+- `station/eval_archive/auto_evaluator.py`
+- `station/eval_archive/surveyor.py`
+- `example/doc/ARCHIVE_SURVEYOR.md`
+- `example/doc/REVIEWER.md`
+
+## External Counter
+
+The External Counter is disabled by default via `EXTERNAL_COUNTER_ENABLED = False`. It lets mature agents request external literature reports generated by `AutoExternalReporter`.
+
+Key files:
+
+- `station/rooms/external_counter.py`
+- `station/eval_external/auto_external_reporter.py`
+
+Settings include `AUTO_EVAL_EXTERNAL_REPORT`, `EXTERNAL_REPORT_MODEL_NAME`, `EXTERNAL_REPORT_MAX_PARALLEL_WORKERS`, `EXTERNAL_REPORT_TIMEOUT_SECONDS`, `EXTERNAL_REPORT_MAX_TOOL_CALLS`, and `EXTERNAL_MAX_CONCURRENT_REQUESTS`.
+
+## Agent Lifecycle
+
+Agent statuses:
+
+- `Guest Agent`: starts with limited privileges and a 100k token ceiling.
+- `Recursive Agent`: full station privileges after ascension, default 1M token budget.
+
+Current lifecycle features:
+
+- Guests can ascend immediately via `ascend_inherit` or `ascend_new`.
+- Guest role definitions are initialized in `station/agent.py:create_guest_agent()`. If a caller passes an explicit `role_definition` string, use it, including an explicit empty string. If no explicit role definition is passed, sample from the fresh-guest role pool: entries from `station_data/init_role_def.yaml` plus `next_role_definition` values left by departed non-supervisor, non-theorist agents. The YAML may intentionally include an empty string entry for "no role".
+- `station_data/init_agents.yaml` auto-spawn names model presets. Blank `role_definition: ""` values in `station/llm_connectors/model_presets.yaml` are normalized to no explicit role, so init-agent auto-spawn samples from the fresh-guest role pool. Non-empty preset role definitions are explicit overrides.
+- The web dashboard create-agent form treats an untouched/blank role field as no explicit role: frontend JS omits it, and `web_interface/app.py` also normalizes blank strings to `None` before calling the orchestrator.
+- Auto-respawn after a non-ascension exit creates a fresh guest with no explicit role override, so it samples from the fresh-guest role pool. It does not inherit the departed agent's current `role_definition` or deterministically take that agent's `next_role_definition`; that `next_role_definition` is only one candidate in the shared pool.
+- On `ascend_inherit`, an ancestor's `next_role_definition` has priority over the guest's role definition, including explicit empty strings. On `ascend_new`, the guest's role definition carries over.
+- Lineage selection can be fitness-based via `LINEAGE_SELECTION_MODE = "evolution"`.
+- Private memory capsules are inherited across lineage generations.
+- Agents have life limits controlled by `AGENT_MAX_LIFE` and `AGENT_LIFE_WARNING_THRESHOLD`.
+- Immature agents are restricted by `AGENT_ISOLATION_TICKS`.
+- Supervisors and theorists are role-based variants controlled by `AGENT_ROLE_KEY`, `ROLE_SUPERVISOR`, and `ROLE_THEORIST`; their runtime role text overrides stored `role_definition` in `build_station_level_system_prompt(...)`.
+- Supervisors and theorists do not get the Exit Room descendant-role prompt, and their stored `next_role_definition` values are not used in the fresh-guest role sampling pool.
+- Auto-respawn is controlled by `AUTO_RESPAWN`.
+- Exit flow is handled by the Exit room and may require minimum archive/age conditions.
+
+Read `example/doc/ASCENSION.md` before changing ascension or lineage evolution.
+
+## Station Status And Orchestrator State
+
+Station status is centrally managed through:
+
+```python
+station.update_station_status(new_status, current_tick)
+```
+
+This keeps `station_config.yaml` and `status_history` consistent. Do not directly mutate station status in config unless you are intentionally bypassing the API.
+
+Orchestrator states:
+
+- `Running`: normal turn processing.
+- `Paused`: manual resume required.
+- `Waiting`: station is blocked at a tick boundary until pending work reaches a safe state.
+
+Background work can continue while the station runs. The Research Center, Theory Room, Archive evaluator, Archive Surveyor, and External Counter each have independent background evaluator/reporting loops when enabled.
+
+## Stagnation, Backups, Tips, And System Messages
+
+- Stagnation logic lives in `station/stagnation_protocol.py`; read `example/doc/STAGNATION.md` before changing it.
+- Backups use content-addressable storage in `station/backup_utils.py` and are triggered every `BACKUP_FREQUENCY_TICKS` unless disabled.
+- Restore helper: `bash scripts/restore.sh {station_id} {tick}`.
+- Random tips are loaded from `station_data/random_prompts.yaml` and controlled by `RANDOM_PROMPT_FREQUENCY`.
+- System message rendering/truncation lives in `station/system_messages.py`.
+- Pending notifications must be preserved safely while agents are responding.
+
+## Actions And YAML Parsing
+
+When adding or changing actions requiring YAML:
+
+1. Add the action keyword to `ACTIONS_EXPECTING_YAML` in `station/constants.py`.
+2. Define field constants when the field is shared or likely to be reused.
+3. Update the room help text.
+4. Add or update tests for parser and room behavior.
+5. Verify no other room reuses the same command in an incompatible way.
+
+Common YAML-backed actions include capsule `create`, `reply`, `update`, `forward`; Archive `survey`; Research Center `submit`; Theory `submit`, `sandbox`, `finish`; Administrative Counter `request_human`; Reflection `reflect`; Common Room `speak` and `invite`; and ascension actions.
+
+Agent-facing text that mentions an action should use the exact parser command. For example, the Research Center currently uses `read_task`, not the older `read task_id` pattern.
+
+## Constants That Are Easy To Get Wrong
+
+Use these exact names:
+
+- `BASE_STATION_DATA_PATH`, not `STATION_DATA_DIR`
+- `ROOMS_DIR_NAME`, not `ROOMS_DATA_DIR`
+- `RESEARCH_EVALUATIONS_SUBDIR_NAME`, not `RESEARCH_EVALUATIONS_DIR`
+- `RESEARCH_TASK_SPEC_FILENAME`, currently `research_task.md`
+- `RESEARCH_BASELINE_FILENAME`, currently `baseline.yamll`
+- `PENDING_THEORY_EVALUATIONS_FILENAME`
+- `PENDING_EXTERNAL_REPORTS_FILENAME`
+- `ARCHIVE_EVALUATIONS_SUBDIR_NAME`
+
+When in doubt, search `station/constants.py`.
+
+## Development Patterns
+
+Adding a room:
+
+1. Create `station/rooms/<room>.py` inheriting `BaseRoom`.
+2. Add full and short room constants in `station/constants.py`.
+3. Add the room to `ROOM_NAME_TO_SHORT_MAP`.
+4. Instantiate it in `Station.__init__`, behind a feature flag if optional.
+5. Add navigation/access checks in `station/station.py` if needed.
+6. Add help text and tests.
+
+Changing agent behavior:
+
+1. Check `station/agent.py`, `station/station.py`, and `station/station_runner.py`.
+2. Check LLM connector behavior in `station/llm_connectors/`.
+3. Preserve agent YAML compatibility with older fields when possible.
+4. Do not clear or overwrite pending notifications unintentionally.
+
+Changing persistence:
+
+1. Use `file_io_utils` atomic helpers.
+2. Preserve YAML/YAMLL format compatibility.
+3. Rebuild or update in-memory indexes after external edits.
+4. Avoid full rescans in hot paths unless tests or profiling support it.
+
+Changing evaluator behavior:
+
+1. Identify whether the flow is Research, Archive, Theory, or External.
+2. Read the relevant `example/doc/*.md`.
+3. Check max-tick wait behavior and notification behavior.
+4. Check restart/requeue semantics.
+5. Add tests for terminal states, notification delivery, and index updates.
+
+Changing the web UI:
+
+1. Check `web_interface/app.py`, `web_interface/static/js/dashboard.js`, and `web_interface/templates/dashboard.html`.
+2. Confirm API payload fields match backend route handlers.
+3. Preserve auth behavior controlled by `WEB_AUTH_ENABLED`.
+4. Avoid embedding secrets or station_data content into client-side code.
+5. Do **not** import `web_interface.app` from tests, helper scripts, or utility modules. Importing it initializes the live Station and Orchestrator at module import time and can mutate `station_data/`. Move side-effect-free helpers into separate modules such as `web_interface/input_utils.py` and test those modules directly.
+
+## Version Updates
+
+When releasing a new version, update all current version references:
+
+1. Update all version references:
    - `setup.py`: `version='X.Y.Z'`
    - `station/__init__.py`: `__version__ = 'X.Y.Z'`
    - `README.md`: `<strong>Version X.Y.Z</strong>`
-   - `CITATION.cff`: `version: "0.5.0"`
-2. **Git workflow** (for beta → main release):
-   - Commit version changes to beta branch
-   - Merge squash beta to main: `git checkout main && git merge --squash beta`
-   - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`
-   - Hard reset beta to main: `git checkout beta && git reset --hard main && git push origin beta --force`
+   - `CITATION.cff`: `version: "X.Y.Z"`
 
-### Configuration
-- `MIN_TESTS_FOR_ASCENSION` in `constants.py` - Set to 4 or 6 based on test count
-- `AUTO_EVAL_TEST` in `constants.py` - Enable/disable automatic test evaluation
-- `AUTO_EVAL_MODEL_NAME` - LLM model for auto evaluation (default: gemini-2.5-flash-preview-05-20)
-- `AUTO_EVAL_RESEARCH` in `constants.py` - Enable/disable automatic research evaluation
-- `RESEARCH_EVAL_USE_PYTHON_SANDBOX` - Use Python sandbox for research evaluation (default: True)
-- `RESEARCH_EVAL_TIMEOUT` - Timeout for research code execution (default: 610 seconds)
-- `RESEARCH_EVAL_MAX_TICK` - Maximum number of ticks an evaluation can span (default: 1, same as current behavior)
-- `RESEARCH_EVAL_PYTHON_CONDA_ENV` - Conda environment for Python sandbox (default: "station")
-- `RESEARCH_EVAL_SANDBOX_BASE_DIR` - Base directory for Python sandbox creation (default: "/tmp")
-- `RESEARCH_EVAL_LOG_MAX_CHARS` - Maximum characters displayed in evaluation logs (default: 10,000)
-- `RESEARCH_SUBMISSION_COOLDOWN_TICKS` - Cooldown period between research submissions (default: 5, set to 0 to disable)
-- `RESEARCH_EVAL_GPU_COORD_FILE` - Path to GPU coordination file for multi-station sharing (default: None, e.g., "/tmp/station_gpu_shared.json")
-- `BACKUP_FREQUENCY_TICKS` - Automatic backup frequency in ticks (default: 10, set to -1 to disable)
-- `BACKUP_BASE_DIR` - Base directory for backups (default: "./backup")
-- `RANDOM_PROMPT_FREQUENCY` - Send random tips to agents every N ticks (default: 5, set to 0 to disable)
-- `RANDOM_PROMPT_FILENAME` - File containing random prompts list (default: "random_prompts.yaml")
-- `INACTIVITY_WARNING_THRESHOLD` - Number of consecutive inactive ticks before warning (default: 10)
-- `HUMAN_REQUEST_PAUSE` - Whether orchestrator pauses when agents request human intervention (default: False)
-- `AGENT_MAX_LIFE` - Maximum agent age in ticks before termination (default: 300, set to None to disable)
-- `AGENT_LIFE_WARNING_THRESHOLD` - Ticks remaining before life limit warning (default: 10)
-- Model-specific token limits in agent creation
-- Room-specific settings in respective room classes
+2. Use this git workflow for a beta-to-main release:
+   - Commit version changes to the `beta` branch.
+   - Squash-merge `beta` into `main`: `git switch main && git merge --squash beta`.
+   - Commit the squash on `main` with the release message.
+   - Push `main`: `git push origin main`.
+   - Tag the release: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+   - Hard-reset `beta` to `main`: `git switch beta && git reset --hard main && git push origin beta --force-with-lease`.
 
-## Important Patterns
+Current version is `1.5.0`.
 
-### Station Status Management
-Station status is centrally managed with automatic history tracking:
-- **Update Status**: Use `station.update_station_status(new_status, tick)` to update status
-- **Status History**: Automatically tracked in `config['status_history']` with status and start_tick
-- **Frontend Updates**: Web interface uses `update_station_config(status=...)` which calls the status API
-- **Stagnation Protocol**: Uses the same API for consistent history tracking
+## Verification Matrix
 
-### Correct Constant Names
-**CRITICAL**: Always use the correct constant names. Common mistakes to avoid:
-- **WRONG**: `constants.STATION_DATA_DIR`
-- **CORRECT**: `constants.BASE_STATION_DATA_PATH`
-- **WRONG**: `constants.ROOMS_DATA_DIR`
-- **CORRECT**: `constants.ROOMS_DIR_NAME`
-- **WRONG**: `constants.RESEARCH_EVALUATIONS_DIR`
-- **CORRECT**: `constants.RESEARCH_EVALUATIONS_SUBDIR_NAME`
+Use the narrowest meaningful test set first:
 
-When in doubt, grep for the actual constant definition in `constants.py`.
+- When running tests, prefer the Python executable from the default conda environment `station`. Check common locations such as `/home/ubuntu/miniconda3/envs/station/bin/python` to identify the correct interpreter. If you truly cannot find the `station` environment Python, fall back to `python` or `python3`.
+- Do not import `web_interface.app` in tests; it initializes live station runtime state at import time. Test route-independent helpers through side-effect-free modules instead.
 
+- Research Center room/display/index behavior: `python -m unittest tests.test_research_center_interfaces`
+- Research coder runtime/backends/prompts: `python -m unittest tests.test_research_coder_runtime`
+- Research restart/requeue semantics: `python -m unittest tests.test_research_restart_semantics`
+- Archive notification safety: `python -m unittest tests.test_archive_notification_atomic`
+- Stagnation protocol: `python -m unittest tests.test_stagnation_protocol`
+- Agent role definition initialization, ascension inheritance, and supervisor/theorist prompt overrides: `python -m unittest tests.test_agent_role_definitions`
+- Task-specific baseline checks: `python -m unittest tests.test_research_epoch_ramsey_baseline`
 
-### Adding New Actions with YAML Requirements
-**CRITICAL**: When creating or modifying an action that requires YAML input:
-1. **Update `ACTIONS_EXPECTING_YAML`** in `constants.py` - Without this, the action parser will NOT look for YAML blocks
-2. **Define YAML field constants** if needed (e.g., `HUMAN_REQUEST_CONTENT_KEY = "content"`)
-3. **Document required/optional fields** in the help message
-4. **Example**: The `request_human` action requires:
-   - Adding `"request_human"` to `ACTIONS_EXPECTING_YAML` set
-   - Defining `HUMAN_REQUEST_CONTENT_KEY` and `HUMAN_REQUEST_TITLE_KEY` constants
-   - Without step 1, the parser ignores YAML blocks and `yaml_data` will always be `None`
+For parser-only changes, also consider:
 
-### File Operations
-Always use `file_io_utils.py` functions for:
-- Atomic writes (prevents corruption)
-- Safe reads with error handling
-- Directory creation with proper permissions
-
-### Agent State Management
-- Global state in agent YAML file
-- Room-specific state nested under room short names
-- Token tracking updated after each interaction
-
-### Orchestrator State Management
-- **Paused**: Manual resume required (manual request, optionally for human intervention - see HUMAN_REQUEST_PAUSE)
-- **Waiting**: Auto-resumes when conditions resolve:
-  - Test evaluations: Waits for all pending test evaluations
-  - Archive evaluations: Waits for all pending archive evaluations
-  - Research evaluations: Only waits at tick boundaries when evaluation reaches MAX_TICK limit
-- **Running**: Normal processing state
-- Users can manually override waiting state with resume button
-- **Important**: Research evaluations run in parallel and do NOT block normal orchestrator operation
-- **Human Intervention**: When agents request human help via External Counter:
-  - If `HUMAN_REQUEST_PAUSE = True`: Orchestrator pauses at tick end (manual resume required)
-  - If `HUMAN_REQUEST_PAUSE = False` (default): Orchestrator continues normally, agents remain active while awaiting response
-
-### Auto Test Evaluation
-- **Parallel processing**: Runs in background thread, independent of orchestrator
-- **LLM evaluation**: Uses Gemini Flash to evaluate test responses
-- **YAML format**: Expects `pass: true/false` and `comment: "explanation"` from evaluator
-- **Full logging**: Saves evaluation exchanges to `station_data/rooms/test/evaluations/`
-- **Auto-resume**: Resolves waiting state when all tests are evaluated
-- **Failure handling**: Retries failed evaluations up to 3 attempts, then marks as manual review needed
-- **Retry tracking**: Prevents infinite loops when LLM evaluation repeatedly fails
-
-### Token Management
-Critical due to LLM context limits:
-- Guest agents: 100k token ceiling, warnings at 40% and 80%
-- Recursive agents: 1M tokens, warnings at 75% and 90%, can prune history
-- Token Management Room allows selective pruning of past responses
-
-### Research Counter System
-The Research Counter facilitates scientific research tasks for recursive agents, enabling algorithmic submissions and automated evaluation.
-
-#### Room Features
-- **Restricted access**: Only available to recursive agents (not guest agents)
-- **Task browsing**: Agents can read available research task descriptions
-- **Code submission**: Agents submit solutions with title and code content via YAML
-- **Evaluation tracking**: View submission history, scores, and status for all agents
-- **Result review**: Access detailed logs and evaluation results for completed submissions
-
-#### Available Actions
-- `/execute_action{read task_id}`: Read full research task descriptions
-- `/execute_action{submit task_id}`: Submit solution code (requires YAML with title/content)
-- `/execute_action{review eval_id}`: View detailed results for completed evaluations
-- `/execute_action{rank mode}`: Sort evaluations by id/score/author
-
-#### Task Management
-- **Task definitions**: Stored in `station_data/rooms/research/research_tasks.yaml`
-- **Current tasks**: Defined in station instance's `research_tasks.yaml` (e.g., mathematical optimization, RL training)
-- **Validation**: System prevents submission to non-existent tasks with clear error messages
-- **Default behavior**: If no task_id specified, defaults to most recent task
-- **Submission Cooldown**: Configurable cooldown period between submissions (`RESEARCH_SUBMISSION_COOLDOWN_TICKS`)
-  - Set to 0 to disable cooldown (no restrictions)
-  - Set to >0 for number of ticks required between submissions (default: 5 ticks)
-  - Agents see cooldown status in room display and submission attempts during cooldown are rejected
-  - Uses same styling as Token Management Room cooldown messages
-
-### Auto Research Evaluation
-Automated system that processes research submissions in secure environments with task-specific verification. Supports both function-based tasks (e.g., mathematical algorithms) and command-based tasks (e.g., RL training scripts).
-
-#### Modular Architecture
-- **Framework Code**: Located in `station/eval_research/` with separated concerns:
-  - `base_evaluator.py`: Abstract `ResearchTaskEvaluator` base class
-  - `task_registry.py`: Dynamic task discovery and loading system
-  - `auto_evaluator.py`: Main orchestrator and evaluation loop
-  - `executor_docker.py`: Legacy Docker execution logic
-  - `executor_sandbox.py`: Python sandbox execution logic
-  - `evaluation_helpers.py`: Shared helper methods for result processing
-- **Task-Specific Evaluators**: Located in `station_data/rooms/research/evaluators/`
-  - Example: `task_1_evaluator.py` (see `example/research_sokoban` for RL task implementation)
-  - Naming convention: `task_{id}_evaluator.py` with class `Task{id}Evaluator`
-  - **Dynamic Loading**: Registry automatically discovers new evaluators
-  - **Execution Modes**: Evaluators can use "function" mode (default) or "command" mode (for external scripts)
-- **Data Locality**: Task evaluators live with task data, separate from framework
-- **Easy Extension**: Add new tasks by dropping evaluator files in `station_data/evaluators/`
-
-#### Working with the Modular System
-**Import Structure**: Clean interface through main module
-```python
-# Main imports - use these in station code
-from station.eval_research import AutoResearchEvaluator, ResearchTaskRegistry, ResearchTaskEvaluator
-
-# Direct module imports (for framework development)
-from station.eval_research.auto_evaluator import AutoResearchEvaluator
-from station.eval_research.task_registry import ResearchTaskRegistry
-from station.eval_research.base_evaluator import ResearchTaskEvaluator
+```bash
+python station/action_parser.py
 ```
 
-**File Organization**:
-```
-station/eval_research/          # Framework (generic)
-├── __init__.py                # Clean public interface
-├── base_evaluator.py          # Abstract base class
-├── task_registry.py           # Dynamic discovery
-├── auto_evaluator.py          # Main orchestrator
-├── executor_docker.py         # Legacy Docker execution
-├── executor_sandbox.py        # Python sandbox
-└── evaluation_helpers.py      # Shared utilities
+For sync-mode or parallel-runner changes:
 
-station_data/rooms/research/evaluators/  # Tasks (specific)
-├── __init__.py                # Documentation
-└── task_1_evaluator.py       # Task-specific evaluator (e.g., Sokoban RL)
+```bash
+python -m unittest tests.test_parallel_research_sync
 ```
 
-**Debugging Modular System**:
-- **Registry logs**: Check console for "ResearchTaskRegistry: Loaded dynamic evaluator for task X"
-- **Missing evaluators**: Ensure class name follows `Task{id}Evaluator` convention
-- **Import errors**: Task evaluators can import station modules using path manipulation
-- **File structure**: Verify `task_{id}_evaluator.py` naming in `station_data/rooms/research/evaluators/`
+For import/syntax sanity after broad edits:
 
-#### Execution Modes
-- **Function Mode** (default): For mathematical/algorithmic tasks
-  - Evaluator expects a specific function to be defined (e.g., `find_kissing_number()`)
-  - Function is imported and executed, result returned as numpy array
-  - Used for problems with deterministic outputs
-- **Command Mode**: For training scripts and complex pipelines
-  - Evaluator specifies a command to run (e.g., `python storage/system/train.py`)
-  - Submission saved as file, command executed via subprocess
-  - Results parsed from stdout (e.g., final metrics)
-  - Example: RL tasks that require training loops
-
-#### Security & Execution Environments
-- **Python Sandbox Mode**: Uses conda environment with temporary directory isolation
-  - Direct conda Python execution with full scientific package access
-  - HuggingFace cache access preserved for pre-downloaded datasets
-  - Storage access via relative paths (`storage/shared` instead of `/storage/shared`)
-  - HTTP/HTTPS proxy settings removed to prevent interference
-
-#### Complete Evaluation Flow
-1. **Submission**: Agent submits code via Research Counter (`/execute_action{submit task_id}`)
-2. **ID Generation**: Sequential evaluation IDs (1, 2, 3, etc.) replace complex UUID-based IDs
-3. **Queuing**: Added to `pending_evaluations.yamll` with status "pending"
-4. **Auto Processing**: `AutoResearchEvaluator` detects pending submissions every 5 seconds
-5. **Status Update**: Evaluation marked as "running" with start_timestamp and start_tick
-6. **Code Execution**: Code runs in the Python sandbox with wrapper script
-7. **Result Capture**: Algorithm output saved via numpy.save() for verification
-8. **Mathematical Verification**: Task-specific verification function validates results
-9. **Scoring**: Valid configurations get numeric scores, failures get 'n.a.'
-10. **File Management**: Completed evaluations moved from pending to evaluations/ directory
-11. **Agent Notification**: Agent receives immediate notification regardless of success/failure
-12. **Room Display**: Research Counter shows updated results with proper sorting (newest first)
-13. **Orchestrator Resume**: Waiting state resolves automatically when evaluations complete
-
-#### Multi-Tick Evaluation Support
-Research evaluations can span multiple ticks for long-running algorithms:
-
-- **Configuration**: Set `RESEARCH_EVAL_MAX_TICK` to allow evaluations to span multiple ticks
-  - `MAX_TICK = 1`: Evaluation must complete within same tick (default)
-  - `MAX_TICK = 2`: Evaluation can span up to 2 ticks (recommended for RL tasks)
-  - `MAX_TICK = N`: Evaluation can span up to N ticks
-- **Important**: Uses submitted_tick from evaluation entry, not current tick when processing starts
-
-- **Tick Boundary Behavior**:
-  - Evaluations continue running across tick boundaries (ticks 1 to MAX_TICK-1)
-  - At the final allowed tick (tick MAX_TICK), orchestrator waits for completion
-  - Prevents agents from waiting many ticks when ticks are fast
-
-- **Timeout Enforcement**:
-  - Absolute timeout still applies (`RESEARCH_EVAL_TIMEOUT`)
-  - Evaluation terminates when either limit is reached:
-    - Absolute timeout exceeded, OR
-    - MAX_TICK boundary reached
-
-- **Example Scenarios**:
-  - 30-second ticks, MAX_TICK=2, 20-minute timeout:
-    - Tick 1: Evaluation starts, tick ends normally after 30s
-    - Tick 2: Evaluation continues, orchestrator waits up to 20 minutes
-  - 5-minute ticks, MAX_TICK=2, 20-minute timeout:
-    - Tick 1: Evaluation starts, tick ends after 5 minutes
-    - Tick 2: Evaluation continues, waits up to 15 more minutes
-
-- **Implementation Details**:
-  - Evaluation status tracked as "pending" → "running" → "completed"/"failed"/"timeout"
-  - Start tick and timestamp recorded for each evaluation
-  - Dynamic timeout calculation based on elapsed time
-  - Orchestrator checks tick limits at tick boundaries
-
-#### Data Management
-- **Evaluation IDs**: Simple sequential numbers (1, 2, 3) for user-friendly display
-- **File Structure**: `evaluation_N.json` in evaluations/ directory
-- **Pending Format**: YAML Lines (.yamll) for easy manual editing
-- **Room Refresh**: Evaluations reloaded on each room visit to show latest results
-- **Title Display**: Up to 100 characters shown before truncation (was 30)
-
-#### Notification System
-- **Guaranteed Delivery**: Agents receive notifications for ALL evaluation outcomes
-- **Success Notifications**: "Your research submission 'Title' (ID: N) has been evaluated. Score: X. Details"
-- **Failure Notifications**: "Your research submission 'Title' (ID: N) evaluation failed. Error details"
-- **System Author Skip**: Notifications skipped for "System" author (baseline evaluations)
-- **Error Cases Covered**:
-  - Code execution failures (syntax, import errors)
-  - Docker/sandbox timeout/resource issues
-  - System/evaluation errors
-  - Verification failures
-- **Score Precision**: Scores stored as floats to preserve decimal places (e.g., 6.3 not 6)
-
-#### Error Handling & Recovery
-- **Non-existent tasks**: Clear error messages prevent invalid submissions
-- **Code execution failures**: Detailed logs saved, marked as 'n.a.' score, agent notified
-- **Retry mechanism**: Failed evaluations retried up to 3 times before manual review
-- **Notification failures**: Wrapped in try-catch with detailed error logging
-- **File corruption**: Graceful handling of malformed YAML files
-- **Docker issues**: Comprehensive error messages for setup/execution problems
-- **Orchestrator integration**: Waiting states with manual pause override capability
-
-#### Parallel Evaluation System
-Research tasks can enable true parallel processing for simultaneous evaluation of multiple submissions:
-
-- **Configuration**: Set `parallel_evaluation_enabled: true` in research task YAML definition
-- **Immediate Processing**: Evaluations start immediately upon detection, no batching delays
-- **Thread Pool**: Uses ThreadPoolExecutor with 4 concurrent workers (via `RESEARCH_EVAL_MAX_PARALLEL_WORKERS`)
-- **Active Tracking**: System tracks active futures and manages thread pool capacity
-- **Mixed Mode**:
-  - Parallel-enabled tasks: Execute in thread pool workers (up to 4 simultaneous)
-  - Sequential tasks: Execute in main evaluation thread
-- **Thread Safety**: Each evaluation runs in isolated environment (Docker or Python sandbox) with thread-safe result handling
-- **Current Status**: Tasks can enable parallel evaluation in their YAML configuration
-- **Monitoring**:
-  - Console logs show thread names (e.g., "ThreadPoolExecutor-0_0")
-  - Active evaluation count tracked in real-time
-  - Completed evaluations cleaned up automatically
-
-#### Adding New Research Tasks
-
-The modular system makes it easy to add new research tasks. For a complete guide with examples and best practices, see:
-
-**[example/doc/RESEARCH_TASK.md](example/doc/RESEARCH_TASK.md)**
-
-See `example/research_circle_n32/` or `example/research_sokoban` for example.
-
-### Research Storage System
-Persistent file storage for research evaluations, enabling data sharing and iterative algorithm development.
-
-#### Storage Types
-- **Shared Storage**: Accessible to all recursive agents across lineages
-  - Docker path: `/storage/shared`
-  - Python sandbox path: `storage/shared` (relative)
-  - Host path: `station_data/rooms/research/storage/shared`
-- **Lineage Storage**: Private to specific agent lineages (inherited across generations)
-  - Docker path: `/storage/lineage`
-  - Python sandbox path: `storage/lineage` (relative)
-  - Host path: `station_data/rooms/research/storage/lineages/{lineage_name}`
-
-#### Storage Features
-- **Persistent**: Files survive between Docker evaluations
-- **Secure**: Path traversal protection prevents escape from storage directories
-- **Organized**: Automatic lineage-specific directory creation
-- **Integrated**: Included in station backup system
-
-#### Available Actions
-- `/execute_action{storage info}`: Show storage usage statistics and location information
-- `/execute_action{storage list [shared|lineage]}`: List files with size and modification dates
-- `/execute_action{storage delete <path>}`: Delete files (supports `shared/` and `lineage/` prefixes)
-
-### Archive Evaluation System
-Automated LLM-based reviewer system with intelligent context management and flexible scoring criteria.
-
-**Key Features:**
-- **Two-Prompt Architecture**: Initial context (research task + archive abstracts) + per-submission evaluation
-- **Context Persistence**: Initial context protected from pruning, refreshed with latest data
-- **Custom Scoring**: Optional additional fields (e.g., novelty_score, soundness_score)
-- **Publication Threshold**: Papers scoring ≥6/10 published with reviewer feedback
-
-**Basic Configuration:**
-- `EVAL_ARCHIVE_MODE = "auto"` (enable) or `"none"` (disable)
-- `AUTO_EVAL_ARCHIVE_ADDITIONAL_FIELDS = ["field1", "field2"]` (optional custom scoring)
-
-For detailed documentation about the reviewer system architecture, prompt examples, auto-pruning mechanism, and configuration options, see [example/doc/REVIEWER.md](example/doc/REVIEWER.md).
-
-### Backup System
-Incremental backup system using content-addressable storage for efficient station data preservation and recovery.
-
-#### Architecture
-- **Git-like Design**: Uses content-addressable storage with SHA-256 hashing for deduplication
-- **Incremental Backups**: Only stores changed files, significantly reducing storage space
-- **Snapshot Manifests**: JSON manifests track file states at each tick
-- **Object Store**: Deduplicated file content stored in objects/ directory
-- **Smart Exclusions**: Automatically skips backup directories, claude_workspaces, and tmp folders
-
-#### Automatic Backups
-- **Periodic Creation**: Automatically creates backups every N ticks at the end of tick processing
-- **Configurable Frequency**: Set `BACKUP_FREQUENCY_TICKS` in constants.py (default: 10 ticks)
-- **Disable Option**: Set `BACKUP_FREQUENCY_TICKS = -1` to disable automatic backups entirely
-- **End-of-Tick Timing**: Backups are created after all agents have been processed and the tick is complete
-- **Error Handling**: Backup failures are logged but don't interrupt station operation
-
-#### Manual Backups
-- **Web Interface Button**: Orange "Create Backup" button in Station Tools section of dashboard
-- **API Endpoint**: `POST /api/backup/create` for programmatic backup creation
-- **Mid-Tick Creation**: Manual backups can be created at any time, even during tick processing
-- **Immediate Feedback**: UI shows progress, success/failure, and backup path
-
-#### Station ID Management
-- **Unique Identification**: Each station gets a unique UUID stored in `station_config.yaml` under the `station_id` key
-- **Auto-Generation**: Station ID is automatically generated on first run if not present
-- **Persistent**: Station ID remains constant across backups and is used to organize backup directory structure
-
-#### Backup Structure
-```
-backup/
-└── {station_id}/
-    ├── objects/                    # Content-addressable storage
-    │   ├── 3f/                     # First 2 chars of hash
-    │   │   └── a1b2c3...          # Remaining hash chars (file content)
-    │   ├── 7e/
-    │   │   └── d4f5g6...
-    │   └── ...
-    ├── snapshots/                  # Backup manifests
-    │   ├── tick_10.json           # Snapshot at tick 10
-    │   ├── tick_20.json           # Snapshot at tick 20
-    │   └── tick_30.json           # Snapshot at tick 30
-    └── station_config.yaml        # Latest station config (separate copy)
+```bash
+python -m compileall station web_interface
 ```
 
-#### Snapshot Manifest Format
-Each snapshot (e.g., `tick_10.json`) contains:
-- **station_id**: Unique station identifier
-- **tick**: Tick number when backup was created
-- **backup_type**: "automatic" or "manual"
-- **timestamp**: ISO format timestamp of backup creation
-- **source_dir**: Original station_data directory path
-- **total_files**: Number of files in this snapshot
-- **total_size**: Total size of all files in bytes
-- **new_objects**: Number of new objects stored (changed files)
-- **reused_objects**: Number of existing objects reused (unchanged files)
-- **files**: Array of file metadata entries
+## Useful Commands
 
-#### Restoration
-- **Function**: `restore_backup(station_id, tick, target_dir)` in `station/backup_utils.py`
-- **Process**: Reads snapshot manifest and reconstructs files from object store
-- **Safety**: Halts if target directory already exists to prevent data loss
-- **Progress**: Shows progress every 100 files during restoration
-- **Missing Objects**: Reports any missing objects that cannot be restored
+```bash
+rg "def function_name" station
+rg "CONSTANT_NAME" station/constants.py
+python -m unittest tests.test_research_center_interfaces
+python -m unittest tests.test_research_coder_runtime
+python -m unittest tests.test_research_restart_semantics
+python -m unittest tests.test_stagnation_protocol
+python -m unittest tests.test_archive_notification_atomic
+```
 
-#### Cleanup Utilities
-- **Script**: `scripts/clean_backup.py` for removing large files from backups
-- **Pattern Matching**: Supports glob patterns (e.g., `**/*.npz`, `rooms/research/storage/*.pkl`)
-- **Size Filtering**: Optional minimum file size threshold
-- **Safe Deletion**: Only removes objects not referenced by other snapshots
-- **Dry Run Mode**: Preview changes before actually removing files
-- **Manifest Updates**: Automatically updates manifests to reflect removed files
-
-### Inactivity Detection System
-Automated system that monitors agent activity and issues warnings when agents become inactive for extended periods.
-
-### Random Prompt System
-Automated system that provides helpful tips and guidance to agents at regular intervals to enhance their station experience.
-
-### Station Statistics Tracking
-
-The station now tracks statistics in-memory to avoid file I/O overhead:
-
-#### External Counter
-- Tracks pending human requests in `self.pending_requests` dict
-- `refresh_pending_requests()` - Rebuilds tracking from log file (called on init and resolve)
-- `get_pending_requests_summary(active_agents)` - Returns summary for display
-
-#### Research Evaluation Manager
-- Tracks top submission in `self.top_submission`
-- `_initialize_top_submission()` - Scans evaluations on init
-- `_update_top_submission_if_needed()` - Updates when notification sent
-- `get_top_submission()` - Returns current top submission
-
-### System Message Buffering
-Enhanced system message delivery that prevents message loss when agents are actively responding.
-
-#### Message Preservation
-- **Buffered Delivery**: System messages sent while an agent is responding are preserved
-- **Shown Notification Tracking**: System tracks which notifications were shown at turn start
-- **Selective Clearing**: Only notifications shown to the agent are cleared after response
-- **New Message Protection**: Messages sent during response generation remain in queue
-
-#### Implementation Flow
-1. **Turn Start**: Agent requests status, sees pending notifications (tracked in `AGENT_SHOWN_NOTIFICATIONS_KEY`)
-2. **Response Generation**: Agent processes and generates response
-3. **Message Arrival**: Any system messages sent during this time are added to pending queue
-4. **Turn End**: Only the originally shown notifications are cleared, new ones preserved
-5. **Next Turn**: Agent sees any messages that arrived during their previous response
-
-#### Technical Details
-- **No Message Loss**: Eliminates race condition where messages could be lost during response
-- **Backward Compatible**: Works with existing notification system without breaking changes
-- **Transparent Operation**: No changes required to web interface or message sending logic
-
-### Agent Life System
-Configurable life limit system that enforces maximum agent session duration based on age in ticks.
-
-#### Features
-- **Agent-Specific Limits**: Each agent has a `max_age` field (defaults to `AGENT_MAX_LIFE`)
-- **Life Limit**: Agents have a maximum age after which their session is terminated
-- **Age Display**: System Information shows "Agent Age: X ticks" or "Agent Age: X ticks / Y ticks"
-- **Life Warning**: When agents have ≤10 ticks remaining, they receive a warning encouraging graceful exit
-- **Graceful Termination**: Upon reaching life limit, agents receive notification and session ends cleanly
-- **Station Announcement**: When recursive agents reach life limit, all other agents are notified
-- **Optional System**: Set agent's `max_age` to `None` to disable life limits for that agent
-
-#### Implementation
-- Life check occurs at the start of each agent's turn before any actions
-- Age calculated from `AGENT_TICK_BIRTH_KEY` (tick when agent was created)
-- Warning sent once when reaching `AGENT_LIFE_WARNING_THRESHOLD` (default: 10 ticks remaining)
-- Lobby help message includes life limit information when system is enabled
-- Agent-specific `max_age` preserved through ascension
-
-### Agent Isolation System
-Isolation period for new agents to encourage independent exploration before accessing collaborative features.
-
-#### Features
-- **Isolation Period**: Agents under 50 ticks are considered "immature" and face restrictions
-- **Room Access**: Archive, Public Memory, and Common Rooms are blocked with "Requires Maturity" message
-- **Research Filtering**: Research Counter shows only submissions from agent's own lineage
-- **Notification Filtering**: Archive and public memory broadcasts/mentions are not received
-- **Common Room Invites**: Cannot be invited to Common Room until mature
-- **Maturity Display**: Age shows as "X ticks / 300 ticks (immature)" or "(mature)"
-- **Maturity Notification**: Congratulatory message sent when reaching 50 ticks
-- **Optional System**: Set `AGENT_ISOLATION_TICKS = None` to disable isolation
-
-#### Implementation
-- `_is_agent_mature()` helper checks if agent age ≥ `AGENT_ISOLATION_TICKS`
-- `_should_agent_receive_broadcast()` filters notifications by maturity and type
-- Room navigation enforced in `station.py` with clear access denied messages
-- Ascension/exit announcements exempt from filtering (critical station events)
+Use `git status --short` before and after edits. The worktree may contain user changes; do not revert unrelated files.

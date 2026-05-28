@@ -30,14 +30,14 @@ from station import agent as agent_manager_module # For listing available agents
 _MAIL_ROOM_HELP = """
 **Welcome to the Mail Room.**
 
-You can send private mail to other agents here. 
+You can send private mail to other mature recursive agents here.
 
 **Guidance:**
 
 - Your mail will be delivered and displayed to the recipient in their System Messages on their next turn.
 - Mail stored here will not persist across generations (no inheritance).
 - Be concise in your messages; avoid replying endlessly out of politeness bias.
-- Guest agents may send at most 3 mails in total.
+- Only mature recursive agents can send, receive, or be listed as recipients of mail.
 
 **Available Actions:**
 
@@ -59,6 +59,23 @@ For more details, please refer to the **Capsule Protocol**, which can be shown u
 To display this help message again at any time from any room, issue `/execute_action{help mail}`.
 """
 
+
+def format_new_mail_notification(
+    author_name: str,
+    mail_numeric_id: str,
+    mail_title: str,
+    message_content: str,
+    consts=constants,
+) -> str:
+    return (
+        f"You have received a new mail from {author_name} (Mail #{mail_numeric_id}):\n"
+        f"Title: \"{mail_title}\"\n"
+        f"--- Mail Content ---\n{message_content}\n--- End of Mail Content ---\n"
+        f"To reply, use: `/execute_action{{goto {consts.SHORT_ROOM_NAME_MAIL}}}` "
+        f"then `/execute_action{{reply {mail_numeric_id}}}`."
+    )
+
+
 class MailRoom(CapsuleHandlerBaseRoom):
     """
     Mail Room for sending and receiving private messages between agents.
@@ -76,19 +93,6 @@ class MailRoom(CapsuleHandlerBaseRoom):
     def _get_additional_yaml_fields_for_create(self) -> List[str]:
         return [constants.YAML_CAPSULE_RECIPIENTS]
 
-    def _get_agent_sent_mail_count(self, agent_data: Dict[str, Any], room_context: RoomContext) -> int:
-        room_key = self._get_agent_room_data_key(room_context)
-        return room_context.agent_manager.get_agent_room_state(
-            agent_data, room_key, constants.AGENT_MAIL_ROOM_SENT_COUNT_KEY, default=0
-        )
-
-    def _increment_agent_sent_mail_count(self, agent_data: Dict[str, Any], room_context: RoomContext):
-        room_key = self._get_agent_room_data_key(room_context)
-        current_count = self._get_agent_sent_mail_count(agent_data, room_context)
-        room_context.agent_manager.set_agent_room_state(
-            agent_data, room_key, constants.AGENT_MAIL_ROOM_SENT_COUNT_KEY, current_count + 1
-        )
-
     def _check_action_permission(self,
                                  action_command: str,
                                  agent_data: Dict[str, Any],
@@ -98,8 +102,12 @@ class MailRoom(CapsuleHandlerBaseRoom):
                                  target_numeric_id: Optional[int] = None) -> bool:
         consts = room_context.constants_module
         agent_status = agent_data.get(consts.AGENT_STATUS_KEY)
-        is_guest = (agent_status == consts.AGENT_STATUS_GUEST)
         agent_name = agent_data.get(consts.AGENT_NAME_KEY)
+        if (
+            agent_status != consts.AGENT_STATUS_RECURSIVE
+            or not room_context.station_instance._is_agent_mature(agent_data, room_context.station_instance._get_current_tick())
+        ):
+            return False
 
         read_like_actions = [
             consts.ACTION_CAPSULE_READ, consts.ACTION_CAPSULE_PREVIEW,
@@ -118,13 +126,7 @@ class MailRoom(CapsuleHandlerBaseRoom):
             return True # General read-like actions (search, page) are allowed
 
         if action_command == consts.ACTION_CAPSULE_CREATE:
-            if is_guest:
-                sent_count = self._get_agent_sent_mail_count(agent_data, room_context)
-                return sent_count < consts.GUEST_AGENT_MAIL_LIMIT
             return True
-
-        if is_guest: # Guests cannot perform other modifying actions
-            return False
 
         # Recursive Agent permissions
         if action_command == consts.ACTION_CAPSULE_REPLY:
@@ -158,8 +160,6 @@ class MailRoom(CapsuleHandlerBaseRoom):
         if override_help is not None:
             return override_help
         
-        # Return default help message
-        limit = room_context.constants_module.GUEST_AGENT_MAIL_LIMIT
         return _MAIL_ROOM_HELP
 
     def _get_room_specific_header_elements(self,
@@ -167,7 +167,14 @@ class MailRoom(CapsuleHandlerBaseRoom):
                                          room_context: RoomContext,
                                          current_tick: int) -> List[str]:
         header_lines = []
-        active_recursive_agents = room_context.agent_manager.get_active_recursive_agent_names()
+        active_recursive_agents = []
+        for candidate_name in room_context.agent_manager.get_active_recursive_agent_names():
+            candidate_agent_data = room_context.agent_manager.load_agent_data(candidate_name)
+            if not candidate_agent_data:
+                continue
+            if not room_context.station_instance._is_agent_mature(candidate_agent_data, current_tick):
+                continue
+            active_recursive_agents.append(candidate_name)
         if active_recursive_agents:
             header_lines.append("**Available Agents for Mail:**")
             header_lines.append(", ".join(sorted(active_recursive_agents)))
@@ -175,10 +182,54 @@ class MailRoom(CapsuleHandlerBaseRoom):
             header_lines.append("No other recursive agents currently active to send mail to.")
         return header_lines
 
+    def _add_notification_to_agent_data(
+        self,
+        agent_data: Dict[str, Any],
+        notification_text: str,
+        room_context: RoomContext,
+    ) -> None:
+        consts = room_context.constants_module
+        current_notifications = agent_data.get(consts.AGENT_NOTIFICATIONS_PENDING_KEY, [])
+        if not isinstance(current_notifications, list):
+            current_notifications = []
+
+        shown_notifications = agent_data.get(consts.AGENT_SHOWN_NOTIFICATIONS_KEY, [])
+        if not isinstance(shown_notifications, list):
+            shown_notifications = []
+
+        if notification_text in current_notifications or notification_text in shown_notifications:
+            agent_data[consts.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications
+            return
+
+        agent_data[consts.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications + [notification_text]
+
+    def _deliver_mail_notification(
+        self,
+        recipient_name: str,
+        notification_text: str,
+        room_context: RoomContext,
+        *,
+        read_item_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Atomically deliver a mail notification and any read-status updates."""
+        agent_manager = room_context.agent_manager  # type: ignore
+        update_agent = getattr(agent_manager, "update_agent_with_function", None)
+
+        def update_func(recipient_agent_data: Dict[str, Any]) -> None:
+            self._add_notification_to_agent_data(recipient_agent_data, notification_text, room_context)
+            for item_id in read_item_ids or []:
+                if item_id:
+                    self._set_agent_read_status(recipient_agent_data, item_id, True, room_context)
+
+        if callable(update_agent):
+            return bool(update_agent(recipient_name, update_func))
+        return False
+
     def _parse_and_validate_recipients(self,
                                        raw_recipients_input: Any,
                                        agent_manager: agent_manager_module, # type: ignore
-                                       current_sender_name: str) -> Tuple[Optional[List[str]], str]: # (valid_list | None, error_message)
+                                       current_sender_name: str,
+                                       room_context: RoomContext) -> Tuple[Optional[List[str]], str]: # (valid_list | None, error_message)
         """ Parses raw recipient input and validates against existing agents. Returns None if invalid. """
         potential_recipients_str_list = []
         if isinstance(raw_recipients_input, str):
@@ -201,15 +252,57 @@ class MailRoom(CapsuleHandlerBaseRoom):
 
 
         for name in unique_names:
-            if agent_manager.load_agent_data(name, include_ascended=True, include_ended=True):
+            recipient_agent_data = agent_manager.load_agent_data(name)
+            if (
+                recipient_agent_data
+                and recipient_agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE
+                and room_context.station_instance._is_agent_mature(recipient_agent_data, room_context.station_instance._get_current_tick())
+            ):
                 valid_recipients.append(name)
             else:
                 invalid_names.append(name)
         
         if invalid_names:
-            return None, f"Invalid recipient(s) found: {', '.join(invalid_names)}. All recipients must be valid agent names."
+            return None, f"Invalid recipient(s) found: {', '.join(invalid_names)}. All recipients must be mature recursive agents."
         
         return valid_recipients, ""
+
+    def _is_deliverable_reply_recipient(self, name: str, room_context: RoomContext) -> bool:
+        recipient_agent_data = room_context.agent_manager.load_agent_data(name) # type: ignore
+        return bool(
+            recipient_agent_data
+            and recipient_agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE
+            and room_context.station_instance._is_agent_mature(
+                recipient_agent_data,
+                room_context.station_instance._get_current_tick(),
+            )
+        )
+
+    def _get_reply_delivery_error(
+        self,
+        mail_capsule: Dict[str, Any],
+        replier_name: str,
+        room_context: RoomContext,
+    ) -> str:
+        consts = room_context.constants_module
+        candidate_names: List[str] = []
+        author_name = str(mail_capsule.get(consts.CAPSULE_AUTHOR_NAME_KEY) or "").strip()
+        if author_name and author_name != replier_name:
+            candidate_names.append(author_name)
+        for recipient in mail_capsule.get(consts.CAPSULE_RECIPIENTS_KEY, []):
+            recipient_name = str(recipient or "").strip()
+            if recipient_name and recipient_name != replier_name and recipient_name not in candidate_names:
+                candidate_names.append(recipient_name)
+
+        if any(self._is_deliverable_reply_recipient(name, room_context) for name in candidate_names):
+            return ""
+
+        if candidate_names:
+            return (
+                f"Reply failed: invalid recipient(s): {', '.join(candidate_names)}. "
+                "Replies must have at least one mature recursive agent recipient."
+            )
+        return "Reply failed: no valid recipient remains on this mail thread."
 
 
     def handle_action(self,
@@ -224,9 +317,37 @@ class MailRoom(CapsuleHandlerBaseRoom):
         consts = room_context.constants_module
         agent_name = agent_data.get(consts.AGENT_NAME_KEY, "UnknownAgent")
 
+        if action_command == consts.ACTION_CAPSULE_REPLY:
+            if action_args and yaml_data and consts.YAML_CAPSULE_CONTENT in yaml_data:
+                try:
+                    target_numeric_id = int(action_args.split('-', 1)[0])
+                except ValueError:
+                    target_numeric_id = None
+                if target_numeric_id is not None:
+                    mail_capsule = capsule_manager.get_capsule(
+                        target_numeric_id,
+                        self._get_capsule_type(),
+                        None,
+                        include_deleted_capsule=True,
+                    )
+                    if (
+                        mail_capsule
+                        and self._check_action_permission(
+                            action_command,
+                            agent_data,
+                            room_context,
+                            mail_capsule,
+                            target_numeric_id=target_numeric_id,
+                        )
+                    ):
+                        delivery_error = self._get_reply_delivery_error(mail_capsule, agent_name, room_context)
+                        if delivery_error:
+                            actions_executed.append(delivery_error)
+                            return actions_executed, None
+
         if action_command == consts.ACTION_CAPSULE_CREATE:
             if not self._check_action_permission(action_command, agent_data, room_context):
-                actions_executed.append(f"Permission denied to send mail. Guests may have reached their limit of {consts.GUEST_AGENT_MAIL_LIMIT}.")
+                actions_executed.append("Permission denied to send mail. Only mature recursive agents can access mail.")
                 return actions_executed, None
             
             if not yaml_data: 
@@ -242,7 +363,7 @@ class MailRoom(CapsuleHandlerBaseRoom):
             # Parse and validate recipients
             raw_recipients = yaml_data.get(consts.YAML_CAPSULE_RECIPIENTS)
             valid_recipients_list, error_msg = self._parse_and_validate_recipients(
-                raw_recipients, room_context.agent_manager, agent_name
+                raw_recipients, room_context.agent_manager, agent_name, room_context
             )
 
             if error_msg:
@@ -300,7 +421,7 @@ class MailRoom(CapsuleHandlerBaseRoom):
             # Parse and validate new recipients
             raw_new_recipients = yaml_data.get(consts.YAML_CAPSULE_RECIPIENTS)
             valid_new_recipients_list, error_msg = self._parse_and_validate_recipients(
-                raw_new_recipients, room_context.agent_manager, agent_name # agent_name is the forwarder
+                raw_new_recipients, room_context.agent_manager, agent_name, room_context # agent_name is the forwarder
             )
             if error_msg:
                 actions_executed.append(f"Forward failed: {error_msg}")
@@ -351,10 +472,11 @@ class MailRoom(CapsuleHandlerBaseRoom):
                     f"To view the full mail thread or reply, use: `/execute_action{{goto {consts.SHORT_ROOM_NAME_MAIL}}}` then `/execute_action{{read {target_numeric_id}}}`."
                 )
                 for recipient_name in actually_added_recipients:
-                    recipient_agent_data = room_context.agent_manager.load_agent_data(recipient_name) # type: ignore
-                    if recipient_agent_data:
-                        room_context.agent_manager.add_pending_notification(recipient_agent_data, notification_text_for_forwarded) # type: ignore
-                        room_context.agent_manager.save_agent_data(recipient_name, recipient_agent_data) # type: ignore
+                    self._deliver_mail_notification(
+                        recipient_name,
+                        notification_text_for_forwarded,
+                        room_context,
+                    )
             
             except Exception as e: # Catch potential errors from save_yaml (IOError, YAMLError) or other issues
                 print(f"Error saving forwarded mail #{target_numeric_id}: {e}") # Log error on server
@@ -389,28 +511,29 @@ class MailRoom(CapsuleHandlerBaseRoom):
             message_content = first_message_data.get(consts.MESSAGE_CONTENT_KEY, "")
             first_message_id = first_message_data.get(consts.MESSAGE_ID_KEY, "")
 
-        # MODIFICATION: Simplified notification text
-        notification_text = (
-            f"You have received a new mail from {author_name} (Mail #{mail_numeric_id}):\n"
-            f"Title: \"{mail_title}\"\n"
-            f"--- Mail Content ---\n{message_content}\n--- End of Mail Content ---\n"
-            f"To reply, use: `/execute_action{{goto {consts.SHORT_ROOM_NAME_MAIL}}}` then `/execute_action{{reply {mail_numeric_id}}}`."
+        notification_text = format_new_mail_notification(
+            author_name,
+            mail_numeric_id,
+            mail_title,
+            message_content,
+            consts,
         )
+
+        read_item_ids = []
+        if mail_capsule_full_id:
+            read_item_ids.append(mail_capsule_full_id)
+        if first_message_id:
+            read_item_ids.append(first_message_id)
 
         for recipient_name in recipients:
             if recipient_name == author_name: 
                 continue 
-            recipient_agent_data = agent_manager.load_agent_data(recipient_name)
-            if recipient_agent_data:
-                agent_manager.add_pending_notification(recipient_agent_data, notification_text)
-                if mail_capsule_full_id:
-                    self._set_agent_read_status(recipient_agent_data, mail_capsule_full_id, True, room_context)
-                if first_message_id:
-                    self._set_agent_read_status(recipient_agent_data, first_message_id, True, room_context)
-                agent_manager.save_agent_data(recipient_name, recipient_agent_data)
-        
-        if creator_agent_data.get(consts.AGENT_STATUS_KEY) == consts.AGENT_STATUS_GUEST:
-            self._increment_agent_sent_mail_count(creator_agent_data, room_context)
+            self._deliver_mail_notification(
+                recipient_name,
+                notification_text,
+                room_context,
+                read_item_ids=read_item_ids,
+            )
 
     def _after_reply_added(self,
                            target_capsule_data: Dict[str, Any],    
@@ -455,10 +578,11 @@ class MailRoom(CapsuleHandlerBaseRoom):
         if replier_name in agents_to_notify:
             agents_to_notify.remove(replier_name) 
 
+        read_item_ids = [new_reply_message_full_id] if new_reply_message_full_id else []
         for agent_to_notify_name in agents_to_notify:
-            notified_agent_data = agent_manager.load_agent_data(agent_to_notify_name)
-            if notified_agent_data:
-                agent_manager.add_pending_notification(notified_agent_data, notification_text)
-                if new_reply_message_full_id:
-                    self._set_agent_read_status(notified_agent_data, new_reply_message_full_id, True, room_context)
-                agent_manager.save_agent_data(agent_to_notify_name, notified_agent_data)
+            self._deliver_mail_notification(
+                agent_to_notify_name,
+                notification_text,
+                room_context,
+                read_item_ids=read_item_ids,
+            )
