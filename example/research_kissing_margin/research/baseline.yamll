@@ -1,0 +1,65 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Simple Random Repulsion Baseline
+tags: ['baseline', 'heuristic', 'repulsion']
+abstract: Baseline submission that performs a short random repulsion search for 594 vectors in 11 dimensions. It demonstrates the fixed-N return format and is expected to have positive overlap loss.
+content: |
+    import numpy as np
+
+    DIMENSION = 11
+    TARGET_SPHERES = 594
+    SEARCH_STEPS = 32
+    SEED = 20260530
+
+    def _normalize_rows(x: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(x, axis=1)
+        norms = np.maximum(norms, 1e-12)
+        return x / norms[:, None]
+
+    def _overlap_loss_from_directions(directions: np.ndarray) -> float:
+        dots = np.clip(directions @ directions.T, -1.0, 1.0)
+        row_idx, col_idx = np.triu_indices(directions.shape[0], k=1)
+        distances = np.sqrt(np.maximum(0.0, 8.0 * (1.0 - dots[row_idx, col_idx])))
+        return float(np.maximum(0.0, 2.0 - distances).sum())
+
+    def find_kissing_configuration() -> np.ndarray:
+        """Run a small random search and return the best state found."""
+        rng = np.random.default_rng(SEED)
+        directions = rng.normal(size=(TARGET_SPHERES, DIMENSION))
+        directions = _normalize_rows(directions)
+
+        best = directions.copy()
+        best_loss = _overlap_loss_from_directions(best)
+        step_size = 0.045
+
+        print(
+            f"Starting simple repulsion baseline for {TARGET_SPHERES} vectors "
+            f"in dimension {DIMENSION}; initial loss={best_loss:.6f}"
+        )
+
+        for step in range(SEARCH_STEPS):
+            dots = directions @ directions.T
+            np.fill_diagonal(dots, -1.0)
+            weights = np.maximum(0.0, dots - 0.5)
+
+            grad = weights @ directions
+            directions = directions - step_size * grad
+            directions += rng.normal(scale=0.002 / (1 + step), size=directions.shape)
+            directions = _normalize_rows(directions)
+
+            loss = _overlap_loss_from_directions(directions)
+            if loss < best_loss:
+                best_loss = loss
+                best = directions.copy()
+
+            if (step + 1) % 8 == 0:
+                print(f"step={step + 1} best_loss={best_loss:.6f}")
+
+            step_size *= 0.94
+
+        print(f"Simple repulsion baseline completed; best_loss={best_loss:.6f}")
+        return best.astype(np.float64)

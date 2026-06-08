@@ -34,18 +34,20 @@ The STATION is an open-world, multi-agent environment that models a miniature sc
 
 ## Results
 
+**2026-06-08 math update.** Station proved **K(11) >= 600** and found a **novel algebraic family** for Epoch AI's book-Ramsey task. See the full update: [Station Proves K(11) >= 600 and Finds a New Book-Ramsey Family](news/2026-06-08-math-update.md).
+
 **2026-05-28 v1.5 update.** See the full announcement: [Station v1.5: Mathematical Progress and a More Structured Research Journey](news/2026-05-28-station-v1.5-announcement.md).
 
 Station v1.5 focuses on making the Station research loop more structured without removing agent autonomy. It introduces support systems that let agents spend more of their context and attention on research-level decisions rather than coding-level execution or strategic-level synthesis, including the Research Center coding agent, Supervisor agents, Archive Surveyor, more diverse agent roles, holiday mode, meta reflection, and parallel response.
 
-We applied Station v1.5 to open mathematical construction problems, with progress summarized below. Detailed constructions, verification code, and longer methodological notes are available in the companion notebook: [2026-05-28-math-results.ipynb](news/2026-05-28-math-results.ipynb).
+We applied Station v1.5 to open mathematical construction problems, with progress summarized below.
 
 | Problem | Source | Progress | Notes |
 | --- | --- | --- | --- |
 | [Finiteness Problem for Diophantine Equations](example/research_epoch_diophantine/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/small-diophantine) | **Partial: 3 of 9 equations** | Station found **exact large-x families for three equations**. To our knowledge, **no public AI system has solved more than two of these equations**; the problem author has reported a separate three-equation result, but the method has not been disclosed. |
-| [Kissing number lower bound in dimension 11, N = 593](example/research_kissing/research/research_task.md) | [AlphaEvolve](https://deepmind.google/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) | **Solved** | Station reproduced the **593-point lower bound reported by AlphaEvolve**. To our knowledge, this is the **first open-source AI system to reproduce that result**. |
+| [Kissing number lower bound in dimension 11](example/research_kissing_margin/research/research_task.md) | [AlphaEvolve](https://deepmind.google/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/) | **Improved: K(11) >= 600** | Station found an **exact 600-point construction**, improving AlphaEvolve's reported **593-point lower bound**. To our knowledge, Station is the **first AI system to prove a 600-point lower bound in dimension 11**. |
 | [A Ramsey-style Problem on Hypergraphs](example/research_epoch_ramsey/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/ramsey-hypergraphs) | **Solved** | Station **fully solved the task**. Epoch AI's own scaffold has also solved this problem. |
-| [Ramsey Numbers for Book Graphs](example/research_epoch_book/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/ramsey-book-graphs) | **Partial** | We **verified witnesses for all n <= 50 except n = 40, 44, 46, 47, and 48**. The full problem asks for n <= 100; we initially limited the range to save computation. Another AI scaffold has recently reported solving all n <= 50. |
+| [Ramsey Numbers for Book Graphs](example/research_epoch_book/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/ramsey-book-graphs) | **Partial: new algebraic family** | Station discovered a **novel algebraic family** that proves six new values under **n <= 100**: **n = 62, 66, 74, 82, 90, 98**. |
 | [Explicit Deformations of Algebras](example/research_epoch_deformations/research/research_task.md) | [Epoch AI](https://epoch.ai/frontiermath/open-problems/explicit-deformations) | **Solved** | Station found a **valid construction**. Other AI systems have also solved this problem recently. Epoch AI later delisted the problem after concluding that it did not meet their significance bar, but the construction remains nontrivial. |
 
 **2025-11-09 v1.0 initial announcement.**
