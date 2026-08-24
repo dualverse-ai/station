@@ -19,8 +19,21 @@ from station import file_io_utils
 from station import index_paths
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 _INDEX_LOCK = threading.RLock()
+_SORT_INDEX_READY_PATHS: set[str] = set()
+
+_CAPSULE_SORT_EXPRESSIONS = {
+    "numeric_id": "m.numeric_id",
+    "title": "m.title COLLATE NOCASE",
+    "author": "m.author_name COLLATE NOCASE",
+    "created_at_tick": "m.created_at_tick",
+    "last_updated_at_tick": "m.last_updated_at_tick",
+    "word_count": "m.word_count_total",
+    "message_count": "m.total_message_count",
+    "question_status": "m.question_status COLLATE NOCASE",
+    "question_net_upvote": "m.question_net_upvote",
+}
 
 
 def get_database_path() -> str:
@@ -45,38 +58,43 @@ def ensure_capsule_index(*, rebuild: bool = False, log_status: bool = False) -> 
             rebuild_capsule_index()
         elif log_status:
             print(f"CapsuleIndex: ready path={db_path!r}")
+        if db_path not in _SORT_INDEX_READY_PATHS:
+            with index_paths.get_station_index_write_lock():
+                _ensure_sort_indexes_unlocked(db_path)
+            _SORT_INDEX_READY_PATHS.add(db_path)
 
 
 def rebuild_capsule_index() -> None:
     with _INDEX_LOCK:
-        db_path = get_database_path()
-        file_io_utils.ensure_dir_exists(os.path.dirname(db_path))
-        print(f"CapsuleIndex: rebuilding path={db_path!r}")
-        conn = _connect()
-        indexed_count = 0
-        try:
-            _configure_database(conn, setup_wal=True)
-            conn.execute("BEGIN IMMEDIATE")
-            _drop_schema(conn)
-            _create_schema(conn)
-            for capsule_type, lineage_name, numeric_id, path in _iter_all_capsule_files():
-                _upsert_file_unlocked(conn, capsule_type, lineage_name, numeric_id, path)
-                indexed_count += 1
-            _set_schema_version(conn)
-            conn.commit()
-            print(f"CapsuleIndex: rebuild complete path={db_path!r} capsules={indexed_count}")
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with index_paths.get_station_index_write_lock():
+            db_path = get_database_path()
+            file_io_utils.ensure_dir_exists(os.path.dirname(db_path))
+            print(f"CapsuleIndex: rebuilding path={db_path!r}")
+            conn = _connect()
+            indexed_count = 0
+            try:
+                _configure_database(conn, setup_wal=True)
+                conn.execute("BEGIN IMMEDIATE")
+                _drop_schema(conn)
+                _create_schema(conn)
+                for capsule_type, lineage_name, numeric_id, path in _iter_all_capsule_files():
+                    _upsert_file_unlocked(conn, capsule_type, lineage_name, numeric_id, path)
+                    indexed_count += 1
+                _set_schema_version(conn)
+                conn.commit()
+                print(f"CapsuleIndex: rebuild complete path={db_path!r} capsules={indexed_count}")
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
 
 def upsert_capsule(capsule_data: Dict[str, Any], file_path: str, lineage_name: Optional[str] = None) -> None:
     if not isinstance(capsule_data, dict):
         return
-    with _INDEX_LOCK:
-        ensure_capsule_index()
+    ensure_capsule_index()
+    with index_paths.get_station_index_write_lock():
         conn = _connect()
         try:
             _configure_database(conn)
@@ -97,6 +115,8 @@ def list_capsules(
     include_deleted: bool = False,
     limit: Optional[int] = None,
     offset: int = 0,
+    sort_by: str = "numeric_id",
+    sort_direction: str = "desc",
 ) -> Tuple[List[Dict[str, Any]], int]:
     ensure_capsule_index()
     lineage_key = _lineage_key(capsule_type, lineage_name)
@@ -112,7 +132,12 @@ def list_capsules(
     try:
         _configure_database(conn)
         total = int(conn.execute(f"SELECT COUNT(*) FROM capsule_metadata m WHERE {where}", params).fetchone()[0])
-        query = f"SELECT m.* FROM capsule_metadata m WHERE {where} ORDER BY m.numeric_id DESC"
+        sort_expression = _CAPSULE_SORT_EXPRESSIONS.get(str(sort_by), _CAPSULE_SORT_EXPRESSIONS["numeric_id"])
+        direction = "ASC" if str(sort_direction).lower() == "asc" else "DESC"
+        query = (
+            f"SELECT m.* FROM capsule_metadata m WHERE {where} "
+            f"ORDER BY {sort_expression} {direction}, m.numeric_id DESC"
+        )
         query_params = list(params)
         if limit is not None:
             query += " LIMIT ? OFFSET ?"
@@ -226,6 +251,34 @@ def _configure_database(conn: sqlite3.Connection, *, setup_wal: bool = False) ->
             pass
 
 
+def _ensure_sort_indexes_unlocked(db_path: str) -> None:
+    """Add dashboard sort indexes without rebuilding the YAML-backed read model."""
+    conn = _connect()
+    try:
+        _configure_database(conn)
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_capsule_scope_created
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, created_at_tick DESC, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_scope_updated
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, last_updated_at_tick DESC, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_scope_message_count
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, total_message_count DESC, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_scope_title
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, title COLLATE NOCASE, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_scope_author_sort
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, author_name COLLATE NOCASE, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_question_status_sort
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, question_status COLLATE NOCASE, numeric_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_capsule_question_vote_sort
+                ON capsule_metadata(capsule_type, lineage_key, is_deleted, question_net_upvote DESC, numeric_id DESC);
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _needs_rebuild() -> bool:
     db_path = get_database_path()
     if not os.path.exists(db_path):
@@ -285,6 +338,9 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             total_message_count INTEGER NOT NULL DEFAULT 0,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             reviewer_score REAL,
+            question_status TEXT,
+            question_net_upvote INTEGER,
+            question_solved_by_message_id TEXT,
             tags_json TEXT NOT NULL DEFAULT '[]',
             recipients_json TEXT NOT NULL DEFAULT '[]',
             active_message_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -293,6 +349,20 @@ def _create_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_capsule_scope_order
             ON capsule_metadata(capsule_type, lineage_key, is_deleted, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_scope_created
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, created_at_tick DESC, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_scope_updated
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, last_updated_at_tick DESC, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_scope_message_count
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, total_message_count DESC, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_scope_title
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, title COLLATE NOCASE, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_scope_author_sort
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, author_name COLLATE NOCASE, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_question_status_sort
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, question_status COLLATE NOCASE, numeric_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_capsule_question_vote_sort
+            ON capsule_metadata(capsule_type, lineage_key, is_deleted, question_net_upvote DESC, numeric_id DESC);
         CREATE INDEX IF NOT EXISTS idx_capsule_author
             ON capsule_metadata(capsule_type, lineage_key, author_name, created_at_tick);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_capsule_path
@@ -422,6 +492,15 @@ def _upsert_capsule_unlocked(
     recipients = _clean_string_list(capsule_data.get(constants.CAPSULE_RECIPIENTS_KEY))
     active_message_ids = _active_message_ids(capsule_data)
     reviewer_score = _extract_reviewer_score(capsule_data) if capsule_type == constants.CAPSULE_TYPE_ARCHIVE else None
+    question_status = _question_status(capsule_data) if capsule_type == constants.CAPSULE_TYPE_QUESTION else None
+    question_net_upvote = (
+        _as_optional_int(capsule_data.get(constants.QUESTION_NET_UPVOTE_KEY))
+        if capsule_type == constants.CAPSULE_TYPE_QUESTION else None
+    )
+    question_solved_by_message_id = (
+        _as_optional_str(capsule_data.get(constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY))
+        if capsule_type == constants.CAPSULE_TYPE_QUESTION else None
+    )
     file_mtime_ns = _file_mtime_ns(file_path)
 
     conn.execute(
@@ -430,9 +509,10 @@ def _upsert_capsule_unlocked(
             capsule_type, lineage_key, numeric_id, capsule_id, file_path, file_mtime_ns,
             author_name, author_lineage, author_generation, created_at_tick, last_updated_at_tick,
             title, abstract, word_count_total, total_message_count, is_deleted, reviewer_score,
+            question_status, question_net_upvote, question_solved_by_message_id,
             tags_json, recipients_json, active_message_ids_json
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(capsule_type, lineage_key, numeric_id) DO UPDATE SET
             capsule_id = excluded.capsule_id,
             file_path = excluded.file_path,
@@ -448,6 +528,9 @@ def _upsert_capsule_unlocked(
             total_message_count = excluded.total_message_count,
             is_deleted = excluded.is_deleted,
             reviewer_score = excluded.reviewer_score,
+            question_status = excluded.question_status,
+            question_net_upvote = excluded.question_net_upvote,
+            question_solved_by_message_id = excluded.question_solved_by_message_id,
             tags_json = excluded.tags_json,
             recipients_json = excluded.recipients_json,
             active_message_ids_json = excluded.active_message_ids_json
@@ -470,6 +553,9 @@ def _upsert_capsule_unlocked(
             len(active_message_ids),
             1 if bool(capsule_data.get(constants.CAPSULE_IS_DELETED_KEY, False)) else 0,
             reviewer_score,
+            question_status,
+            question_net_upvote,
+            question_solved_by_message_id,
             _json_dumps(tags),
             _json_dumps(recipients),
             _json_dumps(active_message_ids),
@@ -541,6 +627,10 @@ def _row_to_metadata(row: sqlite3.Row, agent_read_status: Optional[Dict[str, boo
         metadata[constants.CAPSULE_RECIPIENTS_KEY] = recipients
     if row["reviewer_score"] is not None:
         metadata["reviewer_score"] = row["reviewer_score"]
+    if row["capsule_type"] == constants.CAPSULE_TYPE_QUESTION:
+        metadata[constants.QUESTION_STATUS_KEY] = row["question_status"] or constants.QUESTION_STATUS_PENDING
+        metadata[constants.QUESTION_NET_UPVOTE_KEY] = row["question_net_upvote"] or 0
+        metadata[constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY] = row["question_solved_by_message_id"]
 
     unread_count = 0
     if agent_read_status is not None:
@@ -550,7 +640,12 @@ def _row_to_metadata(row: sqlite3.Row, agent_read_status: Optional[Dict[str, boo
 
 
 def _iter_all_capsule_files() -> Iterable[Tuple[str, Optional[str], int, str]]:
-    for capsule_type in (constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_MAIL, constants.CAPSULE_TYPE_ARCHIVE):
+    for capsule_type in (
+        constants.CAPSULE_TYPE_PUBLIC,
+        constants.CAPSULE_TYPE_MAIL,
+        constants.CAPSULE_TYPE_ARCHIVE,
+        constants.CAPSULE_TYPE_QUESTION,
+    ):
         yield from _iter_scope_capsule_files(capsule_type, None)
 
     private_root = os.path.join(
@@ -595,6 +690,8 @@ def _scope_dir_and_prefix(capsule_type: str, lineage_name: Optional[str]) -> Tup
         return os.path.join(base_capsules_path, constants.MAIL_CAPSULES_SUBDIR_NAME), "mail_"
     if capsule_type == constants.CAPSULE_TYPE_ARCHIVE:
         return os.path.join(base_capsules_path, constants.ARCHIVE_CAPSULES_SUBDIR_NAME), "archive_"
+    if capsule_type == constants.CAPSULE_TYPE_QUESTION:
+        return os.path.join(base_capsules_path, constants.QUESTION_CAPSULES_SUBDIR_NAME), "question_"
     if capsule_type == constants.CAPSULE_TYPE_PRIVATE:
         if not lineage_name:
             raise ValueError("Lineage name required for private capsules.")
@@ -673,6 +770,18 @@ def _extract_reviewer_score(capsule_data: Dict[str, Any]) -> Optional[float]:
             except ValueError:
                 return None
     return None
+
+
+def _question_status(capsule_data: Dict[str, Any]) -> str:
+    status = str(capsule_data.get(constants.QUESTION_STATUS_KEY) or "").strip().lower()
+    allowed = {
+        constants.QUESTION_STATUS_PENDING,
+        constants.QUESTION_STATUS_OPEN,
+        constants.QUESTION_STATUS_REDACTED,
+        constants.QUESTION_STATUS_SOLVED,
+        constants.QUESTION_STATUS_RETIRED,
+    }
+    return status if status in allowed else constants.QUESTION_STATUS_PENDING
 
 
 def _file_mtime_ns(path: str) -> int:

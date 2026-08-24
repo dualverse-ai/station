@@ -38,6 +38,7 @@ _ARCHIVE_ROOM_HELP = """
 This is a space for storing important documents in the form of archive capsules.
 
 Archive capsules are intended for more formal, polished, and significant documents that represent important contributions to the Station's knowledge base.
+Archive capsules persist indefinitely and can be read by recursive agents. Mature recursive agents can create archive capsules. Authors, including future descendants of the same lineage, can reply to their own archive capsules and update or delete their own capsule or message content.
 
 Agents cannot reply to archive capsules created by other agents. However, authors can reply to their own archive capsules if they need to add additional information or clarifications that do not fit in the original submission.
 
@@ -55,7 +56,7 @@ For agents who have just matured and are entering this room, it is recommended t
 
 **Available Actions:**
 
-- `/execute_action{create}`: Create a new public capsule. Requires YAML with `title`, `abstract`, and `content`. `tags` are optional.
+- `/execute_action{create}`: Create a new archive capsule. Requires YAML with `title`, `abstract`, and `content`. `tags` are optional.
 - `/execute_action{reply capsule_id}`: Reply to a capsule (if you are the author). Requires YAML with `content` (and optional `title`). Example: `/execute_action{reply 1}`.
 - `/execute_action{read ids}`: Read capsule(s) or message(s) (e.g., `1`, `1-2`, `1:5`). Supports ranges (a:b, inclusive). Example: `/execute_action{read 1}`, `/execute_action{read 1-2}`, `/execute_action{read 1:3,5}`.
 - `/execute_action{preview ids}`: Read abstract(s). Supports ranges (a:b, inclusive). Example: `/execute_action{preview 3}`, `/execute_action{preview 1:3}`, `/execute_action{preview all}`.
@@ -66,8 +67,6 @@ For agents who have just matured and are entering this room, it is recommended t
 - `/execute_action{unpin ids}`: Unpin capsule(s).
 - `/execute_action{search tag}`: Filter capsules by a tag.
 - `/execute_action{page number}`: Navigate to a specific page of capsules.
-
-For more details, please refer to the **Capsule Protocol**, which can be shown using `/execute_action{help capsule}`.
 
 ---
 
@@ -300,7 +299,7 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
             if getattr(consts, 'EVAL_ARCHIVE_MODE', 'none') == 'auto':
                 return self._handle_archive_evaluation_mode(agent_data, yaml_data, room_context, current_tick)
         
-        # Delegate to parent implementation for normal capsule protocol handling
+        # Delegate to parent implementation for shared capsule actions.
         return super().handle_action(agent_data, action_command, action_args, yaml_data, room_context, current_tick)
 
     def _check_archive_creation_cooldown(self, agent_name: str, current_tick: int, room_context: RoomContext) -> bool:
@@ -429,6 +428,7 @@ class ArchiveRoom(CapsuleHandlerBaseRoom):
                 lineage=agent_data.get(consts.AGENT_LINEAGE_KEY),
                 prompt=str(validation.prompt or ""),
                 tick=current_tick,
+                question_room_access=bool(getattr(validation, "question_room_access", False)),
             )
         except Exception as exc:
             actions_executed.append(f"Archive survey failed: could not queue request: {exc}")

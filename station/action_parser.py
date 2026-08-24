@@ -16,14 +16,24 @@
 """
 Parses agent responses to extract action commands and associated YAML data.
 Action commands are in the format /execute_action{...} (optionally enclosed in backticks)
-and must be at the start of a line. Tolerates empty content within action braces.
+and normally start a line. Inline action tokens followed immediately by their YAML block
+or another standalone action, and terminal inline action chains, are normalized onto
+action lines. Tolerates empty content within action braces.
 YAML blocks are expected to be in the format ```yaml ... ```
 Includes a pre-processing step to neutralize /execute_action{} strings within YAML blocks.
 """
 
+import os
 import re
+import sys
 import yaml 
 from typing import List, Tuple, Optional, Dict, Any, NamedTuple
+
+if __package__ in (None, ""):
+    package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if package_parent not in sys.path:
+        sys.path.insert(0, package_parent)
+
 from station import constants 
 
 class ParsedActionInfo(NamedTuple):
@@ -60,6 +70,15 @@ class ActionParser:
         self.thought_block_pattern_compiled = constants.THOUGHT_BLOCK_PATTERN
         self.yaml_open_fence_pattern = re.compile(r"^([ \t]*)```yaml\b")
         self.yaml_close_fence_pattern = re.compile(r"^([ \t]*)```(.*)$")
+        self.fence_line_pattern = re.compile(r"^[ \t]*```")
+        self.inline_action_token_pattern = re.compile(
+            r"`?" + re.escape(self.action_prefix) + r"\{[^{}]*\}`?"
+        )
+        self.terminal_inline_action_suffix_pattern = re.compile(
+            r"\A(?:`?" + re.escape(self.action_prefix) + r"\{[^{}]*\}`?\s*)+"
+            r"(?:[ \t]*```yaml\s*\n.*?^[ \t]*```\s*)?\Z",
+            re.MULTILINE | re.DOTALL,
+        )
 
     def _split_line_end(self, line: str) -> Tuple[str, str]:
         if line.endswith("\r\n"):
@@ -135,6 +154,96 @@ class ActionParser:
         
         output_parts.append(text[last_end:])
         return "".join(output_parts)
+
+    def _is_start_of_action_line(self, text: str, action_start: int) -> bool:
+        line_start = text.rfind("\n", 0, action_start) + 1
+        line_prefix = text[line_start:action_start]
+        return line_prefix.strip() == ""
+
+    def _position_inside_fenced_block(self, text: str, position: int) -> bool:
+        in_fence = False
+        cursor = 0
+
+        for line in text.splitlines(keepends=True):
+            line_end = cursor + len(line)
+            if position < line_end:
+                return in_fence
+
+            if self.fence_line_pattern.match(line):
+                in_fence = not in_fence
+            cursor = line_end
+
+        return in_fence
+
+    def _normalize_terminal_inline_actions(self, text: str) -> str:
+        """
+        Move recoverable inline actions and terminal action chains onto action-only lines.
+
+        An action immediately followed by its YAML block or another standalone action
+        is strong evidence that the model intended to issue it, even when it was glued
+        to the preceding prose. Other inline tokens remain inert unless they form the
+        existing terminal action-chain recovery case.
+        """
+        normalized_parts = []
+        cursor = 0
+        for match in self.inline_action_token_pattern.finditer(text):
+            action_start = match.start(0)
+            if self._is_start_of_action_line(text, action_start):
+                continue
+            if self._position_inside_fenced_block(text, action_start):
+                continue
+
+            token = match.group(0).strip().strip("`")
+            command_text = token[len(self.action_prefix):].strip()
+            if not command_text.startswith("{") or not command_text.endswith("}"):
+                continue
+            command_and_args = command_text[1:-1].strip()
+            command = command_and_args.split(None, 1)[0].lower() if command_and_args else ""
+            following_text = text[match.end(0):]
+            yaml_follows = (
+                command in constants.ACTIONS_EXPECTING_YAML
+                and re.match(r"^[ \t]*\r?\n[ \t]*```yaml\b", following_text)
+            )
+            standalone_action_follows = re.match(
+                r"^[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*`?"
+                + re.escape(self.action_prefix)
+                + r"\{",
+                following_text,
+            )
+            if not yaml_follows and not standalone_action_follows:
+                continue
+
+            normalized_parts.append(text[cursor:action_start])
+            normalized_parts.append("\n")
+            normalized_parts.append(text[action_start:match.end(0)])
+            cursor = match.end(0)
+
+        if normalized_parts:
+            normalized_parts.append(text[cursor:])
+            text = "".join(normalized_parts)
+
+        for match in self.inline_action_token_pattern.finditer(text):
+            action_start = match.start(0)
+            if self._is_start_of_action_line(text, action_start):
+                continue
+            if self._position_inside_fenced_block(text, action_start):
+                continue
+
+            suffix = text[action_start:]
+            if not self.terminal_inline_action_suffix_pattern.fullmatch(suffix):
+                continue
+
+            prefix = text[:action_start].rstrip(" \t")
+            normalized_suffix = re.sub(
+                r"(?<!^)(?<!\n)[ \t]*(`?" + re.escape(self.action_prefix) + r"\{[^{}]*\}`?)",
+                r"\n\1",
+                suffix,
+            )
+
+            separator = "\n" if prefix else ""
+            return prefix + separator + normalized_suffix.lstrip(" \t")
+
+        return text
     
     def _remove_blocks(self, text: str, block_pattern: re.Pattern) -> str:
         """
@@ -156,6 +265,7 @@ class ActionParser:
         processed_response_text = self._remove_blocks(
             processed_response_text, self.thought_block_pattern_compiled
         )
+        processed_response_text = self._normalize_terminal_inline_actions(processed_response_text)
 
         parsed_actions: List[ParsedActionInfo] = []
         action_matches = list(self.action_pattern_compiled.finditer(processed_response_text))
@@ -249,14 +359,15 @@ if __name__ == '__main__':
     # if it directly imports `station.constants` and that's not the one we want for the test.
     # However, the current parser directly imports, so this test relies on that import working.
 
-    print(f"--- ActionParser Tests (Prefix: '{parser.action_prefix}', Start-of-Line, Optional Backticks, Empty Braces) ---")
+    print(f"--- ActionParser Tests (Prefix: '{parser.action_prefix}', Start-of-Line, Terminal Inline, Optional Backticks, Empty Braces) ---")
 
     test_cases = [
         (f"  {parser.action_prefix}{{goto lobby}}", "Plain action", "goto", "lobby", None, None),
         (f"`{parser.action_prefix}{{help lobby}}`", "Action with backticks", "help", "lobby", None, None),
         (f"  `{parser.action_prefix}{{create}}`\n```yaml\ntitle: Test\n```", "Action with backticks and YAML", "create", None, {"title": "Test"}, None),
         (f"{parser.action_prefix}{{speak}}\n  ```yaml\n  message: Hello\n  ```", "Action no backticks, indented YAML", "speak", None, {"message": "Hello"}, None),
-        (f"Not an action: {parser.action_prefix}{{ignored}}", "Mid-line action (ignored)", None, None, None, None),
+        (f"Not an action: {parser.action_prefix}{{ignored}} after text", "Mid-sentence action (ignored)", None, None, None, None),
+        (f"Terminal action: {parser.action_prefix}{{help lobby}}", "Terminal inline action", "help", "lobby", None, None),
         (f"{parser.action_prefix}{{}}", "Empty action braces", "", None, None, "Empty action command received"),
         (f"  `{parser.action_prefix}{{}}`  ", "Empty action braces with backticks and spaces", "", None, None, "Empty action command received"),
     ]

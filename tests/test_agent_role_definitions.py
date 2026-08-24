@@ -136,7 +136,7 @@ class GuestRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
         )
         self.assertEqual("", blank_agent_data[constants.AGENT_ROLE_DEFINITION_KEY])
 
-    def test_guest_sampling_pool_includes_departed_next_roles(self):
+    def test_guest_sampling_pool_excludes_departed_next_roles(self):
         self.write_init_roles(["Init Role"])
         departed = agent_module.create_recursive_agent(
             model_name="test-model",
@@ -163,14 +163,14 @@ class GuestRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
 
         pool = agent_module.get_role_definition_sampling_pool()
 
-        self.assertIn("Init Role", pool)
-        self.assertIn("Departed next role", pool)
+        self.assertEqual(["Init Role"], pool)
+        self.assertNotIn("Departed next role", pool)
         self.assertNotIn("Departed current role", pool)
         self.assertNotIn("Active next role", pool)
 
         def choose_role(role_pool):
             self.assertEqual(pool, role_pool)
-            return "Departed next role"
+            return "Init Role"
 
         with patch.object(agent_module.random, "choice", side_effect=choose_role):
             agent_data = agent_module.create_guest_agent(
@@ -180,11 +180,11 @@ class GuestRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
 
         self.assertIsNotNone(agent_data)
         self.assertEqual(
-            "Departed next role",
+            "Init Role",
             agent_data[constants.AGENT_ROLE_DEFINITION_KEY],
         )
 
-    def test_guest_sampling_pool_excludes_supervisor_and_theorist_next_roles(self):
+    def test_guest_sampling_pool_excludes_all_departed_next_roles(self):
         self.write_init_roles(["Init Role"])
         supervisor = agent_module.create_recursive_agent(
             model_name="test-model",
@@ -227,12 +227,12 @@ class GuestRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
 
         pool = agent_module.get_role_definition_sampling_pool()
 
-        self.assertIn("Init Role", pool)
-        self.assertIn("Ordinary next role", pool)
+        self.assertEqual(["Init Role"], pool)
+        self.assertNotIn("Ordinary next role", pool)
         self.assertNotIn("Supervisor next role", pool)
         self.assertNotIn("Theorist next role", pool)
 
-    def test_blocked_exit_role_replacement_uses_full_sampling_pool(self):
+    def test_blocked_exit_role_replacement_uses_fresh_guest_sampling_pool(self):
         self.write_init_roles(["Init Role"])
         departed = agent_module.create_recursive_agent(
             model_name="test-model",
@@ -248,15 +248,15 @@ class GuestRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
 
         def choose_role(role_pool):
             self.assertIn("Init Role", role_pool)
-            self.assertIn("Departed next role", role_pool)
-            return "Departed next role"
+            self.assertNotIn("Departed next role", role_pool)
+            return "Init Role"
 
         with patch.object(agent_module.random, "choice", side_effect=choose_role):
             replacement, blocked_term = session_end_flow.replace_blocked_role_definition(
                 "Make the next agent a Hacker."
             )
 
-        self.assertEqual("Departed next role", replacement)
+        self.assertEqual("Init Role", replacement)
         self.assertEqual("Hacker", blocked_term)
 
 
@@ -312,7 +312,7 @@ class RespawnRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
             respawned[constants.AGENT_LLM_CUSTOM_API_PARAMS_KEY],
         )
 
-    def test_respawned_guest_uses_shared_pool_instead_of_direct_role_inheritance(self):
+    def test_respawned_guest_uses_init_pool_instead_of_next_role_inheritance(self):
         self.write_init_roles(["Fresh init role"])
         original = agent_module.create_recursive_agent(
             model_name="test-model",
@@ -328,9 +328,9 @@ class RespawnRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
 
         def choose_role(role_pool):
             self.assertIn("Fresh init role", role_pool)
-            self.assertIn("Ascension-only role", role_pool)
+            self.assertNotIn("Ascension-only role", role_pool)
             self.assertNotIn("Departed agent role", role_pool)
-            return "Ascension-only role"
+            return "Fresh init role"
 
         with patch.object(agent_module.random, "choice", side_effect=choose_role):
             new_agent_name = self.make_station().create_respawn_guest_agent(
@@ -341,7 +341,7 @@ class RespawnRoleDefinitionTests(TempAgentRoleDefinitionTestCase):
         respawned = agent_module.load_agent_data(new_agent_name)
         self.assertIsNotNone(respawned)
         self.assertEqual(
-            "Ascension-only role",
+            "Fresh init role",
             respawned[constants.AGENT_ROLE_DEFINITION_KEY],
         )
         self.assertNotEqual(
@@ -756,6 +756,8 @@ class RolePromptOverrideTests(TempAgentRoleDefinitionTestCase):
         )
 
         self.assertIn("Supervisor Protocol", prompt)
+        self.assertIn("A known failure mode is premature demotion", prompt)
+        self.assertIn("verify in later meetings that the backlog is revisited", prompt)
         self.assertNotIn("Stored ordinary role", prompt)
 
 

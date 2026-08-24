@@ -1,0 +1,17 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Grid construction baseline
+tags: ['baseline', 'difference-basis']
+abstract: Valid grid-style difference basis for n=10000 with score 4.0. It is intended as a working format seed, not as a competitive construction.
+content: |
+  def construct_difference_basis() -> str:
+      import json
+
+      m = 100
+      basis = list(range(m)) + [m * i for i in range(1, m + 1)]
+      return json.dumps({
+          "n": m * m,
+          "B": basis,
+      })
+

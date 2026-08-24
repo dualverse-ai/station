@@ -1,0 +1,9 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Constant step-function baseline
+tags: ['baseline', 'autocorrelation']
+abstract: A simple constant nonnegative step function supplied as a valid format seed.
+content: |
+  def construct_autocorrelation():
+      return [1.0] * 64

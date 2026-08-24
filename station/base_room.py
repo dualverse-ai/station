@@ -99,13 +99,6 @@ class InternalActionHandler(ABC):
         """
         return None
 
-    def get_dialogue_tick_protection(self) -> Optional[Dict[str, str]]:
-        """
-        Returns an optional protection record for the Station tick that owns this
-        internal action.
-        """
-        return None
-    
 class LoggingInternalActionHandlerWrapper(InternalActionHandler):
     """
     Wraps an InternalActionHandler to log the dialogue steps and ensure
@@ -197,9 +190,6 @@ class LoggingInternalActionHandlerWrapper(InternalActionHandler):
     def get_llm_override(self) -> Optional[Dict[str, str]]:
         return self.actual_handler.get_llm_override()
 
-    def get_dialogue_tick_protection(self) -> Optional[Dict[str, str]]:
-        return self.actual_handler.get_dialogue_tick_protection()
-        
 
 class BaseRoom(ABC):
     """
@@ -254,12 +244,14 @@ class BaseRoom(ABC):
                 if help_text and help_text.strip():
                     output_parts.append(help_text)
 
-                if hasattr(room_context.agent_manager, "protect_dialogue_tick"):
-                    room_context.agent_manager.protect_dialogue_tick(
+                if hasattr(room_context.agent_manager, "add_protected_context_item"):
+                    room_context.agent_manager.add_protected_context_item(
                         agent_data,
-                        current_tick,
-                        room_context.constants_module.PROTECTED_DIALOGUE_REASON_ROOM_HELP,
+                        tick=current_tick,
+                        kind=room_context.constants_module.PROTECTED_CONTEXT_KIND_ROOM_HELP,
                         source=f"room:{room_data_key}",
+                        title=f"Help Message - {self.room_name}",
+                        content=help_text,
                         metadata={"room_name": self.room_name},
                     )
                 

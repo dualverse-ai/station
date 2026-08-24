@@ -1,0 +1,20 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Inclusion-exclusion seed
+tags: ['baseline', 'prime-counting', 'weights']
+abstract: Small finite divisor-pattern weight dictionary intended as a working format seed.
+content: |
+  import json
+
+  def construct_prime_weights() -> str:
+      return json.dumps({
+          "mode": "prime-weight-v1",
+          "weights": {
+              "1": 1.0,
+              "2": -1.0,
+              "3": -1.0,
+              "6": 1.0,
+          },
+      })
+

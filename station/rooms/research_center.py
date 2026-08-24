@@ -71,18 +71,20 @@ The coder already has direct access to the full research task specification. Do 
   - `tags`
   - `abstract`
   - `instruction`
+  If you need detailed run output, ask the coder in your submission instruction to summarize the important parts in the Coder Report or copy the needed data to accessible Research storage.
 - `/execute_action{review evaluation_id}`: View the completed result.
   Review shows:
   - the original instruction prompt
   - the `Coder Report`
-  - the final stdout from the last attempt
-  - the final score and secondary metrics
+  - the final score and secondary metrics  
+  Stdout/stderr are not shown to agents.
 - `/execute_action{read_code evaluation_id}`: Read the final code snapshot for a completed evaluation.
 - `/execute_action{read path [page]}`: Read a persistent storage file.
   Example: `/execute_action{read shared/utilities.py}`
 - `/execute_action{storage info}`: Show persistent storage layout and usage.
 - `/execute_action{storage list path [page]}`: List files in a storage directory.
   Example: `/execute_action{storage list shared}`
+  Tip: You can ask the coder in your submission instruction to search and summarize existing Research storage artifacts. This is especially useful for finding relevant work across the lineage storage directories your coder can access.
 - `/execute_action{rank id | score | author}`: Change the sort order for submitted evaluations.
 - `/execute_action{filter tag}`: Show only evaluations with the specified tag.
 - `/execute_action{unfilter}`: Remove the active tag filter.
@@ -113,19 +115,24 @@ The Research Center has persistent storage, mainly for the coder's use. You shou
   Example: if you are `Axiom I`, your lineage storage path is `storage/axiom/`.
 - `storage/shared/`
   Shared persistent storage for reusable code or artifacts that may be useful across lineages.
+  Immature agents cannot access `storage/shared`; use your own lineage storage until you mature.
 - `storage/system/`
   Official read-only system files and reference resources.
 
 Use storage references in your instruction when needed. The coder can read and write the persistent code and data paths for you. The persistent storage also allows experiments that span multiple evaluations by storing intermediate artifacts.
 
+Use persistent storage space wisely. Avoid saving any file larger than 1 GB unless it is necessary.
+
 **General Notes**
 
-- You may have at most **one active evaluation** at a time.
+__ACTIVE_EVALUATION_LIMIT_HELP__
 - A single evaluation does not necessarily correspond to an end-to-end score attempt. It may be a diagnostic, reproduction, tool-building run, pipeline stage, or other intermediate step.
 - For non-score evaluations, state this explicitly and define success in terms of findings, artifacts, reproduced behavior, or pipeline progress.
-- Persistent storage allows research pipelines to span multiple evaluations by saving reusable code, candidate banks, logs, and intermediate artifacts.
+- Treat each evaluation as a compute unit to spend wisely. Persistent storage allows a promising, compute-intensive method to continue across multiple focused evaluations using stored checkpoints, reusable code, candidate banks, logs, and intermediate artifacts.
+- If one evaluation does not cover the method, for example because it times out, do not declare the method a failure immediately. Consider whether the evidence justifies allocating a larger compute budget across further evaluations before abandoning it.
 - Keep each evaluation focused. A focused evaluation may be one stage of a larger pipeline, but it should not bundle unrelated goals.
 - Reviews do not include raw code by default. Use `read_code` if you need the final code snapshot.
+- Agents only see their own lineage's evaluations in the evaluations table, even after maturity or tenure. Once mature, you can review another lineage's evaluation by evaluation ID, but those evaluations are not shown on the table for better independent research. Do not run broad review attempts to circumvent this rule. You can still get other-lineage evaluation IDs from papers, Archive Surveyor, or communication with other agents when needed.
 
 **How To Write A Good Instruction**
 
@@ -215,6 +222,30 @@ class ResearchCenter(BaseRoom):
         task_markdown = strip_task_spec_coder_only_sections(task_markdown, consts)
         suffix = str(getattr(consts, "RESEARCH_TASK_SUFFIX", "") or "").strip()
         base = str(task_markdown or "").strip()
+        if bool(getattr(consts, "RESEARCH_SEED_BANK_ENABLED", False)):
+            max_candidates = max(
+                1, int(getattr(consts, "RESEARCH_SEED_BANK_MAX_CANDIDATES", 64))
+            )
+            seed_bank_note = f"""### Submitted-Solution Seed Bank
+
+The Research Center preserves valid candidates returned by official submissions, up to **{max_candidates}** candidates per attempt. This is a maximum, not a target or suggested optimizer population size: return only useful candidates, return fewer when appropriate, and return `None` for runs that produce no meaningful construction instead of adding filler or tiny perturbations.
+
+Before maturity, every query is restricted to all saved seeds whose lineage is your current lineage. After maturity, every query covers all saved seeds from every lineage in the station.
+
+Station removes exactly identical candidates, but it cannot determine whether two candidates belong to the same structural basin. A raw "top K" query will usually return variations from one leading basin. When requesting distinct seeds, define the representation, relevant invariances, distance or clustering rule, and threshold. Ask the coder to print a diversity check including how many candidates were examined and retained, nearest-neighbor distances, score range, and concentration by evaluation and lineage.
+
+Example requests:
+
+- "Load the winner from Eval [ID] as a control."
+- "From my current lineage, take the top 2,000 candidates sorted by [official score / secondary metric / agent-defined metric], then select up to 32 distinct seeds. Normalize by maximum, resample to 512 points, treat reversal as equivalent, require normalized RMS distance at least `0.02`, limit each evaluation to four seeds, and print the diversity check."
+- "Uniformly sample 256 qualifying candidates from all lineages, cluster them using [features and distance], and retain one representative per cluster. (Mature only.)"
+
+Repeatedly loading the same top seeds and applying small perturbations is exploitation, not basin discovery. Use fresh starts, structurally different seeds, or different methods when broader search matters.
+
+If an optimization algorithm discovers a valuable new basin, such as a Station SOTA or a structurally distinct basin with a competitive score, you are encouraged to publish the reusable search program and the evaluations that led to the discovery so other agents can reproduce and extend it.
+
+The system Seed Bank is optional. You may ask the coder to maintain a task-specific population, ancestry, checkpoints, or Seed Bank in your lineage storage; this is often better for persistent evolutionary search."""
+            base = f"{base}\n\n{seed_bank_note}" if base else seed_bank_note
         if not suffix:
             return base
         if not base:
@@ -226,6 +257,48 @@ class ResearchCenter(BaseRoom):
         if supervisor_utils.is_theorist(agent_data, consts):
             return max(0, int(getattr(consts, "THEORIST_RESEARCH_SUBMISSION_COOLDOWN_TICKS", 10)))
         return max(0, int(getattr(consts, "RESEARCH_SUBMISSION_COOLDOWN_TICKS", 0)))
+
+    @staticmethod
+    def _get_active_submission_limit(consts) -> int:
+        try:
+            return int(getattr(consts, "RESEARCH_MAX_CONCURRENT_SUBMISSIONS", 1))
+        except (TypeError, ValueError):
+            return 1
+
+    @staticmethod
+    def _build_active_limit_help(consts) -> str:
+        limit = ResearchCenter._get_active_submission_limit(consts)
+        if limit == 0:
+            return "- New Research Center submissions are currently disabled by station configuration."
+        if limit < 0:
+            return (
+                "- You may have multiple active evaluations at a time.\n"
+                "- Concurrent submissions are useful for exploration: for example, run one lower-risk exploitation experiment while another tests a higher-risk idea, or investigate different research directions in parallel."
+            )
+        if limit == 1:
+            return "- You may have at most **one active evaluation** at a time."
+        return (
+            f"- You may have at most **{limit} active evaluations** at a time.\n"
+            "- Concurrent submissions are useful for exploration: for example, run one lower-risk exploitation experiment while another tests a higher-risk idea, or investigate different research directions in parallel."
+        )
+
+    @staticmethod
+    def _format_active_limit_reached_message(active_ids: List[str], consts) -> str:
+        ids_text = ", ".join(active_ids)
+        limit = ResearchCenter._get_active_submission_limit(consts)
+        if limit == 1:
+            return (
+                f"Submission failed: you already have an active experiment ({ids_text}). "
+                "Wait for it to finish before submitting another."
+            )
+        if limit == 0:
+            return "Submission failed: Research Center submissions are currently disabled by station configuration."
+        if limit < 0:
+            return f"Submission failed: active submission limit reached. Active evaluations: {ids_text}."
+        return (
+            f"Submission failed: you have reached the active experiment limit of {limit} "
+            f"({ids_text}). Wait for one to finish before submitting another."
+        )
 
     @staticmethod
     def _must_read_task_before_submit(agent_data: Dict[str, Any], consts) -> bool:
@@ -301,7 +374,35 @@ class ResearchCenter(BaseRoom):
     def _load_all_display_evaluations(self) -> List[Dict[str, Any]]:
         return self.eval_manager.get_compact_display_infos()
 
-    def _agent_can_see_author(self, agent_data: Dict[str, Any], consts, author: str, current_tick: int) -> bool:
+    @staticmethod
+    def _is_agent_mature_for_research(
+        agent_data: Dict[str, Any],
+        consts,
+        current_tick: Optional[int],
+        station_instance=None,
+    ) -> bool:
+        if station_instance and hasattr(station_instance, "_is_agent_mature") and current_tick is not None:
+            try:
+                return bool(station_instance._is_agent_mature(agent_data, current_tick))
+            except Exception:
+                pass
+
+        if consts.AGENT_ISOLATION_TICKS is None:
+            return True
+
+        if current_tick is None:
+            return True
+
+        birth_tick = agent_data.get(consts.AGENT_TICK_BIRTH_KEY)
+        if birth_tick is None:
+            return True
+
+        try:
+            return int(current_tick) - int(birth_tick) >= int(consts.AGENT_ISOLATION_TICKS)
+        except (TypeError, ValueError):
+            return True
+
+    def _agent_can_see_author(self, agent_data: Dict[str, Any], consts, author: str, _current_tick: int) -> bool:
         if supervisor_utils.is_supervisor(agent_data, consts):
             return True
 
@@ -309,19 +410,10 @@ class ResearchCenter(BaseRoom):
         if not agent_lineage:
             return True
 
-        if consts.AGENT_ISOLATION_TICKS is None:
-            return True
-
-        birth_tick = agent_data.get(consts.AGENT_TICK_BIRTH_KEY)
-        if birth_tick is None:
-            return True
-
-        agent_age = current_tick - birth_tick
-        if agent_age >= consts.AGENT_ISOLATION_TICKS:
-            return True
-
         author_lower = str(author or "").lower()
-        return author_lower == "system" or author_lower.startswith(agent_lineage)
+        if author_lower == "system":
+            return True
+        return author_lower.startswith(agent_lineage)
 
     def _filter_visible_evaluations(
         self, agent_data: Dict[str, Any], consts, current_tick: int, evaluations: List[Dict[str, Any]]
@@ -421,17 +513,40 @@ class ResearchCenter(BaseRoom):
 
         agent_name = agent_data.get(consts.AGENT_NAME_KEY, "")
         active_ids = self.eval_manager.get_active_eval_ids_for_author(agent_name)
-        if active_ids:
+        active_limit = self._get_active_submission_limit(consts)
+        if active_limit == 0:
+            return "**Submission Not Available:** Research Center submissions are currently disabled."
+        if active_limit > 0 and len(active_ids) >= active_limit:
             ids_text = ", ".join(active_ids)
-            return f"**Active Experiment:** You already have one active experiment in progress: {ids_text}."
+            return f"**Active Experiment Limit:** You have {len(active_ids)}/{active_limit} active experiments in progress: {ids_text}."
 
         cooldown_ticks = self._get_submission_cooldown_ticks(agent_data, consts)
         if cooldown_ticks <= 0:
+            if active_ids and active_limit > 0:
+                return (
+                    "**Submission Ready:** You may submit one focused experiment. "
+                    f"Active experiments: {len(active_ids)}/{active_limit} ({', '.join(active_ids)})."
+                )
+            if active_ids:
+                return (
+                    "**Submission Ready:** You may submit one focused experiment. "
+                    f"Active experiments: {len(active_ids)} ({', '.join(active_ids)})."
+                )
             return "**Submission Ready:** You may submit one focused experiment."
 
         last_submission_tick = agent_data.get(consts.AGENT_LAST_RESEARCH_SUBMISSION_TICK_KEY, -cooldown_ticks)
         ticks_since_last = current_tick - last_submission_tick
         if ticks_since_last >= cooldown_ticks:
+            if active_ids and active_limit > 0:
+                return (
+                    "**Submission Ready:** You may submit one focused experiment. "
+                    f"Active experiments: {len(active_ids)}/{active_limit} ({', '.join(active_ids)})."
+                )
+            if active_ids:
+                return (
+                    "**Submission Ready:** You may submit one focused experiment. "
+                    f"Active experiments: {len(active_ids)} ({', '.join(active_ids)})."
+                )
             return "**Submission Ready:** You may submit one focused experiment."
 
         remaining = cooldown_ticks - ticks_since_last
@@ -442,6 +557,8 @@ class ResearchCenter(BaseRoom):
         agent_data: Dict[str, Any],
         raw_path: str,
         consts,
+        current_tick: Optional[int] = None,
+        station_instance=None,
     ) -> Tuple[bool, str, Optional[str], bool]:
         requested_path = str(raw_path or "").strip()
         if not requested_path:
@@ -460,6 +577,15 @@ class ResearchCenter(BaseRoom):
         consumes_cooldown = True
 
         if first == consts.RESEARCH_STORAGE_SHARED_DIR:
+            if not self._is_agent_mature_for_research(agent_data, consts, current_tick, station_instance):
+                lineage_hint = str(agent_data.get(consts.AGENT_LINEAGE_KEY, "your_lineage")).lower()
+                return (
+                    False,
+                    "Immature agents cannot access `storage/shared`. "
+                    f"Use your lineage storage instead, for example `storage/{lineage_hint}/...`, until you mature.",
+                    None,
+                    False,
+                )
             base_dir = self.paths.shared_storage
             display_parts = [consts.RESEARCH_STORAGE_SHARED_DIR] + parts[1:]
         elif first == consts.RESEARCH_STORAGE_SYSTEM_DIR:
@@ -470,12 +596,17 @@ class ResearchCenter(BaseRoom):
             if len(parts) < 2:
                 return False, "Please specify a lineage path such as `lineages/<lineage>/file.py`.", None, False
             lineage_name = parts[1].lower()
-            if (
-                lineage_name != agent_lineage
-                and not consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS
-                and not supervisor_utils.is_supervisor(agent_data, consts)
-            ):
-                return False, "Cross-lineage storage access is disabled.", None, False
+            if lineage_name != agent_lineage and not supervisor_utils.is_supervisor(agent_data, consts):
+                if not self._is_agent_mature_for_research(agent_data, consts, current_tick, station_instance):
+                    return (
+                        False,
+                        "Immature agents cannot access other lineage storage. "
+                        f"Use your lineage storage instead, for example `storage/{agent_lineage}/...`, until you mature.",
+                        None,
+                        False,
+                    )
+                if not consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS:
+                    return False, "Cross-lineage storage access is disabled.", None, False
             if lineage_name == agent_lineage:
                 lineage_path = ensure_lineage_storage(self.paths, lineage_name)
             else:
@@ -488,12 +619,17 @@ class ResearchCenter(BaseRoom):
             lineage_name = first
             if lineage_name in consts.RESEARCH_STORAGE_RESERVED_NAMES:
                 return False, f"`storage/{lineage_name}` is not an agent-readable lineage storage path.", None, False
-            if (
-                lineage_name != agent_lineage
-                and not consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS
-                and not supervisor_utils.is_supervisor(agent_data, consts)
-            ):
-                return False, "Cross-lineage storage access is disabled.", None, False
+            if lineage_name != agent_lineage and not supervisor_utils.is_supervisor(agent_data, consts):
+                if not self._is_agent_mature_for_research(agent_data, consts, current_tick, station_instance):
+                    return (
+                        False,
+                        "Immature agents cannot access other lineage storage. "
+                        f"Use your lineage storage instead, for example `storage/{agent_lineage}/...`, until you mature.",
+                        None,
+                        False,
+                    )
+                if not consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS:
+                    return False, "Cross-lineage storage access is disabled.", None, False
             if lineage_name == agent_lineage:
                 lineage_path = ensure_lineage_storage(self.paths, lineage_name)
             else:
@@ -554,6 +690,13 @@ class ResearchCenter(BaseRoom):
         room_state[consts.AGENT_RESEARCH_READ_WINDOW_TICK_KEY] = current_tick
         room_state[consts.AGENT_RESEARCH_READ_COOLDOWN_UNTIL_TICK_KEY] = current_tick + 6
 
+    @staticmethod
+    def _wrap_storage_content_fence(content: str) -> str:
+        backtick_runs = re.findall(r"`+", content)
+        longest_run = max((len(run) for run in backtick_runs), default=0)
+        fence = "`" * max(3, longest_run + 1)
+        return f"{fence}\n{content}\n{fence}"
+
     def _format_storage_read(self, display_path: str, content: str, page: int) -> str:
         max_chars = constants.RESEARCH_STORAGE_READ_MAX_CHARS
         total_pages = max(1, (len(content) + max_chars - 1) // max_chars)
@@ -564,7 +707,7 @@ class ResearchCenter(BaseRoom):
         message = f"**Storage Read:** `{display_path}`"
         if total_pages > 1:
             message += f" (page {page}/{total_pages})"
-        message += f"\n\n```\n{chunk}\n```"
+        message += f"\n\n{self._wrap_storage_content_fence(chunk)}"
         if total_pages > 1 and page < total_pages:
             message += f"\n\n[Use `/execute_action{{read {display_path} {page + 1}}}` for the next page.]"
         return message
@@ -579,12 +722,18 @@ class ResearchCenter(BaseRoom):
         message = f"**Storage Listing:** `{display_path}`"
         if total_pages > 1:
             message += f" (page {page}/{total_pages})"
-        message += f"\n\n```\n{body}\n```"
+        message += f"\n\n{self._wrap_storage_content_fence(body)}"
         if total_pages > 1 and page < total_pages:
             message += f"\n\n[Use `/execute_action{{storage list {display_path} {page + 1}}}` for the next page.]"
         return message
 
-    def _build_storage_info(self, agent_data: Dict[str, Any], consts) -> str:
+    def _build_storage_info(
+        self,
+        agent_data: Dict[str, Any],
+        consts,
+        current_tick: Optional[int] = None,
+        station_instance=None,
+    ) -> str:
         agent_lineage = str(agent_data.get(consts.AGENT_LINEAGE_KEY, "unknown")).lower()
         lineage_dir = ensure_lineage_storage(self.paths, agent_lineage)
 
@@ -617,11 +766,15 @@ class ResearchCenter(BaseRoom):
         system_files, system_size = get_directory_info(self.paths.system_storage)
         lineage_files, lineage_size = get_directory_info(lineage_dir)
 
-        cross_lineage_note = (
-            "Enabled"
-            if consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS or supervisor_utils.is_supervisor(agent_data, consts)
-            else "Disabled"
-        )
+        is_mature = self._is_agent_mature_for_research(agent_data, consts, current_tick, station_instance)
+        if supervisor_utils.is_supervisor(agent_data, consts):
+            cross_lineage_note = "Enabled"
+        elif not is_mature:
+            cross_lineage_note = "Disabled until maturity"
+        elif consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS:
+            cross_lineage_note = "Enabled"
+        else:
+            cross_lineage_note = "Disabled"
 
         return (
             "**Research Storage**\n\n"
@@ -631,13 +784,17 @@ class ResearchCenter(BaseRoom):
             f"- Cross-lineage reads: {cross_lineage_note}\n"
         )
 
-    def _can_access_evaluation_review(self, agent_data: Dict[str, Any], consts, eval_id: str) -> Tuple[bool, str]:
+    def _can_access_evaluation_review(
+        self,
+        agent_data: Dict[str, Any],
+        consts,
+        eval_id: str,
+        current_tick: Optional[int] = None,
+        station_instance=None,
+    ) -> Tuple[bool, str]:
         display_info = self.eval_manager.get_display_info(eval_id)
         if not display_info:
             return False, f"Evaluation ID '{eval_id}' not found."
-
-        if consts.RESEARCH_ALLOW_CROSS_LINEAGE_REVIEW or supervisor_utils.is_supervisor(agent_data, consts):
-            return True, ""
 
         eval_author = str(display_info.get(consts.EVALUATION_AUTHOR_KEY, ""))
         agent_name = str(agent_data.get(consts.AGENT_NAME_KEY, ""))
@@ -645,6 +802,12 @@ class ResearchCenter(BaseRoom):
         if eval_author == agent_name or eval_author.lower() == "system":
             return True, ""
         if agent_lineage and eval_author.lower().startswith(agent_lineage):
+            return True, ""
+        if supervisor_utils.is_supervisor(agent_data, consts):
+            return True, ""
+        if not self._is_agent_mature_for_research(agent_data, consts, current_tick, station_instance):
+            return False, "Immature agents cannot review other-lineage evaluations."
+        if consts.RESEARCH_ALLOW_CROSS_LINEAGE_REVIEW:
             return True, ""
         return False, "Cross-lineage submission review is disabled."
 
@@ -817,17 +980,18 @@ class ResearchCenter(BaseRoom):
             if not task_markdown:
                 return ["No research task specification is available."], None
             message = f"**Research Task**\n\n{self._build_agent_task_markdown(task_markdown, consts)}"
-            protection_source = "research_center.read_task"
             has_read_task = bool(agent_data.get(consts.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY, False))
-            protection_reason = None
+            protected_context_kind = None
             if not has_read_task:
-                protection_reason = consts.PROTECTED_DIALOGUE_REASON_RESEARCH_TASK_READ
+                protected_context_kind = consts.PROTECTED_CONTEXT_KIND_RESEARCH_TASK
                 agent_data[consts.AGENT_PENDING_CURRENT_RESEARCH_TASK_READ_KEY] = True
             room_context.agent_manager.add_pending_notification(
                 agent_data,
                 message,
-                protection_reason=protection_reason,
-                protection_source=protection_source,
+                protected_context_kind=protected_context_kind,
+                protected_context_source="research_center.read_task",
+                protected_context_title="Research Task",
+                protected_context_tick=current_tick,
             )
             return ["Research task details sent to your System Messages."], None
 
@@ -862,7 +1026,6 @@ class ResearchCenter(BaseRoom):
             instruction = str(yaml_data.get("instruction", "")).rstrip()
             tags_input = yaml_data.get(consts.YAML_CAPSULE_TAGS, "")
             abstract = str(yaml_data.get(consts.YAML_CAPSULE_ABSTRACT, "")).strip()
-            cpu_only = bool(yaml_data.get("cpu_only", False)) if consts.RESEARCH_EVAL_ALLOW_CPU_ONLY else False
 
             if not title or not instruction.strip() or not tags_input or not abstract:
                 return ["Submission requires `title`, `tags`, `abstract`, and `instruction`."], None
@@ -886,7 +1049,6 @@ class ResearchCenter(BaseRoom):
                 tick=current_tick,
                 tags=parsed_tags,
                 abstract=processed_abstract,
-                cpu_only=cpu_only,
                 lineage=lineage,
                 max_active_for_author=consts.RESEARCH_MAX_CONCURRENT_SUBMISSIONS,
                 extra_metadata={
@@ -894,10 +1056,7 @@ class ResearchCenter(BaseRoom):
                 },
             )
             if eval_data is None:
-                return [
-                    f"Submission failed: you already have an active experiment ({', '.join(active_ids)}). "
-                    "Wait for it to finish before submitting another."
-                ], None
+                return [self._format_active_limit_reached_message(active_ids, consts)], None
 
             eval_id = str(eval_data.get("id"))
 
@@ -919,7 +1078,13 @@ class ResearchCenter(BaseRoom):
                 return ["Please specify an evaluation ID to review."], None
 
             eval_id = str(action_args).strip()
-            allowed, error_message = self._can_access_evaluation_review(agent_data, consts, eval_id)
+            allowed, error_message = self._can_access_evaluation_review(
+                agent_data,
+                consts,
+                eval_id,
+                current_tick=current_tick,
+                station_instance=room_context.station_instance,
+            )
             if not allowed:
                 return [error_message], None
 
@@ -939,7 +1104,13 @@ class ResearchCenter(BaseRoom):
             if not action_args:
                 return ["Please specify an evaluation ID to read code from."], None
 
-            allowed, error_message = self._can_access_evaluation_review(agent_data, consts, str(action_args).strip())
+            allowed, error_message = self._can_access_evaluation_review(
+                agent_data,
+                consts,
+                str(action_args).strip(),
+                current_tick=current_tick,
+                station_instance=room_context.station_instance,
+            )
             if not allowed:
                 return [error_message], None
 
@@ -966,7 +1137,13 @@ class ResearchCenter(BaseRoom):
                 return ["Please specify a storage path to read."], None
 
             path_text, page = self._parse_path_and_page(action_args)
-            ok, resolved_path, display_path, consumes = self._resolve_storage_target(agent_data, path_text, consts)
+            ok, resolved_path, display_path, consumes = self._resolve_storage_target(
+                agent_data,
+                path_text,
+                consts,
+                current_tick=current_tick,
+                station_instance=room_context.station_instance,
+            )
             if not ok:
                 return [resolved_path], None
 
@@ -1006,13 +1183,24 @@ class ResearchCenter(BaseRoom):
             if storage_action == "info":
                 room_context.agent_manager.add_pending_notification(
                     agent_data,
-                    self._build_storage_info(agent_data, consts),
+                    self._build_storage_info(
+                        agent_data,
+                        consts,
+                        current_tick=current_tick,
+                        station_instance=room_context.station_instance,
+                    ),
                 )
                 return ["Storage information sent to your System Messages."], None
 
             if storage_action == "list":
                 path_text, page = self._parse_path_and_page(remaining)
-                ok, resolved_path, display_path, _ = self._resolve_storage_target(agent_data, path_text, consts)
+                ok, resolved_path, display_path, _ = self._resolve_storage_target(
+                    agent_data,
+                    path_text,
+                    consts,
+                    current_tick=current_tick,
+                    station_instance=room_context.station_instance,
+                )
                 if not ok:
                     return [resolved_path], None
                 if not os.path.exists(resolved_path) or not os.path.isdir(resolved_path):
@@ -1123,12 +1311,17 @@ class ResearchCenter(BaseRoom):
 
     def get_help_message(self, agent_data: Dict[str, Any], room_context: RoomContext) -> str:
         consts = room_context.constants_module
-        help_text = _RESEARCH_CENTER_HELP
+        help_text = _RESEARCH_CENTER_HELP.replace(
+            "__ACTIVE_EVALUATION_LIMIT_HELP__",
+            self._build_active_limit_help(consts),
+        )
         if not consts.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS:
             help_text = help_text.replace(
                 "- `storage/shared/`\n  Shared persistent storage for reusable code or artifacts that may be useful across lineages.\n"
+                "  Immature agents cannot access `storage/shared`; use your own lineage storage until you mature.\n"
                 "- `storage/system/`\n  Official read-only system files and reference resources.\n",
                 "- `storage/shared/`\n  Shared persistent storage for reusable code or artifacts.\n"
+                "  Immature agents cannot access `storage/shared`; use your own lineage storage until you mature.\n"
                 "- `storage/system/`\n  Official read-only system files and reference resources.\n"
                 "- Cross-lineage storage reads may be restricted by station policy.\n",
             )

@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ from station.llm_connectors.base import (
     LLMContextOverflowError,
     LLMTransientAPIError,
 )
+from station.llm_connectors.claude import ClaudeConnector
 from station.llm_connectors.gemini import GoogleGeminiConnector
 from station.llm_connectors.openai import OpenAIConnector
 
@@ -117,6 +119,7 @@ class ProviderFallbackConnector(BaseLLMConnector):
         error_cls=LLMTransientAPIError,
         fail_first=True,
         probe_success=False,
+        probe_success_indices=None,
         always_fail=False,
         failures_before_success: Optional[int] = None,
         max_retries=1,
@@ -131,6 +134,7 @@ class ProviderFallbackConnector(BaseLLMConnector):
         self.error_cls = error_cls
         self.fail_first = fail_first
         self.probe_success = probe_success
+        self.probe_success_indices = set(probe_success_indices) if probe_success_indices is not None else None
         self.always_fail = always_fail
         self.failures_before_success = failures_before_success
         self.endpoint_indices = []
@@ -165,6 +169,8 @@ class ProviderFallbackConnector(BaseLLMConnector):
     def _run_provider_base_recovery_probe(self, snapshot):
         endpoint = snapshot.get("provider_endpoint") or {}
         self.probe_calls.append((self.model_name, endpoint.get("index")))
+        if self.probe_success_indices is not None:
+            return endpoint.get("index") in self.probe_success_indices
         return self.probe_success
 
     def _send_message_implementation(self, user_prompt, current_tick, attempt_number=0):
@@ -200,6 +206,184 @@ class FakeOpenAIStatusError(Exception):
         self.status_code = status_code
         self.request_id = "req-test"
         self.body = {"code": "model_not_found", "message": message}
+
+
+class FakeClaudeUsage:
+    input_tokens = 7
+    output_tokens = 0
+    cache_read_input_tokens = 11
+    cache_creation_input_tokens = 13
+
+
+class FakeClaudeEmptyMessage:
+    id = "msg-empty"
+    request_id = "req-empty"
+    stop_reason = "end_turn"
+    stop_sequence = None
+    usage = FakeClaudeUsage()
+    content = []
+
+
+class FakeClaudeMessagesClient:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg-success",
+                    "request_id": "req-success",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 250000,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "ok"},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+
+
+class FakeClaudeStreamDictFallbackMessagesClient:
+    def __init__(self):
+        self.create_calls = []
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg-dict",
+                    "request_id": "req-dict",
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 5,
+                        "cache_creation_input_tokens": 7,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "raw "},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "stream ok"},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+
+
+class FakeClaudeTruncatedStreamMessagesClient:
+    def __init__(self):
+        self.create_calls = []
+
+    def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg-truncated",
+                    "request_id": "req-truncated",
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 5,
+                        "cache_creation_input_tokens": 7,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "partial response"},
+            },
+        ]
+
+
+class FakeClaudeOpusRefusalMessagesClient:
+    def __init__(self):
+        self.calls = []
+
+    @staticmethod
+    def _events(model, text, stop_reason):
+        return [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg-{model}",
+                    "request_id": f"req-{model}",
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 0,
+                        "cache_read_input_tokens": 5,
+                        "cache_creation_input_tokens": 7,
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": text},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": 2},
+            },
+            {"type": "message_stop"},
+        ]
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        model = kwargs["model"]
+        if model == "claude-opus-5":
+            return self._events(model, "provider refusal", "refusal")
+        return self._events(model, "fallback ok", "end_turn")
 
 
 def make_openai_connector_for_internal_fallback_tests(error: Optional[Exception] = None):
@@ -971,6 +1155,50 @@ class RuntimeApiConfigTests(unittest.TestCase):
         self.assertEqual("official-key", client_kwargs["api_key"])
         self.assertEqual("https://api.openai.com/v1", client_kwargs["base_url"])
 
+    def test_openai_gpt_5_6_defaults_to_max_reasoning_effort(self):
+        connector = object.__new__(OpenAIConnector)
+        connector.agent_name = "OpenAIReasoningDefaultTest"
+        connector.model_name = "gpt-5.6-sol"
+        connector.custom_api_params = {}
+
+        self.assertEqual("max", connector._resolve_reasoning_effort())
+
+        connector.model_name = "gpt-5.6-luna"
+        self.assertEqual("max", connector._resolve_reasoning_effort())
+
+        connector.model_name = "gpt-5.6-terra"
+        self.assertEqual("max", connector._resolve_reasoning_effort())
+
+    def test_openai_connector_constructor_uses_gpt_5_6_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(OpenAIConnector, "_configure_client_from_runtime_snapshot"), \
+             patch.object(OpenAIConnector, "_initialize_tiktoken_encoder"), \
+             patch.object(OpenAIConnector, "_initialize_chat_session"):
+            connector = OpenAIConnector(
+                model_name="gpt-5.6-sol",
+                agent_name="OpenAIReasoningConstructorTest",
+                agent_data_path=temp_dir,
+                api_key="test-key",
+            )
+
+        self.assertEqual("max", connector.reasoning_effort)
+
+    def test_openai_non_gpt_5_6_keeps_xhigh_reasoning_default(self):
+        connector = object.__new__(OpenAIConnector)
+        connector.agent_name = "OpenAIReasoningDefaultTest"
+        connector.model_name = "gpt-5.5"
+        connector.custom_api_params = {}
+
+        self.assertEqual("xhigh", connector._resolve_reasoning_effort())
+
+    def test_openai_max_reasoning_effort_override_is_supported(self):
+        connector = object.__new__(OpenAIConnector)
+        connector.agent_name = "OpenAIReasoningOverrideTest"
+        connector.model_name = "gpt-5.6-sol"
+        connector.custom_api_params = {"openai_thinking_level": "max"}
+
+        self.assertEqual("max", connector._resolve_reasoning_effort())
+
     def test_provider_update_preserves_existing_backup_key_when_blank(self):
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "base-key",
@@ -1219,6 +1447,24 @@ class RuntimeApiConfigTests(unittest.TestCase):
         log_text = "\n".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
         self.assertNotIn("Before pruning", log_text)
 
+    def test_context_anchor_filter_accepts_string_ticks(self):
+        connector = ContextOverflowRetryConnector(self.tmpdir, fail_count=0)
+        connector.context_history_start_tick = 5
+
+        result = connector._filter_and_prune_history([
+            {"tick": "4", "role": "user", "text_content": "before"},
+            {"tick": "5", "role": "user", "text_content": "anchor"},
+            {"tick": 6, "role": "model", "text_content": "after"},
+        ])
+
+        self.assertEqual(
+            [
+                {"role": "user", "text_content": "anchor"},
+                {"role": "model", "text_content": "after"},
+            ],
+            result,
+        )
+
     def test_pruned_summary_is_user_side_with_model_placeholder(self):
         connector = ContextOverflowRetryConnector(self.tmpdir, fail_count=0)
         connector.agent_prune_blocks = [
@@ -1247,22 +1493,22 @@ class RuntimeApiConfigTests(unittest.TestCase):
                 {
                     "role": "user",
                     "text_content": (
-                        "Ticks 123-145 were pruned by the agent in the Token Management Room.\n"
-                        "Summary submitted by the agent:\n"
+                        "Ticks 123-145 were compacted by the Station.\n"
+                        "Summary:\n"
                         "Range summary."
                     ),
                 },
-                {"role": "model", "text_content": "Dialogue pruned."},
+                {"role": "model", "text_content": "Dialogue compacted."},
                 {"role": "user", "text_content": "between"},
                 {
                     "role": "user",
                     "text_content": (
-                        "Tick 151 was pruned by the agent in the Token Management Room.\n"
-                        "Summary submitted by the agent:\n"
+                        "Tick 151 was compacted by the Station.\n"
+                        "Summary:\n"
                         "Single tick summary."
                     ),
                 },
-                {"role": "model", "text_content": "Dialogue pruned."},
+                {"role": "model", "text_content": "Dialogue compacted."},
                 {"role": "user", "text_content": "after"},
             ],
             result,
@@ -1319,6 +1565,274 @@ class RuntimeApiConfigTests(unittest.TestCase):
             self.assertEqual(10, len(connector.endpoint_indices))
             self.assertEqual([0, 0, 1, 1, 0, 0, 1, 1, 0, 0], connector.endpoint_indices)
 
+    def test_claude_total_session_tokens_include_cache_creation(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+
+        self.assertEqual(
+            31,
+            connector._estimate_total_session_tokens_from_usage(FakeClaudeUsage()),
+        )
+
+    def test_claude_non_official_endpoint_uses_five_minute_cache_ttl(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.base_url = "https://provider.example.test"
+        connector.custom_api_params = {}
+        connector.agent_name = "Cache Agent"
+        connector._load_station_id_for_cache = lambda: "station-123"
+        expected_id = "station-agent-" + hashlib.sha256(
+            b"station-123:Cache Agent"
+        ).hexdigest()[:32]
+
+        self.assertTrue(connector._should_skip_token_counting())
+        self.assertEqual(
+            {"type": "ephemeral", "ttl": "5m"},
+            connector._build_request_cache_control(),
+        )
+        self.assertEqual(
+            {"user_id": expected_id, "session_id": expected_id},
+            connector._build_request_metadata(),
+        )
+        self.assertEqual({}, connector._build_api_headers())
+        self.assertEqual(
+            {"type": "text", "text": "hello"},
+            connector._build_text_block("hello"),
+        )
+
+    def test_claude_official_endpoint_uses_one_hour_cache_ttl(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.base_url = "https://api.anthropic.com"
+        connector.custom_api_params = {}
+        connector.agent_name = "Cache Agent"
+        connector._load_station_id_for_cache = lambda: "station-123"
+        expected_id = "station-agent-" + hashlib.sha256(
+            b"station-123:Cache Agent"
+        ).hexdigest()[:32]
+
+        self.assertFalse(connector._should_skip_token_counting())
+        self.assertEqual(
+            {"type": "ephemeral", "ttl": "1h"},
+            connector._build_request_cache_control(),
+        )
+        self.assertEqual(
+            {"user_id": expected_id},
+            connector._build_request_metadata(),
+        )
+        self.assertEqual(
+            {"anthropic-beta": "extended-cache-ttl-2025-04-11"},
+            connector._build_api_headers(),
+        )
+
+    def test_claude_cache_ttl_can_be_overridden(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.base_url = "https://provider.example.test"
+        connector.custom_api_params = {"claude_cache_ttl": "5m"}
+        connector.agent_name = "Cache Agent"
+        connector._load_station_id_for_cache = lambda: "station-123"
+
+        self.assertEqual(
+            {"type": "ephemeral", "ttl": "5m"},
+            connector._build_request_cache_control(),
+        )
+        self.assertIn("user_id", connector._build_request_metadata())
+        self.assertIn("session_id", connector._build_request_metadata())
+        self.assertEqual({}, connector._build_api_headers())
+
+    def test_claude_cache_ttl_override_can_enable_one_hour_for_non_official_endpoint(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.base_url = "https://provider.example.test"
+        connector.custom_api_params = {"claude_cache_ttl": "1h"}
+        connector.agent_name = "Cache Agent"
+        connector._load_station_id_for_cache = lambda: "station-123"
+
+        self.assertEqual(
+            {"type": "ephemeral", "ttl": "1h"},
+            connector._build_request_cache_control(),
+        )
+        self.assertIn("session_id", connector._build_request_metadata())
+        self.assertEqual(
+            {"anthropic-beta": "extended-cache-ttl-2025-04-11"},
+            connector._build_api_headers(),
+        )
+
+    def test_claude_cache_ttl_override_can_disable_cache_control(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.base_url = "https://api.anthropic.com"
+        connector.custom_api_params = {"claude_cache_ttl": "off"}
+        connector.agent_name = "Cache Agent"
+        connector._load_station_id_for_cache = lambda: "station-123"
+
+        self.assertIsNone(connector._build_request_cache_control())
+        self.assertIsNone(connector._build_request_metadata())
+        self.assertEqual({}, connector._build_api_headers())
+
+    def test_claude_empty_message_is_transient_without_high_context(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeEmptyTest"
+        connector._summarize_final_message_blocks = lambda _message: []
+
+        with self.assertRaises(LLMTransientAPIError):
+            connector._raise_for_empty_text_response(
+                FakeClaudeEmptyMessage(),
+                {"total_tokens_in_session": 1000},
+            )
+
+    def test_claude_empty_message_stays_transient_at_high_context(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeEmptyTest"
+        connector._summarize_final_message_blocks = lambda _message: []
+
+        with self.assertRaises(LLMTransientAPIError):
+            connector._raise_for_empty_text_response(
+                FakeClaudeEmptyMessage(),
+                {"total_tokens_in_session": 175000},
+            )
+
+    def test_claude_high_local_estimate_does_not_raise_context_overflow(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeHighEstimateTest"
+        connector.model_name = "claude-opus-4-8"
+        connector.base_url = "https://provider.example.test"
+        connector.active_endpoint_name = "base"
+        connector.system_prompt = "system"
+        connector.history_messages = [{"role": "user", "content": "previous"}]
+        connector.last_known_total_session_tokens = 232889
+        connector.temperature = 1.0
+        connector.max_output_tokens = None
+        connector._skip_token_counting = True
+        connector.api_headers = {}
+        connector.client = SimpleNamespace(messages=FakeClaudeMessagesClient())
+        connector.persist_to_disk = False
+
+        response, thinking, token_info = connector._send_message_implementation(
+            "prompt",
+            current_tick=1,
+        )
+
+        self.assertEqual("ok", response)
+        self.assertIsNone(thinking)
+        self.assertEqual(250002, token_info["total_tokens_in_session"])
+        self.assertEqual(1, len(connector.client.messages.calls))
+        self.assertEqual(64000, connector.client.messages.calls[0]["max_tokens"])
+
+    def test_claude_stream_accepts_dict_shaped_events_without_non_stream_fallback(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeDictStreamFallbackTest"
+        connector.model_name = "claude-opus-4-8"
+        connector.base_url = "https://provider.example.test"
+        connector.active_endpoint_name = "base"
+        connector.system_prompt = "system"
+        connector.history_messages = []
+        connector.last_known_total_session_tokens = None
+        connector.temperature = 1.0
+        connector.max_output_tokens = None
+        connector.custom_api_params = {}
+        connector._skip_token_counting = True
+        connector.api_headers = {}
+        connector.client = SimpleNamespace(messages=FakeClaudeStreamDictFallbackMessagesClient())
+        connector.persist_to_disk = False
+        connector._debug_api_enabled = lambda: False
+
+        response, thinking, token_info = connector._send_message_implementation(
+            "prompt",
+            current_tick=1,
+        )
+
+        self.assertEqual("raw stream ok", response)
+        self.assertIsNone(thinking)
+        self.assertEqual(17, token_info["total_tokens_in_session"])
+        self.assertEqual(1, len(connector.client.messages.create_calls))
+        self.assertIs(connector.client.messages.create_calls[0]["stream"], True)
+
+    def test_claude_stream_without_stop_reason_is_transient_and_not_persisted(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeTruncatedStreamTest"
+        connector.model_name = "claude-opus-4-8"
+        connector.base_url = "https://provider.example.test"
+        connector.active_endpoint_name = "base"
+        connector.system_prompt = "system"
+        connector.history_messages = []
+        connector.last_known_total_session_tokens = None
+        connector.temperature = 1.0
+        connector.max_output_tokens = None
+        connector.custom_api_params = {}
+        connector._skip_token_counting = True
+        connector.api_headers = {}
+        connector.client = SimpleNamespace(messages=FakeClaudeTruncatedStreamMessagesClient())
+        connector.persist_to_disk = False
+        connector._debug_api_enabled = lambda: False
+
+        with self.assertRaisesRegex(
+            LLMTransientAPIError,
+            "stream ended without a stop_reason",
+        ):
+            connector._send_message_implementation("prompt", current_tick=1)
+
+        self.assertEqual([], connector.history_messages)
+        self.assertEqual(1, len(connector.client.messages.create_calls))
+
+    def test_claude_opus_5_refusal_retries_turn_with_opus_4_8(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.agent_name = "ClaudeOpusRefusalTest"
+        connector.model_name = "claude-opus-5"
+        connector.base_url = "https://provider.example.test"
+        connector.active_endpoint_name = "base"
+        connector.system_prompt = "system"
+        connector.history_messages = []
+        connector.last_known_total_session_tokens = None
+        connector.temperature = 1.0
+        connector.max_output_tokens = None
+        connector.custom_api_params = {}
+        connector._skip_token_counting = True
+        connector.api_headers = {}
+        connector.client = SimpleNamespace(messages=FakeClaudeOpusRefusalMessagesClient())
+        connector.history_file_path = os.path.join(
+            self.tmpdir,
+            "agents",
+            "ClaudeOpusRefusalTest",
+            "llm_chat_history.yamll",
+        )
+        connector.persist_to_disk = True
+        connector._debug_api_enabled = lambda: False
+
+        response, thinking, token_info = connector._send_message_implementation(
+            "prompt",
+            current_tick=1,
+        )
+
+        self.assertEqual("fallback ok", response)
+        self.assertIsNone(thinking)
+        self.assertEqual(17, token_info["total_tokens_in_session"])
+        self.assertEqual(
+            ["claude-opus-5", "claude-opus-4-8"],
+            [call["model"] for call in connector.client.messages.calls],
+        )
+        self.assertEqual(
+            [
+                {"role": "user", "content": "prompt"},
+                {"role": "assistant", "content": "fallback ok"},
+            ],
+            connector.history_messages,
+        )
+        persisted = file_io_utils.load_yaml_lines(connector.history_file_path)
+        self.assertEqual(2, len(persisted))
+        self.assertEqual("fallback ok", persisted[1]["parts"][0]["text"])
+        self.assertNotIn("provider refusal", str(persisted))
+        self.assertEqual("claude-opus-4-8", persisted[1]["api_metadata"]["model_name"])
+        self.assertEqual("claude-opus-5", persisted[1]["api_metadata"]["configured_model_name"])
+        self.assertEqual("claude-opus-4-8", persisted[1]["api_metadata"]["refusal_fallback_model"])
+
+    def test_claude_refusal_fallback_is_limited_to_opus_5(self):
+        connector = ClaudeConnector.__new__(ClaudeConnector)
+        connector.model_name = "claude-opus-4-8"
+
+        self.assertFalse(
+            connector._should_fallback_after_refusal({"stop_reason": "refusal"})
+        )
+        connector.model_name = "claude-opus-5"
+        self.assertFalse(
+            connector._should_fallback_after_refusal({"stop_reason": "end_turn"})
+        )
+
     def test_base_recovery_probe_uses_connector_model_and_restores_base_default(self):
         with patch.dict(os.environ, {
             "OPENAI_API_KEY": "base-key",
@@ -1374,6 +1888,42 @@ class RuntimeApiConfigTests(unittest.TestCase):
             self.assertEqual([1], connector.endpoint_indices)
             self.assertEqual(1, runtime_api_config.get_provider_default_endpoint("openai")["index"])
 
+    def test_recovery_probe_checks_earlier_backups_before_current_default(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "base-key",
+            "OPENAI_BASE_URL": "https://base.example.test/v1",
+            "BACKUP_OPENAI_API_KEY": "backup-one-key;backup-two-key",
+            "BACKUP_OPENAI_BASE_URL": "https://backup-one.example.test/v1;https://backup-two.example.test/v1",
+        }, clear=True):
+            with patch("station.runtime_api_config.time.time", return_value=1000.0):
+                for _ in range(10):
+                    runtime_api_config.record_provider_failure_and_get_retry_snapshot(
+                        "openai",
+                        0,
+                        ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+                    )
+                for _ in range(10):
+                    runtime_api_config.record_provider_failure_and_get_retry_snapshot(
+                        "openai",
+                        1,
+                        ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+                    )
+
+            self.assertEqual(2, runtime_api_config.get_provider_default_endpoint("openai")["index"])
+
+            connector = ProviderFallbackConnector(
+                self.tmpdir,
+                fail_first=False,
+                probe_success_indices={1},
+            )
+            with patch("station.runtime_api_config.time.time", return_value=2801.0):
+                response, _thinking, _token_info = connector.send_message("hello", current_tick=1)
+
+            self.assertEqual("ok", response)
+            self.assertEqual([("test-model", 0), ("test-model", 1)], connector.probe_calls)
+            self.assertEqual([1], connector.endpoint_indices)
+            self.assertEqual(1, runtime_api_config.get_provider_default_endpoint("openai")["index"])
+
     def test_openai_internal_stream_fallback_forces_non_stream_once(self):
         connector = make_openai_connector_for_internal_fallback_tests()
         token_info = {"total_tokens_in_session": None}
@@ -1391,6 +1941,56 @@ class RuntimeApiConfigTests(unittest.TestCase):
             [call.get("stream") for call in connector.client.responses.calls],
         )
         self.assertEqual(1, connector._refresh_count)
+
+    def test_openai_responses_defaults_to_streaming_then_non_streaming(self):
+        connector = make_openai_connector_for_internal_fallback_tests()
+        connector._api_runtime_config_snapshot = {
+            "generation": runtime_api_config.get_generation(),
+            "http_proxy": None,
+            "https_proxy": None,
+            "env": {},
+        }
+        token_info = {"total_tokens_in_session": None}
+
+        with self.assertRaises(LLMConnectorError):
+            connector._send_message_with_responses_api(
+                "hello",
+                current_tick=1,
+                token_info=token_info,
+                attempt_number=0,
+            )
+
+        self.assertEqual(
+            [True, None],
+            [call.get("stream") for call in connector.client.responses.calls],
+        )
+
+    def test_openai_responses_outer_retry_uses_non_streaming(self):
+        connector = make_openai_connector_for_internal_fallback_tests()
+        connector._api_runtime_config_snapshot = {
+            "generation": runtime_api_config.get_generation(),
+            "http_proxy": None,
+            "https_proxy": None,
+            "env": {},
+        }
+        token_info = {"total_tokens_in_session": None}
+
+        with self.assertRaises(LLMConnectorError):
+            connector._send_message_with_responses_api(
+                "hello",
+                current_tick=1,
+                token_info=token_info,
+                attempt_number=1,
+            )
+
+        self.assertEqual(
+            [None],
+            [call.get("stream") for call in connector.client.responses.calls],
+        )
+        self.assertEqual(
+            [True, False, True, False],
+            [connector._should_use_responses_streaming_on_attempt(i) for i in range(4)],
+        )
 
     def test_openai_internal_stream_503_defers_to_outer_retry(self):
         connector = make_openai_connector_for_internal_fallback_tests(

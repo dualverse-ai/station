@@ -10,7 +10,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from station import constants
 
@@ -262,6 +262,8 @@ def _get_provider_state_locked(provider_id: str) -> Dict[str, Any]:
         "endpoint_results": {},
         "last_base_probe_at": 0.0,
         "base_probe_in_progress": False,
+        "last_recovery_probe_at": 0.0,
+        "recovery_probe_in_progress": False,
         "default_reason": "initial",
         "default_changed_at": 0.0,
     })
@@ -485,38 +487,154 @@ def record_provider_failure_and_get_retry_snapshot(
         return retry_snapshot
 
 
-def claim_provider_base_recovery_probe(provider_id: str, env_names: Iterable[str]) -> Optional[Dict[str, Any]]:
+def advance_provider_fallback_after_failure(
+    provider_id: str,
+    endpoint_index: Optional[int],
+    failure_streak: int,
+    env_names: Iterable[str],
+) -> Dict[str, Any]:
+    """Apply the shared retry-once-then-rotate provider fallback policy."""
     with _LOCK:
         endpoints = _build_provider_endpoints_locked(provider_id)
         if len(endpoints) <= 1:
+            return {
+                "handled": False,
+                "failure_streak": int(failure_streak or 0),
+                "retry_same_endpoint": False,
+                "retry_snapshot": None,
+                "cycle_wrapped": False,
+            }
+
+        next_failure_streak = int(failure_streak or 0) + 1
+        if next_failure_streak < 2:
+            record_provider_failure(
+                provider_id,
+                endpoint_index,
+                promote_default=False,
+            )
+            return {
+                "handled": True,
+                "failure_streak": next_failure_streak,
+                "retry_same_endpoint": True,
+                "retry_snapshot": None,
+                "cycle_wrapped": False,
+            }
+
+        retry_snapshot = record_provider_failure_and_get_retry_snapshot(
+            provider_id,
+            endpoint_index,
+            env_names,
+        )
+        if retry_snapshot is None:
+            return {
+                "handled": False,
+                "failure_streak": next_failure_streak,
+                "retry_same_endpoint": False,
+                "retry_snapshot": None,
+                "cycle_wrapped": False,
+            }
+        return {
+            "handled": True,
+            "failure_streak": 0,
+            "retry_same_endpoint": False,
+            "retry_snapshot": retry_snapshot,
+            "cycle_wrapped": bool(retry_snapshot.get("provider_endpoint_cycle_wrapped")),
+        }
+
+
+def claim_provider_recovery_probes(provider_id: str, env_names: Iterable[str]) -> List[Dict[str, Any]]:
+    """Claim an ordered recovery probe batch for endpoints before the current default."""
+    with _LOCK:
+        endpoints = [
+            endpoint for endpoint in _build_provider_endpoints_locked(provider_id)
+            if endpoint.get("valid", True)
+        ]
+        if len(endpoints) <= 1:
+            return []
+        state = _get_provider_state_locked(provider_id)
+        current_index = int(state.get("default_index", 0))
+        candidate_indices = [
+            int(endpoint["index"])
+            for endpoint in sorted(endpoints, key=lambda item: int(item.get("index", 0)))
+            if int(endpoint.get("index", 0)) < current_index
+        ]
+        if not candidate_indices:
+            return []
+        if state.get("recovery_probe_in_progress") or state.get("base_probe_in_progress"):
+            return []
+        now = time.time()
+        last_probe = float(state.get("last_recovery_probe_at") or state.get("last_base_probe_at") or 0.0)
+        if last_probe and now - last_probe < PROVIDER_BASE_RECOVERY_CHECK_INTERVAL_SECONDS:
+            return []
+        state["recovery_probe_in_progress"] = True
+        state["base_probe_in_progress"] = True
+        state["last_recovery_probe_at"] = now
+        state["last_base_probe_at"] = now
+        return [
+            _build_config_snapshot_locked(env_names, provider_id, endpoint_index=endpoint_index)
+            for endpoint_index in candidate_indices
+        ]
+
+
+def complete_provider_recovery_probes(provider_id: str, results: Iterable[Tuple[int, bool]]) -> None:
+    """Complete a recovery probe batch and promote to the first successful earlier endpoint."""
+    with _LOCK:
+        state = _get_provider_state_locked(provider_id)
+        first_success_index: Optional[int] = None
+        for endpoint_index, success in results:
+            try:
+                candidate_index = int(endpoint_index)
+            except Exception:
+                continue
+            _append_provider_result_locked(provider_id, candidate_index, bool(success))
+            if success and first_success_index is None:
+                first_success_index = candidate_index
+        current_index = int(state.get("default_index", 0))
+        state["base_probe_in_progress"] = False
+        state["recovery_probe_in_progress"] = False
+        if first_success_index is not None and first_success_index != current_index:
+            state["default_index"] = first_success_index
+            state["default_reason"] = (
+                "base_recovery_probe"
+                if first_success_index == 0
+                else "earlier_endpoint_recovery_probe"
+            )
+            state["default_changed_at"] = time.time()
+            _bump_generation()
+
+
+def claim_provider_base_recovery_probe(provider_id: str, env_names: Iterable[str]) -> Optional[Dict[str, Any]]:
+    """Backward-compatible single base probe claim."""
+    with _LOCK:
+        endpoints = [
+            endpoint for endpoint in _build_provider_endpoints_locked(provider_id)
+            if endpoint.get("valid", True)
+        ]
+        if len(endpoints) <= 1:
             return None
         base_endpoint = next((endpoint for endpoint in endpoints if int(endpoint.get("index", -1)) == 0), None)
-        if not base_endpoint or not base_endpoint.get("valid", True):
+        if not base_endpoint:
             return None
         state = _get_provider_state_locked(provider_id)
         if int(state.get("default_index", 0)) == 0:
             return None
-        if state.get("base_probe_in_progress"):
+        if state.get("recovery_probe_in_progress") or state.get("base_probe_in_progress"):
             return None
         now = time.time()
-        last_probe = float(state.get("last_base_probe_at") or 0.0)
+        last_probe = float(state.get("last_recovery_probe_at") or state.get("last_base_probe_at") or 0.0)
         if last_probe and now - last_probe < PROVIDER_BASE_RECOVERY_CHECK_INTERVAL_SECONDS:
             return None
+        state["recovery_probe_in_progress"] = True
         state["base_probe_in_progress"] = True
+        state["last_recovery_probe_at"] = now
         state["last_base_probe_at"] = now
         return _build_config_snapshot_locked(env_names, provider_id, endpoint_index=0)
+    return None
 
 
 def complete_provider_base_recovery_probe(provider_id: str, success: bool) -> None:
-    with _LOCK:
-        state = _get_provider_state_locked(provider_id)
-        state["base_probe_in_progress"] = False
-        _append_provider_result_locked(provider_id, 0, bool(success))
-        if success and int(state.get("default_index", 0)) != 0:
-            state["default_index"] = 0
-            state["default_reason"] = "base_recovery_probe"
-            state["default_changed_at"] = time.time()
-            _bump_generation()
+    """Backward-compatible base probe completion."""
+    complete_provider_recovery_probes(provider_id, [(0, success)])
 
 
 def get_station_proxy_snapshot() -> Dict[str, Any]:

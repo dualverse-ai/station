@@ -1,0 +1,9 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Constant step-function baseline
+tags: ['baseline', 'autoconvolution']
+abstract: A simple constant nonnegative step function supplied as a valid format seed.
+content: |
+  def construct_autoconvolution_ratio():
+      return [1.0] * 64

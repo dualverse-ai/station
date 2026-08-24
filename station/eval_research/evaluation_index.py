@@ -21,18 +21,15 @@ from station import file_io_utils
 from station import index_paths
 
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "6"
 _INDEX_LOCK = threading.RLock()
 _PROCESS_REBUILD_REQUESTED_SCOPES: set[str] = set()
+_PROCESS_TOP_REFRESHED_SCOPES: set[str] = set()
 
 TERMINAL_EVALUATION_STATUSES = {"completed", "success", "failed", "blocked", "partial"}
 ACTIVE_EVALUATION_STATUSES = {"queued", "running"}
 QUEUED_EVALUATION_STATUSES = {"queued"}
 RUNNING_EVALUATION_STATUSES = {"running"}
-ARTIFACT_MIGRATION_BLOB_FIELDS = ("submission_snapshot", "stdout", "stdout_visible", "stderr", "coder_report")
-ARTIFACT_MIGRATION_KEYS = ("submission", "stdout", "stderr", "report")
-
-
 def should_rebuild_from_process_args() -> bool:
     import sys
 
@@ -71,34 +68,59 @@ def ensure_research_evaluation_index(
 def rebuild_research_evaluation_index(evaluations_dir: str) -> None:
     scope = _scope_key(evaluations_dir)
     with _INDEX_LOCK:
-        db_path = get_database_path(evaluations_dir)
-        file_io_utils.ensure_dir_exists(os.path.dirname(db_path))
-        print(f"ResearchIndex: rebuilding path={db_path!r} evaluations_dir={scope!r}")
-        conn = _connect(evaluations_dir)
-        indexed_count = 0
-        try:
-            _configure_database(conn, setup_wal=True)
-            conn.execute("BEGIN IMMEDIATE")
-            _create_schema(conn)
-            _clear_scope_unlocked(conn, scope)
-            for eval_id, path in _iter_evaluation_files(evaluations_dir):
-                data = file_io_utils.load_yaml(path)
-                if not isinstance(data, dict):
-                    continue
-                _upsert_evaluation_unlocked(conn, scope, data, path)
-                indexed_count += 1
-            _recompute_top_submission_unlocked(conn, scope)
-            _set_scope_schema_unlocked(conn, scope)
-            conn.commit()
-            print(
-                "ResearchIndex: rebuild complete "
-                f"path={db_path!r} evaluations_dir={scope!r} evaluations={indexed_count}"
-            )
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with index_paths.get_station_index_write_lock():
+            db_path = get_database_path(evaluations_dir)
+            file_io_utils.ensure_dir_exists(os.path.dirname(db_path))
+            print(f"ResearchIndex: rebuilding path={db_path!r} evaluations_dir={scope!r}")
+            conn = _connect(evaluations_dir)
+            indexed_count = 0
+            try:
+                _configure_database(conn, setup_wal=True)
+                conn.execute("BEGIN IMMEDIATE")
+                _create_schema(conn)
+                _clear_scope_unlocked(conn, scope)
+                for eval_id, path in _iter_evaluation_files(evaluations_dir):
+                    data = file_io_utils.load_yaml(path)
+                    if not isinstance(data, dict):
+                        continue
+                    _upsert_evaluation_unlocked(conn, scope, data, path)
+                    indexed_count += 1
+                _recompute_top_submission_unlocked(conn, scope)
+                _set_scope_schema_unlocked(conn, scope)
+                conn.commit()
+                _PROCESS_TOP_REFRESHED_SCOPES.add(scope)
+                print(
+                    "ResearchIndex: rebuild complete "
+                    f"path={db_path!r} evaluations_dir={scope!r} evaluations={indexed_count}"
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+
+def refresh_top_submission_from_index(evaluations_dir: str) -> None:
+    """Recompute the exact top-submission cache from indexed rows once per process.
+
+    This upgrades caches written by versions that applied breakthrough epsilon
+    to top-submission selection. It intentionally reads SQLite only and never
+    scans evaluation YAML.
+    """
+    scope = _scope_key(evaluations_dir)
+    ensure_research_evaluation_index(evaluations_dir)
+    with _INDEX_LOCK:
+        if scope in _PROCESS_TOP_REFRESHED_SCOPES:
+            return
+        with index_paths.get_station_index_write_lock():
+            conn = _connect(evaluations_dir)
+            try:
+                _configure_database(conn)
+                with conn:
+                    _recompute_top_submission_unlocked(conn, scope)
+            finally:
+                conn.close()
+        _PROCESS_TOP_REFRESHED_SCOPES.add(scope)
 
 
 def upsert_evaluation(eval_data: Dict[str, Any], evaluations_dir: str) -> None:
@@ -109,8 +131,11 @@ def upsert_evaluation(eval_data: Dict[str, Any], evaluations_dir: str) -> None:
     if not eval_id:
         return
     file_path = _get_yaml_eval_path(eval_id, evaluations_dir)
-    with _INDEX_LOCK:
-        ensure_research_evaluation_index(evaluations_dir)
+    ensure_research_evaluation_index(evaluations_dir)
+    # Do not hold _INDEX_LOCK while waiting for SQLite. Readers use that lock
+    # during schema checks, so a busy write could otherwise stall room renders
+    # for the full SQLite busy timeout.
+    with index_paths.get_station_index_write_lock():
         conn = _connect(evaluations_dir)
         try:
             _configure_database(conn)
@@ -125,8 +150,8 @@ def upsert_evaluation(eval_data: Dict[str, Any], evaluations_dir: str) -> None:
 def delete_evaluation(eval_id: str, evaluations_dir: str) -> None:
     scope = _scope_key(evaluations_dir)
     eval_id = str(eval_id)
-    with _INDEX_LOCK:
-        ensure_research_evaluation_index(evaluations_dir)
+    ensure_research_evaluation_index(evaluations_dir)
+    with index_paths.get_station_index_write_lock():
         conn = _connect(evaluations_dir)
         try:
             _configure_database(conn)
@@ -180,6 +205,75 @@ def list_display_infos(evaluations_dir: str) -> List[Dict[str, Any]]:
         conn.close()
 
 
+def list_successful_score_rows(evaluations_dir: str) -> List[Dict[str, Any]]:
+    """Return compact successful score rows for aggregate analysis."""
+    ensure_research_evaluation_index(evaluations_dir)
+    scope = _scope_key(evaluations_dir)
+    conn = _connect(evaluations_dir)
+    try:
+        _configure_database(conn)
+        rows = conn.execute(
+            """
+            SELECT eval_id, eval_id_num, author, score_json, sort_key_json
+            FROM research_evaluations
+            WHERE evaluations_dir = ? AND success_score = 1
+            ORDER BY eval_id_num ASC, eval_id ASC
+            """,
+            (scope,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            score = _json_load_any(row["score_json"], constants.RESEARCH_SCORE_NA)
+            sort_key = _json_load_any(row["sort_key_json"]) if row["sort_key_json"] else None
+            result.append({
+                "eval_id": str(row["eval_id"]),
+                "eval_id_num": int(row["eval_id_num"] or 0),
+                "author": row["author"] or "",
+                "score": score,
+                "sort_key": sort_key,
+            })
+        return result
+    finally:
+        conn.close()
+
+
+def list_breakthrough_source_rows(evaluations_dir: str) -> List[Dict[str, Any]]:
+    """Return indexed successful evaluation rows for canonical breakthrough detection."""
+    ensure_research_evaluation_index(evaluations_dir)
+    scope = _scope_key(evaluations_dir)
+    conn = _connect(evaluations_dir)
+    try:
+        _configure_database(conn)
+        rows = conn.execute(
+            """
+            SELECT eval_id, eval_id_num, author, lineage, title, abstract, tags_json,
+                   submitted_tick, score_json, sort_key_json, progress_records_json
+            FROM research_evaluations
+            WHERE evaluations_dir = ? AND success_score = 1
+            ORDER BY eval_id_num ASC, eval_id ASC
+            """,
+            (scope,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "eval_id": str(row["eval_id"]),
+                "eval_id_num": int(row["eval_id_num"] or 0),
+                "author": row["author"] or "",
+                "lineage": row["lineage"] or "",
+                "title": row["title"] or "Untitled",
+                "abstract": row["abstract"] or "",
+                "tags": _json_load_list(row["tags_json"]),
+                "submitted_tick": row["submitted_tick"],
+                "score": _json_load_any(row["score_json"], constants.RESEARCH_SCORE_NA),
+                "sort_key": _json_load_any(row["sort_key_json"]) if row["sort_key_json"] else None,
+                "progress_records": _json_load_any(row["progress_records_json"], []),
+            })
+        return result
+    finally:
+        conn.close()
+
+
 def get_all_evaluation_ids(evaluations_dir: str) -> List[str]:
     ensure_research_evaluation_index(evaluations_dir)
     scope = _scope_key(evaluations_dir)
@@ -198,30 +292,6 @@ def get_all_evaluation_ids(evaluations_dir: str) -> List[str]:
         return [str(row["eval_id"]) for row in rows]
     finally:
         conn.close()
-
-
-def needs_artifact_migration(evaluations_dir: str) -> bool:
-    ensure_research_evaluation_index(evaluations_dir)
-    scope = _scope_key(evaluations_dir)
-    conn = _connect(evaluations_dir)
-    try:
-        _configure_database(conn)
-        value = conn.execute(
-            """
-            SELECT 1
-            FROM research_evaluations
-            WHERE evaluations_dir = ? AND needs_artifact_migration = 1
-            LIMIT 1
-            """,
-            (scope,),
-        ).fetchone()
-        return value is not None
-    finally:
-        conn.close()
-
-
-def get_artifact_migration_eval_ids(evaluations_dir: str) -> List[str]:
-    return _list_ids_by_flag(evaluations_dir, "needs_artifact_migration = 1")
 
 
 def search_abstracts(evaluations_dir: str, pattern: str, limit: int = 50) -> Tuple[int, List[Dict[str, Any]]]:
@@ -363,6 +433,45 @@ def get_unfinished_instruction_eval_ids(evaluations_dir: str) -> List[str]:
 
 def get_retryable_blocked_instruction_eval_ids(evaluations_dir: str) -> List[str]:
     return _list_ids_by_flag(evaluations_dir, "is_retryable_blocked = 1")
+
+
+def get_unfinished_requeue_candidate_instruction_eval_ids(
+    evaluations_dir: str,
+    *,
+    include_active_statuses: bool = True,
+) -> List[str]:
+    if not include_active_statuses:
+        return get_no_report_terminal_requeueable_eval_ids(evaluations_dir)
+    return _list_ids_by_flag(
+        evaluations_dir,
+        """
+        (
+            is_coder_managed = 1
+            AND final_exists = 0
+            AND coder_active = 0
+            AND COALESCE(latest_attempt_status, '') != 'running'
+            AND top_level_status IN ('queued', 'running')
+        )
+        OR (
+            is_coder_managed = 1
+            AND final_exists = 0
+            AND coder_active = 0
+            AND status IN ('failed', 'blocked', 'partial')
+        )
+        """,
+    )
+
+
+def get_no_report_terminal_requeueable_eval_ids(evaluations_dir: str) -> List[str]:
+    return _list_ids_by_flag(
+        evaluations_dir,
+        """
+        is_coder_managed = 1
+        AND final_exists = 0
+        AND coder_active = 0
+        AND status IN ('failed', 'blocked', 'partial')
+        """,
+    )
 
 
 def get_pending_notification_eval_ids(evaluations_dir: str) -> List[str]:
@@ -511,7 +620,9 @@ def _needs_rebuild(evaluations_dir: str) -> bool:
             "SELECT schema_version FROM research_evaluation_scopes WHERE evaluations_dir = ?",
             (scope,),
         ).fetchone()
-        return row is None or str(row["schema_version"]) != SCHEMA_VERSION
+        if row is None or str(row["schema_version"]) != SCHEMA_VERSION:
+            return True
+        return False
     except sqlite3.DatabaseError as exc:
         if "no such table" in str(exc).lower():
             return True
@@ -553,6 +664,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             score_numeric REAL,
             details_json TEXT,
             sort_key_json TEXT,
+            progress_records_json TEXT,
             final_exists INTEGER NOT NULL DEFAULT 0,
             success_score INTEGER NOT NULL DEFAULT 0,
             is_instruction INTEGER NOT NULL DEFAULT 0,
@@ -565,9 +677,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             is_unfinished_instruction INTEGER NOT NULL DEFAULT 0,
             is_retryable_blocked INTEGER NOT NULL DEFAULT 0,
             has_pending_notification INTEGER NOT NULL DEFAULT 0,
-            has_required_artifacts INTEGER NOT NULL DEFAULT 0,
-            has_inline_blobs INTEGER NOT NULL DEFAULT 0,
-            needs_artifact_migration INTEGER NOT NULL DEFAULT 0,
             current_attempt INTEGER,
             start_timestamp REAL,
             coder_status TEXT,
@@ -586,11 +695,10 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             ON research_evaluations(evaluations_dir, author_lower, is_active);
         CREATE INDEX IF NOT EXISTS idx_research_eval_lineage_recent
             ON research_evaluations(evaluations_dir, lineage_lower, final_exists, submitted_tick DESC);
+        CREATE INDEX IF NOT EXISTS idx_research_eval_success_order
+            ON research_evaluations(evaluations_dir, success_score, eval_id_num ASC, eval_id ASC);
         CREATE INDEX IF NOT EXISTS idx_research_eval_pending_notification
             ON research_evaluations(evaluations_dir, has_pending_notification);
-        CREATE INDEX IF NOT EXISTS idx_research_eval_artifact_migration
-            ON research_evaluations(evaluations_dir, needs_artifact_migration, eval_id_num ASC, eval_id ASC);
-
         CREATE TABLE IF NOT EXISTS research_evaluation_tags (
             evaluations_dir TEXT NOT NULL,
             eval_id TEXT NOT NULL,
@@ -612,9 +720,7 @@ def _ensure_research_evaluation_columns(conn: sqlite3.Connection) -> None:
     }
     missing_columns = {
         "latest_attempt_status": "TEXT",
-        "has_required_artifacts": "INTEGER NOT NULL DEFAULT 0",
-        "has_inline_blobs": "INTEGER NOT NULL DEFAULT 0",
-        "needs_artifact_migration": "INTEGER NOT NULL DEFAULT 0",
+        "progress_records_json": "TEXT",
     }
     for column, definition in missing_columns.items():
         if column not in existing:
@@ -657,6 +763,7 @@ def _upsert_evaluation_unlocked(
     score = display_info.get(constants.EVALUATION_SCORE_KEY, constants.RESEARCH_SCORE_NA)
     details = display_info.get(constants.EVALUATION_DETAILS_KEY, "")
     sort_key = display_info.get("sort_key")
+    progress_records = (final.get("progress_records") if isinstance(final, dict) else []) or []
     tags = _clean_string_list(display_info.get(constants.EVALUATION_TAGS_KEY))
     notification = eval_data.get("notification") or {}
     coder = eval_data.get("coder", {}) or {}
@@ -673,10 +780,6 @@ def _upsert_evaluation_unlocked(
         and status in TERMINAL_EVALUATION_STATUSES
         and score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA, None)
     )
-    has_required_artifacts = _has_required_artifacts(eval_data)
-    has_inline_blobs = _has_inline_blobs(eval_data)
-    needs_artifact_migration = has_inline_blobs or not has_required_artifacts
-
     if active_summary:
         top_level_status = active_summary.get("top_level_status")
         display_status = active_summary.get("status")
@@ -696,14 +799,21 @@ def _upsert_evaluation_unlocked(
             evaluations_dir, eval_id, eval_id_num, file_path, file_mtime_ns,
             author, author_lower, lineage, lineage_lower, title, abstract, tags_json,
             submitted_tick, submitted_timestamp, status, display_status, top_level_status,
-            latest_attempt_status, score_json, score_numeric, details_json, sort_key_json, final_exists, success_score,
+            latest_attempt_status, score_json, score_numeric, details_json, sort_key_json, progress_records_json,
+            final_exists, success_score,
             is_instruction, is_coder_managed, is_active, is_queued_instruction, is_running_instruction,
             active_coder, is_resuming_instruction, is_unfinished_instruction, is_retryable_blocked,
-            has_pending_notification, has_required_artifacts, has_inline_blobs, needs_artifact_migration,
+            has_pending_notification,
             current_attempt, start_timestamp, coder_status, coder_active, execution_source,
             system_baseline, updated_at
         )
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES(
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?
+        )
         ON CONFLICT(evaluations_dir, eval_id) DO UPDATE SET
             eval_id_num = excluded.eval_id_num,
             file_path = excluded.file_path,
@@ -725,6 +835,7 @@ def _upsert_evaluation_unlocked(
             score_numeric = excluded.score_numeric,
             details_json = excluded.details_json,
             sort_key_json = excluded.sort_key_json,
+            progress_records_json = excluded.progress_records_json,
             final_exists = excluded.final_exists,
             success_score = excluded.success_score,
             is_instruction = excluded.is_instruction,
@@ -737,9 +848,6 @@ def _upsert_evaluation_unlocked(
             is_unfinished_instruction = excluded.is_unfinished_instruction,
             is_retryable_blocked = excluded.is_retryable_blocked,
             has_pending_notification = excluded.has_pending_notification,
-            has_required_artifacts = excluded.has_required_artifacts,
-            has_inline_blobs = excluded.has_inline_blobs,
-            needs_artifact_migration = excluded.needs_artifact_migration,
             current_attempt = excluded.current_attempt,
             start_timestamp = excluded.start_timestamp,
             coder_status = excluded.coder_status,
@@ -771,6 +879,7 @@ def _upsert_evaluation_unlocked(
             _as_optional_float(score),
             _json_dumps(details),
             _json_dumps(sort_key) if sort_key is not None else None,
+            _json_dumps(progress_records),
             1 if bool(final) else 0,
             1 if score_success else 0,
             1 if is_instruction_eval else 0,
@@ -783,9 +892,6 @@ def _upsert_evaluation_unlocked(
             1 if is_coder_managed and status in {"queued", "running", "blocked"} else 0,
             1 if status == "blocked" and is_coder_managed and not bool(coder.get("active")) else 0,
             1 if bool(final) and status in TERMINAL_EVALUATION_STATUSES and not notification.get("sent") else 0,
-            1 if has_required_artifacts else 0,
-            1 if has_inline_blobs else 0,
-            1 if needs_artifact_migration else 0,
             _as_optional_int(eval_data.get("current_attempt")),
             _as_optional_float(start_timestamp),
             coder_substate,
@@ -851,6 +957,15 @@ def _candidate_from_row(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
         "abstract": row["abstract"] or "",
         "sort_key": list(normalized_sort_key),
     }
+
+
+def _extract_metric_value(value: Any) -> Any:
+    # Evaluation details often store metrics as [formatted, raw].
+    if isinstance(value, (list, tuple)) and value:
+        if len(value) >= 2:
+            return value[1]
+        return value[0]
+    return value
 
 
 def _row_to_display_info(row: sqlite3.Row) -> Dict[str, Any]:
@@ -982,25 +1097,6 @@ def _build_active_evaluation_summary(eval_data: Dict[str, Any]) -> Optional[Dict
     }
 
 
-def _has_required_artifacts(eval_data: Dict[str, Any]) -> bool:
-    artifacts = eval_data.get("artifacts")
-    return isinstance(artifacts, dict) and all(
-        isinstance(artifacts.get(key), str) and artifacts.get(key).strip()
-        for key in ARTIFACT_MIGRATION_KEYS
-    )
-
-
-def _has_inline_blobs(eval_data: Dict[str, Any]) -> bool:
-    attempts = eval_data.get("attempts") or []
-    if isinstance(attempts, list):
-        for attempt in attempts:
-            if isinstance(attempt, dict) and any(key in attempt for key in ARTIFACT_MIGRATION_BLOB_FIELDS):
-                return True
-
-    final = eval_data.get("final")
-    return isinstance(final, dict) and any(key in final for key in ARTIFACT_MIGRATION_BLOB_FIELDS)
-
-
 def _normalize_evaluation_status(status: Optional[str]) -> Optional[str]:
     if status is None:
         return None
@@ -1063,10 +1159,6 @@ def _normalize_sort_key_component(value: Any) -> Optional[Any]:
         return None
 
 
-def _is_numeric_singleton_tuple(key: Any) -> bool:
-    return isinstance(key, tuple) and len(key) == 1 and isinstance(key[0], (int, float))
-
-
 def _coerce_tick(tick: Any) -> Optional[int]:
     try:
         return int(tick)
@@ -1090,17 +1182,10 @@ def _should_replace_top_submission(candidate: Dict[str, Any], current_top: Optio
     top_sort_key = _normalize_sort_key(current_top.get("sort_key"), current_top.get("score"))
     if top_sort_key is None:
         return True
-    eps = getattr(constants, "BREAKTHROUGH_EPS", 1e-8)
-    if _is_numeric_singleton_tuple(candidate_sort_key) and _is_numeric_singleton_tuple(top_sort_key):
-        if candidate_sort_key[0] > top_sort_key[0] + eps:
-            return True
-        if candidate_sort_key[0] + eps < top_sort_key[0]:
-            return False
-    else:
-        if candidate_sort_key > top_sort_key:
-            return True
-        if candidate_sort_key < top_sort_key:
-            return False
+    if candidate_sort_key > top_sort_key:
+        return True
+    if candidate_sort_key < top_sort_key:
+        return False
     candidate_tick = _coerce_tick(candidate.get("submitted_tick"))
     top_tick = _coerce_tick(current_top.get("submitted_tick"))
     if candidate_tick is not None and top_tick is not None and candidate_tick != top_tick:

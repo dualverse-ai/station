@@ -16,13 +16,13 @@
 
 // static/js/dashboard.js
 document.addEventListener('DOMContentLoaded', () => {
+    const operationMode = document.body.dataset.operationMode;
+    const isMultistartPreview = operationMode === 'multistart_preview';
     // --- DOM Elements ---
     let stationTickDashboard = document.getElementById('station-tick-dashboard');
     let stationVersionDashboard = document.getElementById('station-version-dashboard');
-    let stationSyncModeDashboard = document.getElementById('station-sync-mode-dashboard');
     let stationStatusDashboard = null; // Will be created dynamically in header
     let cachedStationStatus = "Unknown"; // Track current station status string value
-    let cachedSyncMode = "parallel";
     let latestTickStartedTimestampMs = null;
     let latestTickTimingTooltip = '';
     const orchestratorStatusDisplay = document.getElementById('orchestrator-status-display');
@@ -103,8 +103,53 @@ document.addEventListener('DOMContentLoaded', () => {
     const archivePaperDetailTitle = document.getElementById('archive-paper-detail-title');
     const archivePaperDetailMeta = document.getElementById('archive-paper-detail-meta');
     const archivePaperMarkdownContainer = document.getElementById('archive-paper-markdown-container');
+    const archiveRowCountSelect = document.getElementById('archive-row-count-select');
+    const archivePreviousPageButton = document.getElementById('archive-previous-page-button');
+    const archiveNextPageButton = document.getElementById('archive-next-page-button');
+    const archivePageSummary = document.getElementById('archive-page-summary');
     const backToArchivePapersListButton = document.getElementById('back-to-archive-papers-list-button');
     const copyArchivePaperMarkdownButton = document.getElementById('copy-archive-paper-markdown-button');
+    const openWebArchiveSurveysModalButton = document.getElementById('open-web-archive-surveys-modal-button');
+    const webArchiveSurveysModal = document.getElementById('web-archive-surveys-modal');
+    const closeWebArchiveSurveysModalButton = document.getElementById('close-web-archive-surveys-modal-button');
+    const webArchiveSurveysListView = document.getElementById('web-archive-surveys-list-view');
+    const webArchiveSurveyRequestModal = document.getElementById('web-archive-survey-request-modal');
+    const openWebArchiveSurveyRequestButton = document.getElementById('open-web-archive-survey-request-button');
+    const closeWebArchiveSurveyRequestModalButton = document.getElementById('close-web-archive-survey-request-modal-button');
+    const cancelWebArchiveSurveyRequestButton = document.getElementById('cancel-web-archive-survey-request-button');
+    const webArchiveSurveyTemplateButtons = document.getElementById('web-archive-survey-template-buttons');
+    const webArchiveSurveyPrompt = document.getElementById('web-archive-survey-prompt');
+    const clearWebArchiveSurveyPromptButton = document.getElementById('clear-web-archive-survey-prompt-button');
+    const submitWebArchiveSurveyButton = document.getElementById('submit-web-archive-survey-button');
+    const refreshWebArchiveSurveysButton = document.getElementById('refresh-web-archive-surveys-button');
+    const webArchiveSurveysTableBody = document.getElementById('web-archive-surveys-table-body');
+    const webArchiveSurveyRowCountSelect = document.getElementById('web-archive-survey-row-count-select');
+    const webArchiveSurveyPreviousPageButton = document.getElementById('web-archive-survey-previous-page-button');
+    const webArchiveSurveyNextPageButton = document.getElementById('web-archive-survey-next-page-button');
+    const webArchiveSurveyPageSummary = document.getElementById('web-archive-survey-page-summary');
+    const webArchiveSurveyReportShell = document.getElementById('web-archive-survey-report-shell');
+    const webArchiveSurveyReportTitle = document.getElementById('web-archive-survey-report-title');
+    const webArchiveSurveyReportMeta = document.getElementById('web-archive-survey-report-meta');
+    const webArchiveSurveyReport = document.getElementById('web-archive-survey-report');
+    const removeWebArchiveSurveyButton = document.getElementById('remove-web-archive-survey-button');
+    const copyWebArchiveSurveyMarkdownButton = document.getElementById('copy-web-archive-survey-markdown-button');
+    const closeWebArchiveSurveyReportButton = document.getElementById('close-web-archive-survey-report-button');
+
+    const openQuestionRoomModalButton = document.getElementById('open-question-room-modal-button');
+    const questionRoomModal = document.getElementById('question-room-modal');
+    const closeQuestionRoomModalButton = document.getElementById('close-question-room-modal-button');
+    const questionRoomListView = document.getElementById('question-room-list-view');
+    const questionRoomDetailView = document.getElementById('question-room-detail-view');
+    const questionRoomTableBody = document.getElementById('question-room-table-body');
+    const questionPageSizeSelect = document.getElementById('question-page-size-select');
+    const questionPreviousPageButton = document.getElementById('question-previous-page-button');
+    const questionNextPageButton = document.getElementById('question-next-page-button');
+    const questionPageSummary = document.getElementById('question-page-summary');
+    const questionRoomDetailTitle = document.getElementById('question-room-detail-title');
+    const questionRoomDetailStatus = document.getElementById('question-room-detail-status');
+    const questionRoomDetailMeta = document.getElementById('question-room-detail-meta');
+    const questionRoomThread = document.getElementById('question-room-thread');
+    const backToQuestionRoomListButton = document.getElementById('back-to-question-room-list-button');
 
     const openSpeakCommonRoomModalButton = document.getElementById('open-speak-common-room-modal-button');
     const speakCommonRoomModal = document.getElementById('speak-common-room-modal');
@@ -118,7 +163,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const closeUpdateStationConfigModalButton = document.getElementById('close-update-station-config-modal-button');
     const updateStationConfigForm = document.getElementById('update-station-config-form');
     const updateStationId = document.getElementById('update-station-id');
-    const updateStationSyncMode = document.getElementById('update-station-sync-mode');
     const updateStationStatus = document.getElementById('update-station-status');
     const updateStationName = document.getElementById('update-station-name');
     const updateStationDescription = document.getElementById('update-station-description');
@@ -126,6 +170,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const currentStationStatus = document.getElementById('current-station-status');
     const currentStationName = document.getElementById('current-station-name');
     const currentStationDescription = document.getElementById('current-station-description');
+    const openResearchTaskSpecModalButton = document.getElementById('open-research-task-spec-modal-button');
+    const researchTaskSpecModal = document.getElementById('research-task-spec-modal');
+    const closeResearchTaskSpecModalButton = document.getElementById('close-research-task-spec-modal-button');
+    const taskSpecPreviewTab = document.getElementById('task-spec-preview-tab');
+    const taskSpecEditTab = document.getElementById('task-spec-edit-tab');
+    const taskSpecPreviewPane = document.getElementById('task-spec-preview-pane');
+    const taskSpecEditPane = document.getElementById('task-spec-edit-pane');
+    const taskSpecRawEditor = document.getElementById('task-spec-raw-editor');
+    const taskSpecPath = document.getElementById('task-spec-path');
+    const taskSpecRevision = document.getElementById('task-spec-revision');
+    const taskSpecDirtyIndicator = document.getElementById('task-spec-dirty-indicator');
+    const reloadTaskSpecButton = document.getElementById('reload-task-spec-button');
+    const saveTaskSpecButton = document.getElementById('save-task-spec-button');
     const openApiRuntimeConfigModalButton = document.getElementById('open-api-runtime-config-modal-button');
     const apiRuntimeConfigModal = document.getElementById('api-runtime-config-modal');
     const closeApiRuntimeConfigModalButton = document.getElementById('close-api-runtime-config-modal-button');
@@ -171,12 +228,46 @@ document.addEventListener('DOMContentLoaded', () => {
     let archivePapersCache = [];
     let archiveAllAbstractsMarkdown = '';
     let archiveSelectedPaper = null;
-    let archiveSortState = { key: 'numeric_id', direction: 'asc' };
+    let archiveRowCount = 100;
+    let archivePage = 1;
+    let archiveSortState = { key: 'accepted_tick', direction: 'desc' };
+    let webArchiveSurveyTemplates = [];
+    let webArchiveSurveys = [];
+    let webArchiveSurveysLoaded = false;
+    let webArchiveSelectedSurvey = null;
+    let webArchiveSurveyRowCount = 100;
+    let webArchiveSurveyPage = 1;
+    let questionListState = {
+        page: 1,
+        pageSize: 100,
+        total: 0,
+        totalPages: 1,
+        sortBy: 'authored_tick',
+        sortDirection: 'desc'
+    };
+    let questionListRequestSequence = 0;
+    let taskSpecState = {
+        rawMarkdown: '',
+        savedRawMarkdown: '',
+        revision: '',
+        relativePath: '',
+        dirty: false,
+        loaded: false,
+        mode: 'preview'
+    };
 
     let sseSource = null;
     let pollingFallbackInterval = null;
+    let sseReconnectTimer = null;
+    let pollingRequestInFlight = false;
+    let liveEventCursor = null;
+    let liveStreamEpoch = null;
+    let liveTransportMode = 'idle';
+    let liveUiRefreshTimer = null;
+    let liveAgentRefreshNeeded = false;
     let currentSelectedAgentForDialogueView = "all"; 
     let isLoadingHistoryForAgent = null;
+    let isRefreshingAgentSelector = false;
     let orchestratorState = { is_prepared: false, is_running: false, is_paused: false, agents_awaiting_human: [], turn_order: [] };
     let resolveRequestCache = new Map();
     let fullAgentListCache = [];
@@ -193,15 +284,26 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!['recent', 'earliest'].includes(historyWindowMode)) {
         historyWindowMode = 'recent';
     }
+    if (isMultistartPreview) historyWindowMode = 'recent';
     let logMessageSequence = 0;
     const expandedMessageIds = new Set();
     const collapsedSourceKeys = new Set();
+    const renderedAgentDialogueFingerprints = new Set();
+    const pendingLiveStationObservations = new Map();
+    const multistartPreviewDialogueSignatures = new Map();
+    const multistartPreviewDialogueMtimes = new Map();
+    let multistartPreviewDialogueRefreshInFlight = false;
     const backgroundHistoryLoads = new Map();
     const HISTORY_WINDOW_TICKS = 50;
+    const HISTORY_REQUEST_TIMEOUT_MS = 60000;
+    const HISTORY_RENDER_CHUNK_SIZE = 12;
+    const HISTORY_RENDER_CHUNK_TEXT_BUDGET = 24000;
     let activeFloatingTooltipTarget = null;
     let dashboardFloatingTooltip = null;
     let dashboardTooltipHideTimer = null;
-    let agentHistoryRenderFragment = null;
+    let historyLoadSequence = 0;
+    let activeHistoryAbortController = null;
+    let bufferedLiveEventsDuringHistory = [];
     let dashboardStatusTimer = null;
 
     // --- Helper Functions ---
@@ -429,10 +531,443 @@ document.addEventListener('DOMContentLoaded', () => {
         window.addEventListener('resize', positionMoreToolsPopover);
     }
 
-    function renderMarkdownForDashboard(markdownText) {
+    let dashboardMathRenderingEnabled = false;
+    const SYSTEM_MESSAGES_TRUNCATION_NOTICE = '[System Messages exceeded the length limit; please do not issue too many actions within one tick.]';
+
+    function configureDashboardMathRendering() {
+        const markedKatexFactory = window.markedKatex && (window.markedKatex.default || window.markedKatex);
+        if (!window.marked || typeof window.marked.use !== 'function' || typeof markedKatexFactory !== 'function' || !window.katex) {
+            console.warn('KaTeX Markdown extension unavailable. Formula rendering will use the plain Markdown fallback.');
+            return;
+        }
+        try {
+            window.marked.use(markedKatexFactory({
+                throwOnError: false,
+                nonStandard: true,
+                strict: 'ignore',
+                trust: false,
+                output: 'html'
+            }));
+            dashboardMathRenderingEnabled = true;
+        } catch (error) {
+            console.error('Failed to initialize KaTeX Markdown rendering:', error);
+        }
+    }
+
+    function normalizeLatexDelimitersForMarked(markdownText) {
+        let source = String(markdownText || '');
+        const protectedCode = [];
+        const protectCode = (segment) => {
+            const placeholder = `@@STATION_PROTECTED_CODE_${protectedCode.length}@@`;
+            protectedCode.push(segment);
+            return placeholder;
+        };
+
+        // Marked consumes the backslashes in \(...\) and \[...\] before the
+        // KaTeX extension sees them. Protect code first, then translate only
+        // prose math delimiters to the extension's native dollar delimiters.
+        source = source.replace(/(^|\n)([ \t]*)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n\2\3[ \t]*(?=\n|$)/g, protectCode);
+        source = source.replace(/(`+)([^`\n]*?)\1/g, protectCode);
+        source = source.replace(
+            /\\\[([\s\S]*?)\\\]/g,
+            (_match, formula) => `$$${String(formula).replace(/\r?\n[ \t]*/g, ' ').trim()}$$`
+        );
+        source = source.replace(/\\\(([\s\S]*?)\\\)/g, (_match, formula) => `$${formula}$`);
+        source = source.replace(/@@STATION_PROTECTED_CODE_(\d+)@@/g, (_match, index) => protectedCode[Number(index)] || '');
+        return source;
+    }
+
+    function repairStationCodeFences(markdownText) {
+        const source = String(markdownText || '');
+        const readBlockPattern = /(^### Message \d+[^\n]*\n+\*\*(?:Storage|Code) Read:\*\*[^\n]*\n+)(`{3,})([^\n]*)\n([\s\S]*?)\n`{3,}[ \t]*(?=\n+(?:### Message \d+[^\n]*\n|---\n+## Actions Detected))/gm;
+        return source.replace(readBlockPattern, (_match, prefix, _openingFence, info, content) => {
+            const nestedFences = content.match(/`{3,}/g) || [];
+            const fenceWidth = Math.max(3, ...nestedFences.map(fence => fence.length)) + 1;
+            const safeFence = '`'.repeat(fenceWidth);
+            const extension = prefix.match(/`[^`]+\.([A-Za-z0-9]+)`/)?.[1]?.toLowerCase();
+            const languages = {
+                json: 'json',
+                yaml: 'yaml',
+                yml: 'yaml',
+                py: 'python',
+                md: 'markdown',
+                c: 'c',
+                cc: 'cpp',
+                cpp: 'cpp',
+                h: 'c',
+                hpp: 'cpp',
+                js: 'javascript',
+                ts: 'typescript',
+                sh: 'bash',
+            };
+            const language = info.trim() || languages[extension] || '';
+            return `${prefix}${safeFence}${language}\n${content}\n${safeFence}`;
+        });
+    }
+
+    function normalizeStorageReadFences(markdownText) {
+        const source = String(markdownText || '');
+        const storageHeaderPattern = /\*\*Storage Read:\*\*[^\n]*\n[ \t]*\n[ \t]*(`{3,})[^\n]*\n/g;
+        const boundaryPatterns = [
+            /\n### Message \d+[ \t]*(?:\n|$)/g,
+            /\n---\n\n## Actions Detected(?: \(Last Turn\))?/g,
+            /\n---\n\n## Room Output History/g,
+            /\n---\n\n## Current State/g,
+            /\n\[Use `\/execute_action\{read /g,
+        ];
+        let result = '';
+        let cursor = 0;
+        let headerMatch;
+
+        while ((headerMatch = storageHeaderPattern.exec(source)) !== null) {
+            const contentStart = storageHeaderPattern.lastIndex;
+            let sectionEnd = source.length;
+            boundaryPatterns.forEach(pattern => {
+                pattern.lastIndex = contentStart;
+                const boundaryMatch = pattern.exec(source);
+                if (boundaryMatch && boundaryMatch.index < sectionEnd) sectionEnd = boundaryMatch.index;
+            });
+
+            const noticeIndex = source.indexOf(SYSTEM_MESSAGES_TRUNCATION_NOTICE, contentStart);
+            let truncationBoundary = -1;
+            if (noticeIndex >= 0) {
+                truncationBoundary = noticeIndex;
+                while (truncationBoundary > contentStart && /[\r\n]/.test(source[truncationBoundary - 1])) {
+                    truncationBoundary -= 1;
+                }
+                if (truncationBoundary < sectionEnd) sectionEnd = truncationBoundary;
+            }
+
+            const section = source.slice(contentStart, sectionEnd);
+            const closingFencePattern = /^(`{3,})[ \t]*$/gm;
+            const closingFences = Array.from(section.matchAll(closingFencePattern));
+            const truncatedAtNotice = truncationBoundary >= 0 && sectionEnd === truncationBoundary;
+            if (!closingFences.length && !truncatedAtNotice) continue;
+
+            const closingFence = closingFences.length ? closingFences[closingFences.length - 1] : null;
+            const closingStart = closingFence ? contentStart + closingFence.index : sectionEnd;
+            const closingEnd = closingFence ? closingStart + closingFence[0].length : sectionEnd;
+            const content = source.slice(contentStart, closingStart);
+            const backtickRuns = content.match(/`+/g) || [];
+            const longestRun = backtickRuns.reduce((longest, run) => Math.max(longest, run.length), 0);
+            const safeFence = '`'.repeat(Math.max(3, longestRun + 1));
+            const openingStart = headerMatch.index + headerMatch[0].lastIndexOf(headerMatch[1]);
+            const closingPrefix = content.endsWith('\n') ? '' : '\n';
+
+            result += source.slice(cursor, openingStart);
+            result += `${safeFence}\n${content}${closingPrefix}${safeFence}`;
+            cursor = closingEnd;
+            storageHeaderPattern.lastIndex = closingEnd;
+        }
+
+        return cursor ? result + source.slice(cursor) : source;
+    }
+
+    function enhanceStorageReadBlocks(markdownSource, embeddedHtml) {
+        const source = String(markdownSource || '');
+        const storageReadPattern = /\*\*Storage Read:\*\*[ \t]*([^\n]*)\r?\n[ \t]*\r?\n[ \t]*(`{3,})[^\n]*\r?\n([\s\S]*?)\r?\n[ \t]*\2[ \t]*(?=\n|$)/g;
+        return source.replace(storageReadPattern, (_match, rawPath, _fence, content) => {
+            const path = String(rawPath || '').trim().replace(/^`|`$/g, '');
+            const panel = `
+                <details class="station-storage-read">
+                    <summary class="station-storage-read-summary">
+                        <span class="station-storage-read-label">Storage Read</span>
+                        <code>${escapeHtml(path || 'file')}</code>
+                        <span class="station-storage-read-toggle" aria-hidden="true"></span>
+                    </summary>
+                    <pre class="station-storage-read-content"><code>${escapeHtml(content)}</code></pre>
+                </details>
+            `.trim();
+            return protectDashboardEmbeddedHtml(panel, embeddedHtml);
+        });
+    }
+
+    function normalizeStationActionCommands(markdownText) {
+        let source = String(markdownText || '');
+        const protectedCode = [];
+        const protectCode = (segment) => {
+            const placeholder = `@@STATION_ACTION_CODE_${protectedCode.length}@@`;
+            protectedCode.push(segment);
+            return placeholder;
+        };
+
+        source = source.replace(/(^|\n)([ \t]*)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n\2\3[ \t]*(?=\n|$)/g, protectCode);
+        source = source.replace(/(`+)([^`\n]*?)\1/g, protectCode);
+        source = source.replace(
+            /\/execute_action\{[^}\n]+\}/g,
+            command => `\`${command}\``
+        );
+        source = source.replace(/@@STATION_ACTION_CODE_(\d+)@@/g, (_match, index) => protectedCode[Number(index)] || '');
+        return source;
+    }
+
+    function styleStationActionCommandHtml(renderedHtml) {
+        return String(renderedHtml || '').replace(
+            /<code>(\/execute_action\{[\s\S]*?\})<\/code>/g,
+            (_match, commandHtml) => {
+                const verbMatch = commandHtml.match(/^\/execute_action\{\s*([a-zA-Z_]+)/);
+                const verb = verbMatch ? verbMatch[1].toLowerCase() : 'action';
+                const actionBodyMatch = commandHtml.match(/^\/execute_action\{([\s\S]*)\}$/);
+                const actionBodyHtml = actionBodyMatch ? actionBodyMatch[1].trim() : commandHtml;
+                const navigationActions = new Set(['goto']);
+                const readActions = new Set(['read', 'read_task', 'read_code', 'review', 'preview', 'rank', 'filter', 'unfilter', 'storage', 'page', 'page_size', 'help']);
+                const writeActions = new Set(['submit', 'create', 'reply', 'update', 'forward', 'meta', 'speak', 'survey', 'reflect', 'request_human']);
+                let category = 'control';
+                if (navigationActions.has(verb)) category = 'navigation';
+                else if (readActions.has(verb)) category = 'read';
+                else if (writeActions.has(verb)) category = 'write';
+                return `<code class="station-action-command station-action-${category}" data-station-action-verb="${verb}">${actionBodyHtml}</code>`;
+            }
+        );
+    }
+
+    configureDashboardMathRendering();
+
+    const STATION_YAML_CARD_MAX_CHARS = 120000;
+    const STATION_YAML_ACTION_LABELS = {
+        submit: 'Research Submission',
+        reply: 'Capsule Reply',
+        create: 'Capsule Creation',
+        meta: 'Agent Meta Prompt',
+        speak: 'Common Room Post',
+        reflect: 'Reflection',
+        survey: 'Archive Survey Request',
+        request_human: 'Human Assistance Request',
+    };
+    const STATION_YAML_MARKDOWN_FIELDS = [
+        ['abstract', 'Abstract'],
+        ['content', 'Content'],
+        ['message', 'Message'],
+        ['description', 'Description'],
+        ['prompt', 'Prompt'],
+    ];
+
+    function getStationYamlActionHint(markdownSource, fenceOffset) {
+        const context = markdownSource.slice(Math.max(0, fenceOffset - 320), fenceOffset);
+        const match = context.match(/(?:^|\n)\s*`?\/execute_action\{([^}\n]+)\}`?\s*$/i);
+        if (!match) return '';
+        return String(match[1] || '').trim().split(/\s+/)[0].toLowerCase();
+    }
+
+    function parseStationYamlCard(rawYaml, actionHint) {
+        if (!window.jsyaml || typeof window.jsyaml.load !== 'function') return null;
+        if (!rawYaml || rawYaml.length > STATION_YAML_CARD_MAX_CHARS) return null;
+        try {
+            const parsed = window.jsyaml.load(rawYaml, {
+                schema: window.jsyaml.FAILSAFE_SCHEMA,
+                json: false,
+            });
+            if (!parsed || Object.prototype.toString.call(parsed) !== '[object Object]') return null;
+
+            const keys = Object.keys(parsed);
+            const hasRecognizedText = ['title', 'content', 'abstract', 'instruction', 'message', 'description', 'prompt']
+                .some(key => typeof parsed[key] === 'string');
+            const hasKnownAction = Boolean(STATION_YAML_ACTION_LABELS[actionHint]);
+            const resemblesResearchSubmission = ['title', 'abstract', 'instruction'].every(key => typeof parsed[key] === 'string');
+            const resemblesCapsule = typeof parsed.title === 'string' && typeof parsed.content === 'string';
+            if (!keys.length || !hasRecognizedText || (!hasKnownAction && !resemblesResearchSubmission && !resemblesCapsule)) {
+                return null;
+            }
+            return parsed;
+        } catch (_error) {
+            return null;
+        }
+    }
+
+    function renderDashboardMarkdownInline(value) {
+        const textValue = String(value || '');
+        if (!window.marked || typeof window.marked.parseInline !== 'function') return escapeHtml(textValue);
+        try {
+            const source = dashboardMathRenderingEnabled
+                ? normalizeLatexDelimitersForMarked(textValue)
+                : textValue;
+            return window.marked.parseInline(source, { gfm: true, breaks: false });
+        } catch (_error) {
+            return escapeHtml(textValue);
+        }
+    }
+
+    function renderStationYamlCard(parsed, rawYaml, actionHint) {
+        const actionLabel = STATION_YAML_ACTION_LABELS[actionHint]
+            || (typeof parsed.instruction === 'string' ? 'Research Submission' : 'Structured Station Action');
+        const title = typeof parsed.title === 'string' && parsed.title.trim()
+            ? parsed.title.trim()
+            : actionLabel;
+        const eyebrow = title === actionLabel ? 'Station Action' : actionLabel;
+        const tags = Array.isArray(parsed.tags)
+            ? parsed.tags.map(tag => String(tag).trim()).filter(Boolean)
+            : String(parsed.tags || '').split(',').map(tag => tag.trim()).filter(Boolean);
+
+        const tagHtml = tags.length
+            ? `<div class="station-yaml-tags">${tags.map(tag => `<span>${escapeHtml(tag)}</span>`).join('')}</div>`
+            : '';
+        const fieldsHtml = STATION_YAML_MARKDOWN_FIELDS.map(([key, label]) => {
+            if (typeof parsed[key] !== 'string' || !parsed[key].trim()) return '';
+            return `
+                <section class="station-yaml-field">
+                    <div class="station-yaml-field-label">${label}</div>
+                    <div class="station-yaml-field-markdown markdown-content-host">${renderMarkdownForDashboard(parsed[key], { enhanceYamlCards: false })}</div>
+                </section>`;
+        }).join('');
+        const instructionHtml = typeof parsed.instruction === 'string' && parsed.instruction.trim()
+            ? `
+                <details class="station-yaml-instructions" open>
+                    <summary>Full instructions</summary>
+                    <div class="station-yaml-field-markdown markdown-content-host">${renderMarkdownForDashboard(parsed.instruction, { enhanceYamlCards: false })}</div>
+                </details>`
+            : '';
+
+        return `
+            <article class="station-yaml-card" data-station-action="${escapeHtml(actionHint || 'structured')}">
+                <header class="station-yaml-card-header">
+                    <div class="station-yaml-card-heading">
+                        <div class="station-yaml-card-eyebrow">${escapeHtml(eyebrow)}</div>
+                        <div class="station-yaml-card-title">${renderDashboardMarkdownInline(title)}</div>
+                    </div>
+                    <button type="button" class="station-yaml-copy-button" data-copy-kind="YAML">Copy YAML</button>
+                </header>
+                ${tagHtml}
+                <div class="station-yaml-card-body">${fieldsHtml}${instructionHtml}</div>
+                <textarea class="station-yaml-copy-source" hidden readonly aria-hidden="true">${escapeHtml(rawYaml)}</textarea>
+            </article>`.trim();
+    }
+
+    function renderAgentMetaPromptCard(rawPrompt) {
+        return `
+            <article class="station-yaml-card station-meta-prompt-card" data-station-action="agent-meta-prompt">
+                <header class="station-yaml-card-header">
+                    <div class="station-yaml-card-heading">
+                        <div class="station-yaml-card-eyebrow">Agent State</div>
+                        <div class="station-yaml-card-title">Agent Meta Prompt</div>
+                    </div>
+                    <button type="button" class="station-yaml-copy-button" data-copy-kind="Meta prompt">Copy Prompt</button>
+                </header>
+                <div class="station-yaml-card-body">
+                    <div class="station-yaml-field-markdown markdown-content-host">${renderMarkdownForDashboard(rawPrompt, { enhanceYamlCards: false })}</div>
+                </div>
+                <textarea class="station-yaml-copy-source" hidden readonly aria-hidden="true">${escapeHtml(rawPrompt)}</textarea>
+            </article>`.trim();
+    }
+
+    function protectDashboardEmbeddedHtml(html, embeddedHtml) {
+        const index = embeddedHtml.length;
+        embeddedHtml.push(html);
+        return `\n\nSTATIONEMBEDDEDHTML${index}TOKEN\n\n`;
+    }
+
+    function restoreDashboardEmbeddedHtml(renderedHtml, embeddedHtml) {
+        let restored = String(renderedHtml || '');
+        embeddedHtml.forEach((html, index) => {
+            const token = `STATIONEMBEDDEDHTML${index}TOKEN`;
+            restored = restored.replace(new RegExp(`<p>\\s*${token}\\s*</p>`, 'g'), html);
+            restored = restored.split(token).join(html);
+        });
+        return restored;
+    }
+
+    function enhanceAgentMetaPromptFields(markdownSource, embeddedHtml) {
+        const source = String(markdownSource || '');
+        const metaPromptPattern = /(^|\n)[ \t]*[-*+][ \t]+Agent Meta Prompt:[ \t]*\r?\n[ \t]*```(?:markdown|md)?[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```(?=\n|$)/gi;
+        return source.replace(metaPromptPattern, (fullMatch, leadingNewline, rawPrompt) => {
+            if (!rawPrompt.trim() || rawPrompt.length > STATION_YAML_CARD_MAX_CHARS) return fullMatch;
+            return `${leadingNewline}${protectDashboardEmbeddedHtml(renderAgentMetaPromptCard(rawPrompt), embeddedHtml)}\n`;
+        });
+    }
+
+    function enhanceStationYamlBlocks(markdownSource, embeddedHtml) {
+        const source = String(markdownSource || '');
+        const yamlFencePattern = /(^|\n)[ \t]*```ya?ml[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```(?=\n|$)/gi;
+        return source.replace(yamlFencePattern, (fullMatch, leadingNewline, rawYaml, fenceOffset) => {
+            const actionHint = getStationYamlActionHint(source, fenceOffset);
+            const parsed = parseStationYamlCard(rawYaml, actionHint);
+            if (!parsed) return fullMatch;
+            return `${leadingNewline}${protectDashboardEmbeddedHtml(renderStationYamlCard(parsed, rawYaml, actionHint), embeddedHtml)}\n`;
+        });
+    }
+
+    function enhanceStationBareYamlActions(markdownSource, embeddedHtml) {
+        let source = String(markdownSource || '');
+        const protectedCode = [];
+        source = source.replace(
+            /(^|\n)([ \t]*)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n\2\3[ \t]*(?=\n|$)/g,
+            segment => {
+                const placeholder = `STATIONBAREYAMLCODE${protectedCode.length}TOKEN`;
+                protectedCode.push(segment);
+                return placeholder;
+            }
+        );
+
+        const actionLinePattern = /(^|\n)[ \t]*`?\/execute_action\{([^}\n]+)\}`?[ \t]*\r?\n/g;
+        let result = '';
+        let cursor = 0;
+        let actionMatch;
+
+        while ((actionMatch = actionLinePattern.exec(source)) !== null) {
+            if (actionMatch.index < cursor) continue;
+            const actionHint = String(actionMatch[2] || '').trim().split(/\s+/)[0].toLowerCase();
+            if (!STATION_YAML_ACTION_LABELS[actionHint]) continue;
+
+            let payloadStart = actionLinePattern.lastIndex;
+            const blankPrefix = source.slice(payloadStart).match(/^(?:[ \t]*\r?\n)*/);
+            payloadStart += blankPrefix ? blankPrefix[0].length : 0;
+            const remaining = source.slice(payloadStart);
+            if (!/^[A-Za-z_][A-Za-z0-9_-]*[ \t]*:/.test(remaining)) continue;
+
+            const lines = remaining.match(/.*(?:\r?\n|$)/g) || [];
+            let consumed = 0;
+            let payloadEnd = -1;
+            for (let index = 0; index < lines.length; index += 1) {
+                consumed += lines[index].length;
+                const nextLine = index + 1 < lines.length ? lines[index + 1] : '';
+                const nextText = nextLine.replace(/\r?\n$/, '');
+                const nextContinuesYaml = !nextLine
+                    || !nextText.trim()
+                    || /^[ \t]/.test(nextText)
+                    || /^[A-Za-z_][A-Za-z0-9_-]*[ \t]*:/.test(nextText)
+                    || /^-[ \t]+/.test(nextText)
+                    || /^#/.test(nextText);
+                if (nextContinuesYaml && nextLine) continue;
+
+                const rawYaml = remaining.slice(0, consumed).trimEnd();
+                const parsed = parseStationYamlCard(rawYaml, actionHint);
+                if (parsed) payloadEnd = payloadStart + rawYaml.length;
+                break;
+            }
+
+            if (payloadEnd < payloadStart) continue;
+            const rawYaml = source.slice(payloadStart, payloadEnd);
+            const parsed = parseStationYamlCard(rawYaml, actionHint);
+            if (!parsed) continue;
+            result += source.slice(cursor, payloadStart);
+            result += `${protectDashboardEmbeddedHtml(renderStationYamlCard(parsed, rawYaml, actionHint), embeddedHtml)}\n`;
+            cursor = payloadEnd;
+            actionLinePattern.lastIndex = payloadEnd;
+        }
+
+        if (cursor) source = result + source.slice(cursor);
+        source = source.replace(/STATIONBAREYAMLCODE(\d+)TOKEN/g, (_match, index) => protectedCode[Number(index)] || '');
+        return source;
+    }
+
+    function renderMarkdownForDashboard(markdownText, options = {}) {
         if (window.marked && typeof window.marked.parse === 'function') {
-            try { 
-                return marked.parse(String(markdownText || ""), { gfm: true, breaks: true, pedantic: false, smartypants: false }); 
+            try {
+                const embeddedHtml = [];
+                const repairedReadSource = repairStationCodeFences(markdownText);
+                const normalizedStorageSource = normalizeStorageReadFences(repairedReadSource);
+                const normalizedActionSource = normalizeStationActionCommands(normalizedStorageSource);
+                let markdownSource = dashboardMathRenderingEnabled
+                    ? normalizeLatexDelimitersForMarked(normalizedActionSource)
+                    : normalizedActionSource;
+                if (options.enhanceYamlCards !== false) {
+                    markdownSource = enhanceStorageReadBlocks(markdownSource, embeddedHtml);
+                    markdownSource = enhanceAgentMetaPromptFields(markdownSource, embeddedHtml);
+                    markdownSource = enhanceStationYamlBlocks(markdownSource, embeddedHtml);
+                    markdownSource = enhanceStationBareYamlActions(markdownSource, embeddedHtml);
+                }
+                let renderedHtml = marked.parse(markdownSource, { gfm: true, breaks: true, pedantic: false, smartypants: false });
+                renderedHtml = restoreDashboardEmbeddedHtml(renderedHtml, embeddedHtml);
+                return styleStationActionCommandHtml(renderedHtml);
             } 
             catch (e) { 
                 console.error("Markdown parsing error:", e, "Input:", markdownText); 
@@ -448,6 +983,66 @@ document.addEventListener('DOMContentLoaded', () => {
     function escapeHtml(unsafe) {
         if (unsafe === null || typeof unsafe === 'undefined') return '';
         return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+    }
+
+    function formatEventTime(timestamp) {
+        const numericTimestamp = Number(timestamp);
+        if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) return '';
+        const eventDate = new Date(numericTimestamp * 1000);
+        if (Number.isNaN(eventDate.getTime())) return '';
+        return eventDate.toLocaleTimeString();
+    }
+
+    function normalizeThinkingWhitespace(thinkingText) {
+        const text = String(thinkingText || '').replace(/\r\n?/g, '\n').trim();
+        if (!text) return '';
+
+        const lines = text.split('\n');
+        const nonEmptyLines = lines.filter(line => line.trim());
+        const newlineDensity = (lines.length - 1) / Math.max(1, text.length);
+        const averageLineLength = nonEmptyLines.length
+            ? nonEmptyLines.reduce((total, line) => total + line.trim().length, 0) / nonEmptyLines.length
+            : text.length;
+        const shortLineRatio = nonEmptyLines.length
+            ? nonEmptyLines.filter(line => line.trim().length <= 4).length / nonEmptyLines.length
+            : 0;
+        const looksTokenFragmented = lines.length >= 9
+            && newlineDensity >= 0.055
+            && (averageLineLength <= 24 || shortLineRatio >= 0.3);
+
+        if (!looksTokenFragmented) return text;
+
+        return text
+            .split(/\n{2,}/)
+            .map(paragraph => {
+                const fragments = paragraph.split('\n');
+                let joined = fragments[0] ? fragments[0].trim() : '';
+                for (let index = 1; index < fragments.length; index += 1) {
+                    const previousFragment = fragments[index - 1];
+                    const currentFragment = fragments[index];
+                    const currentText = currentFragment.trim();
+                    if (!currentText) continue;
+                    const hasWordBoundary = /[ \t]$/.test(previousFragment) || /^[ \t]/.test(currentFragment);
+                    joined += `${hasWordBoundary ? ' ' : ''}${currentText}`;
+                }
+                return joined.replace(/[ \t]{2,}/g, ' ').trim();
+            })
+            .filter(Boolean)
+            .join('\n\n');
+    }
+
+    function renderCollapsibleThinking(thinkingText, label = 'Agent Thinking') {
+        const content = normalizeThinkingWhitespace(thinkingText);
+        if (!content) return '';
+        return `
+            <details class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 mb-2 text-slate-400 text-xs rounded">
+                <summary class="thinking-summary">
+                    <span class="thinking-summary-label">${escapeHtml(label)}</span>
+                    <span class="thinking-toggle-text" aria-hidden="true"></span>
+                </summary>
+                <div class="thinking-content whitespace-pre-wrap">${escapeHtml(content)}</div>
+            </details>
+        `;
     }
 
     function formatAgentListForStatus(agentNames, maxVisible = 5) {
@@ -725,13 +1320,8 @@ document.addEventListener('DOMContentLoaded', () => {
             const tickText = typeof m.tick !== 'undefined' && m.tick !== null ? ` (Tick ${escapeHtml(String(m.tick))})` : '';
             const headerHtml = `<strong>[${role}${tickText}]</strong>`;
             const content = String(m.content || "");
-            const thinkingContent = String(m.thinking_content || "");
-            const thinkingHtml = thinkingContent.trim()
-                ? `<div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
-                    <strong class="text-sky-500 block mb-1">Agent Thinking:</strong>
-                    <div class="whitespace-pre-wrap">${escapeHtml(thinkingContent)}</div>
-                </div>`
-                : '';
+            const thinkingContent = normalizeThinkingWhitespace(m.thinking_content);
+            const thinkingHtml = renderCollapsibleThinking(thinkingContent);
             const rendered = renderMarkdownForDashboard(content);
             const bubbleContentHtml = `${headerHtml}${thinkingHtml}<div class="mt-1 text-sm markdown-content-host">${rendered}</div>`;
             const rawTextForCopy = thinkingContent.trim()
@@ -753,7 +1343,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!msgs || msgs.length === 0) return '';
         return msgs.map(m => {
             const role = m.role === 'assistant' ? 'Agent' : 'You';
-            const thinkingContent = String(m.thinking_content || '').trim();
+            const thinkingContent = normalizeThinkingWhitespace(m.thinking_content);
             const thinkingText = includeThinking && thinkingContent ? `Thinking:\n${thinkingContent}\n\n` : '';
             return `${role}:\n${thinkingText}${String(m.content || '').trim()}\n`;
         }).join('\n');
@@ -831,18 +1421,32 @@ document.addEventListener('DOMContentLoaded', () => {
         archivePapersTableBody.innerHTML = `<tr><td colspan="6" class="archive-empty-state">${escapeHtml(message)}</td></tr>`;
     }
 
+    function updateArchivePagination() {
+        const total = archivePapersCache.length;
+        const totalPages = Math.max(1, Math.ceil(total / archiveRowCount));
+        archivePage = Math.min(Math.max(1, archivePage), totalPages);
+        if (archivePageSummary) {
+            archivePageSummary.textContent = `Page ${archivePage} of ${totalPages} · ${total} ${total === 1 ? 'paper' : 'papers'}`;
+        }
+        if (archivePreviousPageButton) archivePreviousPageButton.disabled = archivePage <= 1;
+        if (archiveNextPageButton) archiveNextPageButton.disabled = archivePage >= totalPages;
+    }
+
     function renderArchivePapersTable() {
         if (!archivePapersTableBody) return;
         if (!Array.isArray(archivePapersCache) || archivePapersCache.length === 0) {
             setArchiveListLoadingState('No archive papers available.');
             updateArchiveSortButtons();
+            updateArchivePagination();
             return;
         }
 
         sortArchivePapers();
         updateArchiveSortButtons();
+        updateArchivePagination();
 
-        const rows = archivePapersCache.map(paper => {
+        const pageStart = (archivePage - 1) * archiveRowCount;
+        const rows = archivePapersCache.slice(pageStart, pageStart + archiveRowCount).map(paper => {
             const title = escapeHtml(paper.title || 'Untitled');
             const author = escapeHtml(paper.author || 'Unknown');
             const acceptedTick = escapeHtml(String(paper.accepted_tick ?? 'N/A'));
@@ -886,6 +1490,223 @@ document.addEventListener('DOMContentLoaded', () => {
         if (archivePaperDetailView) archivePaperDetailView.classList.remove('hidden');
     }
 
+    function formatWebSurveyTimestamp(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric <= 0) return '—';
+        return new Date(numeric * 1000).toLocaleString();
+    }
+
+    function setWebArchiveSurveyTableState(message) {
+        if (!webArchiveSurveysTableBody) return;
+        webArchiveSurveysTableBody.innerHTML = `<tr><td colspan="5" class="archive-empty-state">${escapeHtml(message)}</td></tr>`;
+    }
+
+    function sortWebArchiveSurveys() {
+        webArchiveSurveys.sort((a, b) => {
+            const tickDifference = (Number(b.source_tick) || 0) - (Number(a.source_tick) || 0);
+            if (tickDifference !== 0) return tickDifference;
+            const timeDifference = (Number(b.submitted_timestamp) || 0) - (Number(a.submitted_timestamp) || 0);
+            if (timeDifference !== 0) return timeDifference;
+            return (Number(b.id) || 0) - (Number(a.id) || 0);
+        });
+    }
+
+    function updateWebArchiveSurveyPagination() {
+        const total = webArchiveSurveys.length;
+        const totalPages = Math.max(1, Math.ceil(total / webArchiveSurveyRowCount));
+        webArchiveSurveyPage = Math.min(Math.max(1, webArchiveSurveyPage), totalPages);
+        if (webArchiveSurveyPageSummary) {
+            webArchiveSurveyPageSummary.textContent = `Page ${webArchiveSurveyPage} of ${totalPages} · ${total} ${total === 1 ? 'report' : 'reports'}`;
+        }
+        if (webArchiveSurveyPreviousPageButton) webArchiveSurveyPreviousPageButton.disabled = webArchiveSurveyPage <= 1;
+        if (webArchiveSurveyNextPageButton) webArchiveSurveyNextPageButton.disabled = webArchiveSurveyPage >= totalPages;
+    }
+
+    function renderWebArchiveSurveyTemplates() {
+        if (!webArchiveSurveyTemplateButtons) return;
+        webArchiveSurveyTemplateButtons.innerHTML = webArchiveSurveyTemplates.map(template => `
+            <button type="button" class="archive-survey-template-button" data-template-id="${escapeHtml(template.id)}">
+                ${escapeHtml(template.label || template.id)}
+            </button>
+        `).join('');
+        webArchiveSurveyTemplateButtons.querySelectorAll('.archive-survey-template-button').forEach(button => {
+            button.addEventListener('click', () => {
+                const template = webArchiveSurveyTemplates.find(item => item.id === button.getAttribute('data-template-id'));
+                if (!template || !webArchiveSurveyPrompt) return;
+                webArchiveSurveyPrompt.value = String(template.prompt || '');
+                webArchiveSurveyPrompt.focus();
+            });
+        });
+    }
+
+    function renderWebArchiveSurveysTable() {
+        if (!webArchiveSurveysTableBody) return;
+        if (!webArchiveSurveys.length) {
+            setWebArchiveSurveyTableState('No survey reports yet. Submit a request to create the first one.');
+            updateWebArchiveSurveyPagination();
+            return;
+        }
+        sortWebArchiveSurveys();
+        updateWebArchiveSurveyPagination();
+        const pageStart = (webArchiveSurveyPage - 1) * webArchiveSurveyRowCount;
+        webArchiveSurveysTableBody.innerHTML = webArchiveSurveys.slice(pageStart, pageStart + webArchiveSurveyRowCount).map(survey => {
+            const status = String(survey.status || 'queued').toLowerCase();
+            const isClickable = status === 'completed' && Boolean(survey.has_report);
+            return `
+                <tr class="archive-papers-row archive-survey-row ${isClickable ? 'is-clickable' : 'is-disabled'}" data-web-survey-id="${escapeHtml(String(survey.id))}">
+                    <td>W${escapeHtml(String(survey.id))}</td>
+                    <td><span class="archive-survey-status status-${escapeHtml(status)}">${escapeHtml(status)}</span></td>
+                    <td class="archive-paper-title-cell">
+                        <strong>${escapeHtml(survey.prompt_preview || 'Survey request')}</strong>
+                        ${isClickable ? '' : `<span>${survey.error ? escapeHtml(String(survey.error)) : (status === 'running' ? 'Report is running. Select Refresh to check again.' : 'Waiting to start. Select Refresh to check again.')}</span>`}
+                    </td>
+                    <td>${survey.source_tick === null || typeof survey.source_tick === 'undefined' ? '—' : `Tick ${escapeHtml(String(survey.source_tick))}`}</td>
+                    <td>${escapeHtml(formatWebSurveyTimestamp(survey.submitted_timestamp))}</td>
+                </tr>
+            `;
+        }).join('');
+        webArchiveSurveysTableBody.querySelectorAll('.archive-survey-row.is-clickable').forEach(row => {
+            row.addEventListener('click', () => {
+                const surveyId = Number(row.getAttribute('data-web-survey-id'));
+                if (Number.isFinite(surveyId)) void openWebArchiveSurvey(surveyId);
+            });
+        });
+    }
+
+    async function loadWebArchiveSurveyTemplates() {
+        const result = await fetchApi('/api/web/archive-surveys/templates', 'GET');
+        webArchiveSurveyTemplates = Array.isArray(result.templates) ? result.templates : [];
+        renderWebArchiveSurveyTemplates();
+    }
+
+    async function loadWebArchiveSurveys({ quiet = false } = {}) {
+        if (!quiet) setWebArchiveSurveyTableState('Loading survey history...');
+        const result = await fetchApi('/api/web/archive-surveys', 'GET');
+        webArchiveSurveys = Array.isArray(result.surveys) ? result.surveys : [];
+        webArchiveSurveysLoaded = true;
+        renderWebArchiveSurveysTable();
+        const selectedId = webArchiveSelectedSurvey ? Number(webArchiveSelectedSurvey.id) : null;
+        if (selectedId && webArchiveSurveys.some(item => Number(item.id) === selectedId)) {
+            const summary = webArchiveSurveys.find(item => Number(item.id) === selectedId);
+            if (summary && ['queued', 'running'].includes(String(summary.status || '').toLowerCase())) {
+                await openWebArchiveSurvey(selectedId, { quiet: true });
+            }
+        }
+    }
+
+    function showWebArchiveSurveysListView() {
+        if (webArchiveSurveysListView) webArchiveSurveysListView.classList.remove('hidden');
+        webArchiveSelectedSurvey = null;
+        if (webArchiveSurveyReportShell) webArchiveSurveyReportShell.classList.add('hidden');
+    }
+
+    async function openWebArchiveSurveysModal() {
+        if (!webArchiveSurveysModal) return;
+        showWebArchiveSurveysListView();
+        webArchiveSurveysModal.style.display = 'block';
+        try {
+            if (!webArchiveSurveysLoaded) await loadWebArchiveSurveys();
+            else renderWebArchiveSurveysTable();
+        } catch (_error) {
+            setWebArchiveSurveyTableState('Failed to load survey history.');
+        }
+    }
+
+    async function openWebArchiveSurveyRequestModal() {
+        if (!webArchiveSurveyRequestModal) return;
+        webArchiveSurveyRequestModal.style.display = 'block';
+        try {
+            if (!webArchiveSurveyTemplates.length) await loadWebArchiveSurveyTemplates();
+        } catch (_error) {
+            showDashboardStatus('Failed to load survey templates. You can still write a custom request.', 'error');
+        }
+        if (webArchiveSurveyPrompt) webArchiveSurveyPrompt.focus();
+    }
+
+    function closeWebArchiveSurveyRequestModal(preserveDraft = true) {
+        if (!webArchiveSurveyRequestModal) return;
+        if (preserveDraft && webArchiveSurveyPrompt && webArchiveSurveyPrompt.value.trim()) {
+            webArchiveSurveyRequestModal.dataset.reopenWithDraft = 'true';
+        } else {
+            delete webArchiveSurveyRequestModal.dataset.reopenWithDraft;
+        }
+        webArchiveSurveyRequestModal.style.display = 'none';
+    }
+
+    async function submitWebArchiveSurvey() {
+        if (!webArchiveSurveyPrompt || !submitWebArchiveSurveyButton) return;
+        const prompt = webArchiveSurveyPrompt.value.trim();
+        if (!prompt) {
+            showDashboardStatus('Survey request cannot be empty.', 'error');
+            webArchiveSurveyPrompt.focus();
+            return;
+        }
+        submitWebArchiveSurveyButton.disabled = true;
+        showDashboardStatus('Submitting survey request...', 'info', 0);
+        try {
+            const result = await fetchApi('/api/web/archive-surveys', 'POST', {
+                prompt
+            });
+            if (result.survey) {
+                webArchiveSurveys = [result.survey, ...webArchiveSurveys.filter(item => Number(item.id) !== Number(result.survey.id))];
+                webArchiveSurveysLoaded = true;
+                webArchiveSurveyPage = 1;
+                renderWebArchiveSurveysTable();
+            }
+            webArchiveSurveyPrompt.value = '';
+            closeWebArchiveSurveyRequestModal(false);
+            showDashboardStatus(result.message || 'Survey request submitted.', 'success');
+        } finally {
+            submitWebArchiveSurveyButton.disabled = false;
+        }
+    }
+
+    async function openWebArchiveSurvey(surveyId, { quiet = false } = {}) {
+        if (!quiet) showDashboardStatus(`Loading Archive Survey W${surveyId}...`, 'info', 1500);
+        const result = await fetchApi(`/api/web/archive-surveys/${encodeURIComponent(surveyId)}`, 'GET');
+        const survey = result.survey || {};
+        const report = String(survey.report_markdown || '').trim();
+        if (!report) {
+            showDashboardStatus(`Survey W${surveyId} is marked complete, but its report content is unavailable. Press Refresh and try again.`, 'error');
+            return;
+        }
+        webArchiveSelectedSurvey = survey;
+        const status = String(survey.status || 'queued').toLowerCase();
+        if (webArchiveSurveyReportTitle) webArchiveSurveyReportTitle.textContent = `Archive Survey W${surveyId}`;
+        if (webArchiveSurveyReportMeta) {
+            const parts = [
+                `Survey ID: W${surveyId}`,
+                `Status: ${status}`,
+                `Submitted Tick: ${survey.source_tick === null || typeof survey.source_tick === 'undefined' ? 'N/A' : survey.source_tick}`,
+                `Submitted Time: ${formatWebSurveyTimestamp(survey.submitted_timestamp)}`
+            ];
+            webArchiveSurveyReportMeta.textContent = parts.join(' | ');
+        }
+        if (webArchiveSurveyReport) {
+            webArchiveSurveyReport.innerHTML = renderMarkdownForDashboard(report);
+            webArchiveSurveyReport.scrollTop = 0;
+        }
+        if (copyWebArchiveSurveyMarkdownButton) copyWebArchiveSurveyMarkdownButton.disabled = false;
+        if (removeWebArchiveSurveyButton) {
+            removeWebArchiveSurveyButton.disabled = status === 'running';
+            removeWebArchiveSurveyButton.title = status === 'running' ? 'Running surveys cannot be removed' : 'Remove this survey request and its stored report';
+        }
+        if (webArchiveSurveysListView) webArchiveSurveysListView.classList.add('hidden');
+        if (webArchiveSurveyReportShell) webArchiveSurveyReportShell.classList.remove('hidden');
+    }
+
+    async function removeWebArchiveSurvey(surveyId) {
+        if (!window.confirm(`Remove Archive Survey W${surveyId} and its stored report?`)) return;
+        const result = await fetchApi(`/api/web/archive-surveys/${encodeURIComponent(surveyId)}`, 'DELETE');
+        webArchiveSurveys = webArchiveSurveys.filter(item => Number(item.id) !== Number(surveyId));
+        if (webArchiveSelectedSurvey && Number(webArchiveSelectedSurvey.id) === Number(surveyId)) {
+            webArchiveSelectedSurvey = null;
+            showWebArchiveSurveysListView();
+        }
+        renderWebArchiveSurveysTable();
+        showDashboardStatus(result.message || `Archive Survey W${surveyId} removed.`, 'success');
+    }
+
     async function copyTextToClipboard(text, successMessage) {
         try {
             await navigator.clipboard.writeText(text);
@@ -894,6 +1715,17 @@ document.addEventListener('DOMContentLoaded', () => {
             showDashboardStatus('Failed to copy to clipboard.', 'error');
         }
     }
+
+    document.addEventListener('click', (event) => {
+        if (!(event.target instanceof Element)) return;
+        const copyButton = event.target.closest('.station-yaml-copy-button');
+        if (!copyButton) return;
+        const card = copyButton.closest('.station-yaml-card');
+        const copySource = card ? card.querySelector('.station-yaml-copy-source') : null;
+        if (!copySource) return;
+        const copyKind = copyButton.dataset.copyKind || 'Content';
+        void copyTextToClipboard(copySource.value || '', `${copyKind} copied to clipboard.`);
+    });
 
     function updateCopySystemPromptButtonState() {
         if (!copySystemPromptButton) return;
@@ -904,7 +1736,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function updateHistoryWindowSelector() {
         if (!historyWindowSelector) return;
         historyWindowSelector.value = historyWindowMode;
-        historyWindowSelector.disabled = currentSelectedAgentForDialogueView !== "all" && !!isLoadingHistoryForAgent;
+        historyWindowSelector.disabled = isMultistartPreview ||
+            (currentSelectedAgentForDialogueView !== "all" && !!isLoadingHistoryForAgent);
     }
 
     function showHistoryWindowSelector(show) {
@@ -915,7 +1748,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function showLoadFullHistoryButton(show, text = 'Load Full History') {
         if (!loadFullHistoryButton) return;
         loadFullHistoryButton.textContent = text;
-        loadFullHistoryButton.classList.toggle('hidden', !show);
+        loadFullHistoryButton.classList.toggle('hidden', isMultistartPreview || !show);
     }
 
     async function loadArchivePapers() {
@@ -923,6 +1756,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const result = await fetchApi('/api/archive/papers', 'GET');
         archivePapersCache = Array.isArray(result.capsules) ? result.capsules : [];
         archiveAllAbstractsMarkdown = String(result.all_abstracts_markdown || '');
+        archivePage = 1;
         renderArchivePapersTable();
     }
 
@@ -935,6 +1769,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (archivePaperDetailMeta) {
             const metaParts = [
+                `Archive ID: #${numericId}`,
                 `Author: ${result.author || 'Unknown'}`,
                 `Accepted Tick: ${result.accepted_tick ?? 'N/A'}`,
                 `Reviewer Score: ${formatArchiveScore(result.reviewer_score)}`
@@ -957,6 +1792,186 @@ document.addEventListener('DOMContentLoaded', () => {
             await loadArchivePapers();
         } catch (error) {
             setArchiveListLoadingState('Failed to load archive papers.');
+        }
+    }
+
+    function setQuestionListLoadingState(message) {
+        if (!questionRoomTableBody) return;
+        questionRoomTableBody.innerHTML = `<tr><td colspan="7" class="archive-empty-state">${escapeHtml(message)}</td></tr>`;
+    }
+
+    function questionStatusClass(status) {
+        const normalized = String(status || 'pending').toLowerCase();
+        return ['pending', 'open', 'redacted', 'solved', 'retired'].includes(normalized) ? `status-${normalized}` : 'status-pending';
+    }
+
+    function updateQuestionSortButtons() {
+        document.querySelectorAll('.question-sort-button').forEach(button => {
+            const key = button.getAttribute('data-sort-key');
+            const label = (button.textContent || '').replace(/\s[↑↓]$/, '');
+            button.textContent = key === questionListState.sortBy
+                ? `${label} ${questionListState.sortDirection === 'asc' ? '↑' : '↓'}`
+                : label;
+        });
+    }
+
+    function updateQuestionPagination() {
+        if (questionPageSummary) {
+            const noun = questionListState.total === 1 ? 'question' : 'questions';
+            questionPageSummary.textContent = `Page ${questionListState.page} of ${questionListState.totalPages} · ${questionListState.total} ${noun}`;
+        }
+        if (questionPreviousPageButton) questionPreviousPageButton.disabled = questionListState.page <= 1;
+        if (questionNextPageButton) questionNextPageButton.disabled = questionListState.page >= questionListState.totalPages;
+    }
+
+    function renderQuestionRoomTable(questions) {
+        if (!questionRoomTableBody) return;
+        updateQuestionSortButtons();
+        updateQuestionPagination();
+        if (!Array.isArray(questions) || questions.length === 0) {
+            setQuestionListLoadingState('No questions are available.');
+            return;
+        }
+
+        questionRoomTableBody.innerHTML = questions.map(question => {
+            const title = escapeHtml(question.title || 'Untitled');
+            const author = escapeHtml(question.author || 'Unknown');
+            const abstract = String(question.abstract || '');
+            const abstractPreviewRaw = abstract.length > 220 ? `${abstract.slice(0, 220)}...` : abstract;
+            const status = String(question.status || 'pending').toLowerCase();
+            return `
+                <tr class="question-room-row" data-question-id="${question.numeric_id}">
+                    <td>${question.numeric_id}</td>
+                    <td class="archive-paper-title-cell">
+                        <strong>${title}</strong>
+                        <span>${escapeHtml(abstractPreviewRaw || 'No abstract available.')}</span>
+                    </td>
+                    <td>${author}</td>
+                    <td>${escapeHtml(String(question.authored_tick ?? 'N/A'))}</td>
+                    <td><span class="question-status-badge ${questionStatusClass(status)}">${escapeHtml(status)}</span></td>
+                    <td><span class="question-net-upvote">${escapeHtml(String(question.net_upvote ?? 0))}</span></td>
+                    <td>${escapeHtml(String(question.reply_count ?? 0))}</td>
+                </tr>
+            `;
+        }).join('');
+
+        questionRoomTableBody.querySelectorAll('.question-room-row').forEach(row => {
+            row.addEventListener('click', () => {
+                const numericId = Number(row.getAttribute('data-question-id'));
+                if (Number.isFinite(numericId)) void openQuestionRoomDetail(numericId);
+            });
+        });
+    }
+
+    function showQuestionRoomListView() {
+        if (questionRoomListView) questionRoomListView.classList.remove('hidden');
+        if (questionRoomDetailView) questionRoomDetailView.classList.add('hidden');
+    }
+
+    function showQuestionRoomDetailView() {
+        if (questionRoomListView) questionRoomListView.classList.add('hidden');
+        if (questionRoomDetailView) questionRoomDetailView.classList.remove('hidden');
+    }
+
+    async function loadQuestionRoomPage() {
+        const requestSequence = ++questionListRequestSequence;
+        setQuestionListLoadingState('Loading questions...');
+        const params = new URLSearchParams({
+            page: String(questionListState.page),
+            page_size: String(questionListState.pageSize),
+            sort_by: questionListState.sortBy,
+            sort_direction: questionListState.sortDirection
+        });
+        const result = await fetchApi(`/api/questions?${params.toString()}`, 'GET');
+        if (requestSequence !== questionListRequestSequence) return;
+
+        questionListState.total = Number(result.total) || 0;
+        questionListState.totalPages = Math.max(1, Number(result.total_pages) || 1);
+        if (questionListState.page > questionListState.totalPages) {
+            questionListState.page = questionListState.totalPages;
+            await loadQuestionRoomPage();
+            return;
+        }
+        questionListState.page = Math.max(1, Number(result.page) || questionListState.page);
+        renderQuestionRoomTable(Array.isArray(result.questions) ? result.questions : []);
+    }
+
+    function renderQuestionRoomThread(question) {
+        if (!questionRoomThread) return;
+        const messages = Array.isArray(question.messages) ? question.messages : [];
+        const sections = [];
+        if (question.abstract) {
+            sections.push(`<div class="question-thread-abstract"><strong>Abstract</strong><div class="mt-1">${escapeHtml(String(question.abstract))}</div></div>`);
+        }
+        if (question.status === 'solved' && question.solved_by_message_id && !messages.some(message => message.is_accepted)) {
+            sections.push('<div class="question-thread-abstract">The accepted solution is no longer available in the active thread.</div>');
+        }
+        messages.forEach((message, index) => {
+            const kind = message.is_question ? 'Question' : `Reply ${index}`;
+            const postAction = message.is_question ? 'posted the question' : 'posted a reply';
+            const acceptedBadge = message.is_accepted
+                ? '<span class="question-accepted-badge">Accepted Solution</span>'
+                : '';
+            const optionalTitle = message.title
+                ? `<span class="question-thread-message-title">${escapeHtml(String(message.title))}</span>`
+                : '';
+            const solutionVoteMeta = message.is_question
+                ? ''
+                : `<span class="question-thread-message-meta">Solution net upvote: ${escapeHtml(String(message.solution_net_upvote ?? 0))}</span>`;
+            sections.push(`
+                <article class="question-thread-message${message.is_accepted ? ' is-accepted' : ''}">
+                    <div class="question-thread-message-header">
+                        <div class="question-thread-byline">
+                            <strong class="question-thread-author">${escapeHtml(message.author || 'Unknown')}</strong>
+                            <span class="question-thread-posted">${postAction} at Tick ${escapeHtml(String(message.posted_tick ?? 'N/A'))}</span>
+                            ${acceptedBadge}
+                        </div>
+                        <div class="question-thread-message-details">
+                            <span class="question-message-kind">${escapeHtml(kind)}</span>
+                            ${optionalTitle}
+                            <span class="question-thread-message-meta">${escapeHtml(String(message.message_id || ''))}</span>
+                            ${solutionVoteMeta}
+                        </div>
+                    </div>
+                    <div class="markdown-content-host">${renderMarkdownForDashboard(String(message.content || ''))}</div>
+                </article>
+            `);
+        });
+        if (sections.length === 0) sections.push('<div class="archive-empty-state">This question has no active messages.</div>');
+        questionRoomThread.innerHTML = sections.join('');
+        questionRoomThread.scrollTop = 0;
+    }
+
+    async function openQuestionRoomDetail(numericId) {
+        showDashboardStatus(`Loading Question #${numericId}...`, 'info', 2000);
+        const result = await fetchApi(`/api/questions/${numericId}`, 'GET');
+        if (questionRoomDetailTitle) questionRoomDetailTitle.textContent = result.title || `Question #${numericId}`;
+        if (questionRoomDetailStatus) {
+            const status = String(result.status || 'pending').toLowerCase();
+            questionRoomDetailStatus.textContent = status;
+            questionRoomDetailStatus.className = `question-status-badge ${questionStatusClass(status)}`;
+        }
+        if (questionRoomDetailMeta) {
+            questionRoomDetailMeta.textContent = [
+                `Question #${numericId}`,
+                `Author: ${result.author || 'Unknown'}`,
+                `Authored Tick: ${result.authored_tick ?? 'N/A'}`,
+                `Last Activity: ${result.last_activity_tick ?? 'N/A'}`,
+                `Net Upvote: ${result.net_upvote ?? 0}`
+            ].join(' | ');
+        }
+        renderQuestionRoomThread(result);
+        showQuestionRoomDetailView();
+    }
+
+    async function openQuestionRoomModal() {
+        if (!questionRoomModal) return;
+        showQuestionRoomListView();
+        questionRoomModal.style.display = 'block';
+        try {
+            await loadQuestionRoomPage();
+        } catch (error) {
+            setQuestionListLoadingState('Could not load questions.');
         }
     }
 
@@ -1167,8 +2182,9 @@ document.addEventListener('DOMContentLoaded', () => {
         let displayThisEvent = false;
         let bubbleContentHtml = "";
         let rawTextForCopy = "";
-        const timeStr = new Date(timestamp * 1000).toLocaleTimeString();
-        let titlePrefix = `<strong>[${eventType.replace(/_/g, ' ').toUpperCase()} @ ${timeStr}]</strong>`;
+        const timeStr = formatEventTime(timestamp);
+        const timeSuffix = timeStr ? ` @ ${timeStr}` : '';
+        let titlePrefix = `<strong>[${eventType.replace(/_/g, ' ').toUpperCase()}${timeSuffix}]</strong>`;
         let bubbleStyle = 'chat-bubble-system'; 
 
         switch (eventType) {
@@ -1322,7 +2338,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     // --- addMessageToAgentBubbleLog (with consistent thinking block logic from previous step) ---
-    function addMessageToAgentBubbleLog(eventData, isHistorical = false) {
+    function addMessageToAgentBubbleLog(eventData, isHistorical = false, historicalAppendTarget = null) {
         if (!agentSpecificBubbleLog) { console.error("agentSpecificBubbleLog element not found"); return; }
 
         let { event: eventType, data, timestamp } = eventData; 
@@ -1338,13 +2354,17 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             eventData.event = eventType; // Persist the change for later logic
         }
+
+        const dialogueFingerprint = liveDialogueFingerprint(eventData);
+        if (dialogueFingerprint && renderedAgentDialogueFingerprints.has(dialogueFingerprint)) return;
         
         const agentDialogueEventTypes = [
             'observation', 'submission', 'internal_prompt', 'internal_response', 
+            'context_compaction_prompt', 'context_compaction_response',
             'llm_event', 
             'submission_outcome', 'internal_action_event', 'internal_outcome', 'internal_completion',
-            'manual_message_to_agent_llm', 'manual_llm_response_to_human', // These are effective types after mapping in SSE
-            'final_message_to_agent', 'final_agent_response_to_human', // These are effective types after mapping in SSE
+            'manual_message_to_agent_llm', 'manual_llm_response_to_human', // Effective types after live-event mapping
+            'final_message_to_agent', 'final_agent_response_to_human',
             'system_message', 
             'error',
             'agent_event', // Include agent_event for general agent activities
@@ -1357,7 +2377,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // If top-level eventType is generic (like llm_event), check inner type
         if (eventType === 'llm_event' && data.type) {
-            isRelevantDialogueEvent = ['observation', 'submission', 'internal_prompt', 'internal_response', 'response'].includes(data.type);
+            isRelevantDialogueEvent = [
+                'observation',
+                'submission',
+                'internal_prompt',
+                'internal_response',
+                'response',
+                'context_compaction_prompt',
+                'context_compaction_response',
+            ].includes(data.type);
         } else if (eventType === 'agent_event') {
             isRelevantDialogueEvent = ['actions_executed', 'submit_error'].includes(data.type);
         }
@@ -1378,20 +2406,16 @@ document.addEventListener('DOMContentLoaded', () => {
         
         let bubbleContentHtml = "";
         let rawTextForCopy = JSON.stringify(data, null, 2); 
-        const timeStr = new Date(timestamp * 1000).toLocaleTimeString();
-        let titlePrefix = `<strong>[${eventType.replace(/_/g, ' ').toUpperCase()} @ ${timeStr}]</strong>`; 
+        const timeStr = formatEventTime(timestamp);
+        const timeSuffix = timeStr ? ` @ ${timeStr}` : '';
+        let titlePrefix = `<strong>[${eventType.replace(/_/g, ' ').toUpperCase()}${timeSuffix}]</strong>`;
         let bubbleStyle = 'chat-bubble-system text-xs';
         let sourceType = 'station';
 
         let thinkingHtml = "";
-        const thinkingContent = data.thinking_text || data.historical_thinking_text; 
+        const thinkingContent = normalizeThinkingWhitespace(data.thinking_text || data.historical_thinking_text);
         if (thinkingContent && thinkingContent.trim() !== "") {
-            thinkingHtml = `
-                <div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
-                    <strong class="text-sky-500 block mb-1">Agent Thinking:</strong>
-                    <div class="whitespace-pre-wrap">${escapeHtml(thinkingContent)}</div>
-                </div>
-            `;
+            thinkingHtml = renderCollapsibleThinking(thinkingContent);
              rawTextForCopy = `Thinking:\n${thinkingContent}\n\nResponse:\n${(data.text_content || data.content || "")}`;
         }
         
@@ -1399,14 +2423,14 @@ document.addEventListener('DOMContentLoaded', () => {
         switch (eventType) {
             case 'system_message': 
                 const systemMessageContent = String(data.message || data.content || "");
-                titlePrefix = `<strong>[SYSTEM @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name || currentSelectedAgentForDialogueView)})</strong>`;
+                titlePrefix = `<strong>[SYSTEM${timeSuffix}] (Agent: ${escapeHtml(data.agent_name || currentSelectedAgentForDialogueView)})</strong>`;
                 bubbleContentHtml = `${titlePrefix} <div class="mt-1 text-sm markdown-content-host">${renderMarkdownForDashboard(systemMessageContent)}</div>`;
                 rawTextForCopy = systemMessageContent;
                 break;
             case 'agent_event': 
                  if (['actions_executed', 'submit_error'].includes(data.type)) {
                     bubbleStyle = 'chat-bubble-system text-purple-300';
-                    let agentEventHeader = `<strong>[AGENT EVENT @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong> - ${escapeHtml(data.type.replace(/_/g, ' '))}`;
+                    let agentEventHeader = `<strong>[AGENT EVENT${timeSuffix}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong> - ${escapeHtml(data.type.replace(/_/g, ' '))}`;
                     let agentEventContent = "";
                     if(data.summary && Array.isArray(data.summary)) {
                          agentEventContent = data.summary.map(s => `- ${s}`).join('\n'); 
@@ -1424,6 +2448,8 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'submission':  
             case 'internal_prompt': 
             case 'internal_response':
+            case 'context_compaction_prompt':
+            case 'context_compaction_response':
             case 'manual_message_to_agent_llm':
             case 'manual_llm_response_to_human':
             case 'final_message_to_agent':
@@ -1446,9 +2472,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 let direction = data.direction; 
 
                 if (isHistorical || !direction) { 
-                    if (['observation', 'internal_prompt', 'llm_event', 'historical_log'].includes(eventType) && (data.type === 'internal_prompt' || speaker === 'Station')) {
+                    if (
+                        ['observation', 'internal_prompt', 'context_compaction_prompt', 'llm_event', 'historical_log'].includes(eventType)
+                        && (data.type === 'internal_prompt' || data.type === 'context_compaction_prompt' || speaker === 'Station')
+                    ) {
                         speaker = data.speaker || "Station"; direction = 'to_llm';
-                    } else if (['submission', 'internal_response', 'llm_event', 'historical_log'].includes(eventType) && (data.type === 'internal_response' || data.type === 'response')) {
+                    } else if (
+                        ['submission', 'internal_response', 'context_compaction_response', 'llm_event', 'historical_log'].includes(eventType)
+                        && (data.type === 'internal_response' || data.type === 'context_compaction_response' || data.type === 'response')
+                    ) {
                         speaker = data.speaker || (data.agent_name || "Agent"); direction = 'from_llm';
                     } else if (eventType === 'manual_message_to_agent_llm') {
                         speaker = data.speaker || 'HumanAssistant'; direction = 'to_llm';
@@ -1465,10 +2497,15 @@ document.addEventListener('DOMContentLoaded', () => {
                      speaker = (data.direction === 'to_llm' ? 'Station' : (data.agent_name || 'AgentLLM'));
                      if (data.type === 'internal_prompt') speaker = 'Station (Internal)';
                      if (data.type === 'internal_response') speaker = `${data.agent_name || 'Agent'} (Internal LLM)`;
+                     if (data.type === 'context_compaction_prompt') speaker = 'Station (Context Compaction)';
+                     if (data.type === 'context_compaction_response') speaker = `${data.agent_name || 'Agent'} (Context Summary)`;
                 }
 
-                let headerText = `<strong>[${escapeHtml(speaker)} @ ${timeStr}] (Tick ${escapeHtml(String(data.tick || 'N/A'))})</strong>`;
-                if (eventType === 'llm_event' && data.type === 'internal_prompt') {
+                let headerText = `<strong>[${escapeHtml(speaker)}${timeSuffix}] (Tick ${escapeHtml(String(data.tick || 'N/A'))})</strong>`;
+                if (
+                    eventType === 'llm_event'
+                    && ['internal_prompt', 'context_compaction_prompt', 'context_compaction_response'].includes(data.type)
+                ) {
                      headerText += ` - ${escapeHtml(data.type.replace(/_/g, ' '))}`;
                 }
                 
@@ -1480,7 +2517,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             case 'submission_outcome': 
                  bubbleStyle = 'chat-bubble-system';
-                 titlePrefix = `<strong>[SUBMISSION OUTCOME @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name || 'N/A')}, Tick ${escapeHtml(String(data.tick || 'N/A'))})</strong>`;
+                 titlePrefix = `<strong>[SUBMISSION OUTCOME${timeSuffix}] (Agent: ${escapeHtml(data.agent_name || 'N/A')}, Tick ${escapeHtml(String(data.tick || 'N/A'))})</strong>`;
                  let outcomeTextForMarkdown = `Actions Executed:\n${(data.actions_executed_summary || data.summary || []).map(s => `- ${s}`).join('\n')}`;
                  if(data.error) outcomeTextForMarkdown += `\nError: ${data.error}`;
                  
@@ -1498,19 +2535,18 @@ document.addEventListener('DOMContentLoaded', () => {
             
             case 'internal_action_event': 
                  bubbleStyle = 'chat-bubble-system text-amber-300'; 
-                 titlePrefix = `<strong>[INTERNAL ACTION @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong>`;
+                 titlePrefix = `<strong>[INTERNAL ACTION${timeSuffix}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong>`;
                  let internalStatusMsg = `Status: ${escapeHtml(data.status.toUpperCase())}`;
                  if(data.handler) internalStatusMsg += ` | Handler: ${escapeHtml(data.handler)}. `;
                  
                  let internalContentDetailMarkdown = "";
                  let liveInternalThinkingHtml = "";
-                 if (!isHistorical && data.thinking_text && data.thinking_text.trim() !== "") {
-                    liveInternalThinkingHtml = `
-                        <div class="thinking-block border-l-4 border-sky-700 bg-slate-800/50 p-2 mb-2 text-slate-400 text-xs italic rounded">
-                            <strong class="text-sky-500 block mb-1">Agent Thinking (Internal):</strong>
-                            <div class="whitespace-pre-wrap">${escapeHtml(data.thinking_text)}</div>
-                        </div>
-                    `;
+                 const normalizedInternalThinking = normalizeThinkingWhitespace(data.thinking_text);
+                 if (!isHistorical && normalizedInternalThinking) {
+                    liveInternalThinkingHtml = renderCollapsibleThinking(
+                        normalizedInternalThinking,
+                        'Agent Thinking (Internal)'
+                    );
                  }
 
                  if(data.status === 'start' && data.text_content) { 
@@ -1532,7 +2568,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 let internalOutcomeMarkdown = String(data.next_prompt || data.completion_message || "N/A");
                 rawTextForCopy = internalOutcomeMarkdown;
                 bubbleStyle = 'chat-bubble-station'; 
-                let internalOutcomeHeader = `<strong>[STATION (Internal) @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong>`;
+                let internalOutcomeHeader = `<strong>[STATION (Internal)${timeSuffix}] (Agent: ${escapeHtml(data.agent_name)}, Tick ${escapeHtml(String(data.tick))})</strong>`;
                 if (data.handler) internalOutcomeHeader += ` - Handler: ${escapeHtml(data.handler)}`;
                 
                 let internalOutcomeBodyRendered = `${thinkingHtml}<div class="mt-1 text-sm markdown-content-host">${renderMarkdownForDashboard(internalOutcomeMarkdown)}</div>`;
@@ -1546,7 +2582,7 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'error': 
                 bubbleStyle = 'chat-bubble-error';
                 let errorMessageContent = String(data.message || data.error || JSON.stringify(data));
-                titlePrefix = `<strong>[ERROR @ ${timeStr}] (Agent: ${escapeHtml(data.agent_name || currentSelectedAgentForDialogueView)})</strong>`;
+                titlePrefix = `<strong>[ERROR${timeSuffix}] (Agent: ${escapeHtml(data.agent_name || currentSelectedAgentForDialogueView)})</strong>`;
                 bubbleContentHtml = `${titlePrefix} <div class="mt-1 text-sm markdown-content-host">${renderMarkdownForDashboard(errorMessageContent)}</div>`;
                 rawTextForCopy = `ERROR: ${errorMessageContent}`;
                 break;
@@ -1561,8 +2597,15 @@ document.addEventListener('DOMContentLoaded', () => {
             sourceType,
             historyKey: eventData.historyKey
         });
+        if (data.tick !== undefined && data.tick !== null) {
+            bubbleWrapper.dataset.dialogueTick = String(data.tick);
+        }
+        if (dialogueFingerprint) {
+            renderedAgentDialogueFingerprints.add(dialogueFingerprint);
+            bubbleWrapper.dataset.dialogueFingerprint = dialogueFingerprint;
+        }
         
-        const appendTarget = (isHistorical && agentHistoryRenderFragment) ? agentHistoryRenderFragment : agentSpecificBubbleLog;
+        const appendTarget = (isHistorical && historicalAppendTarget) ? historicalAppendTarget : agentSpecificBubbleLog;
         appendTarget.appendChild(bubbleWrapper);
 
         if (isHistorical && appendTarget === agentSpecificBubbleLog && agentSpecificBubbleLog.lastChild === bubbleWrapper) {
@@ -1596,9 +2639,80 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function applyMultistartPreviewReadOnlyState() {
+        if (!isMultistartPreview) return;
+        const lockedIds = [
+            'start-loop-button',
+            'pause-orchestrator-button',
+            'resume-orchestrator-button',
+            'stop-orchestrator-button',
+            'create-api-agent-modal-button',
+            'end-api-agent-session-button',
+            'resolve-human-intervention-button',
+            'open-temporal-chat-modal-button',
+            'open-direct-message-modal-button',
+            'open-web-archive-surveys-modal-button',
+            'open-web-archive-survey-request-button',
+            'open-speak-common-room-modal-button',
+            'open-send-system-message-modal-button',
+            'update-station-config-button',
+            'open-api-runtime-config-modal-button',
+            'create-backup-button',
+            'copy-system-prompt-button',
+            'task-spec-edit-tab',
+            'save-task-spec-button',
+        ];
+        lockedIds.forEach((id) => {
+            const element = document.getElementById(id);
+            if (!element) return;
+            element.disabled = true;
+            element.title = 'Unavailable in the read-only Seed 1 multistart preview.';
+        });
+        if (resolveHumanInterventionButton) resolveHumanInterventionButton.classList.add('hidden');
+        if (taskSpecRawEditor) taskSpecRawEditor.readOnly = true;
+        if (startLoopButton) startLoopButton.textContent = 'Managed by Multistart';
+    }
+
+    function updateMultistartPreviewBanner(status) {
+        if (!isMultistartPreview) return;
+        const detail = document.getElementById('multistart-preview-detail');
+        const multistart = status?.multistart || {};
+        const branch = multistart.branch || {};
+        if (!detail) return;
+        const seedStatus = branch.status || status?.branch_status || 'pending';
+        const currentTick = branch.current_tick ?? status?.current_tick ?? '-';
+        const targetTick = branch.target_tick ?? status?.target_tick ?? '-';
+        const completed = multistart.completed_count ?? 0;
+        const total = multistart.seed_count ?? '?';
+        detail.textContent = ` Seed 1 ${seedStatus}, tick ${currentTick} of ${targetTick}. ` +
+            `${completed}/${total} branches completed. This branch may not be selected.`;
+    }
+
+    function multistartBranchStatusLabel(rawStatus) {
+        const normalized = String(rawStatus || 'pending').trim().toLowerCase();
+        const labels = {
+            copy_pending: 'Waiting for Copy',
+            copying: 'Copying Branch Data',
+            copy_failed: 'Copy Retry Pending',
+            pending: 'Waiting to Launch',
+            running: 'Running',
+            paused: 'Paused',
+            interviewing: 'Interviewing Agents',
+            waiting_quiescent: 'Draining Background Jobs',
+            completed: 'Completed',
+            failed: 'Failed',
+        };
+        return labels[normalized] || String(rawStatus || 'Pending');
+    }
+
     function updateOrchestratorControlButtons(status) {
         if (!status) { console.warn("updateOrchestratorControlButtons called with null status"); return; }
         orchestratorState = status; 
+
+        if (status.read_only || isMultistartPreview) {
+            applyMultistartPreviewReadOnlyState();
+            return;
+        }
 
         const isPrepared = status.is_prepared;
         const isRunning = status.is_running;
@@ -1689,13 +2803,22 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    let stationStatisticsRequest = null;
     async function updateStationStatistics() {
+        if (stationStatisticsRequest) return stationStatisticsRequest;
+        stationStatisticsRequest = (async () => {
         try {
             const data = await fetchApi('/api/station/statistics');
             if (data.success && data.statistics) {
                 const stats = data.statistics;
 
                 const formatJobLine = (exp) => {
+                    if (exp.job_type === 'external_report') {
+                        const reportId = exp.id ?? exp.evaluation_id ?? '?';
+                        const author = exp.author || exp.agent_name || 'Unknown';
+                        const status = exp.status || 'unknown';
+                        return `External #${reportId}: ${exp.title || 'Untitled'} (${author}, ${status}, external surveyor)`;
+                    }
                     const elapsedMin = Math.floor((exp.elapsed_seconds || 0) / 60);
                     const elapsedSec = (exp.elapsed_seconds || 0) % 60;
                     const status = exp.status || 'unknown';
@@ -1780,6 +2903,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     const topScoreTickAge = Number.isFinite(currentTick) && Number.isFinite(topSubmittedTick)
                         ? Math.max(0, currentTick - topSubmittedTick)
                         : null;
+                    const breakthroughAgeRaw = stats.ticks_since_last_breakthrough;
+                    const breakthroughAgeNumber = Number(breakthroughAgeRaw);
+                    const breakthroughTickAge = breakthroughAgeRaw !== null
+                        && breakthroughAgeRaw !== undefined
+                        && Number.isFinite(breakthroughAgeNumber)
+                        ? Math.max(0, breakthroughAgeNumber)
+                        : null;
                     const topScoreAgeColor = getTopScoreAgeColor(topScoreTickAge);
                     if (topScoreAgeColor) {
                         scoreElement.style.setProperty('--top-score-age-color', topScoreAgeColor);
@@ -1805,7 +2935,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         `Title: ${topSubmission.title || ''}\n` +
                         `Agent: ${topSubmission.agent_name || ''}\n` +
                         `Tick: ${topSubmission.submitted_tick ?? ''}\n` +
-                        `Ticks since last top score: ${topScoreTickAge === null ? 'N/A' : topScoreTickAge}`
+                        `Ticks since last top score: ${topScoreTickAge === null ? 'N/A' : topScoreTickAge}\n` +
+                        `Ticks since last breakthrough: ${breakthroughTickAge === null ? 'N/A' : breakthroughTickAge}`
                     );
                 } else if (scoreElement) {
                     scoreElement.textContent = 'N/A';
@@ -1820,16 +2951,37 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (error) {
             console.error('Error fetching station statistics:', error);
+        } finally {
+            stationStatisticsRequest = null;
         }
+        })();
+        return stationStatisticsRequest;
     }
 
+    let orchestratorStatusRequest = null;
     async function getOrchestratorStatus() {
+        if (orchestratorStatusRequest) return orchestratorStatusRequest;
+        orchestratorStatusRequest = (async () => {
         try {
             const data = await fetchApi('/api/orchestrator/status');
             if (data.success && data.status) {
                 const status = data.status;
+                const previewBranch = status.multistart?.branch || {};
+                const previewBranchStatus = previewBranch.status || status.branch_status || 'pending';
                 if(orchestratorStatusDot) orchestratorStatusDot.className = 'status-dot'; 
-                if (status.is_running) {
+                if (status.read_only) {
+                    const normalizedBranchStatus = String(previewBranchStatus).toLowerCase();
+                    if (orchestratorStatusDisplay) {
+                        orchestratorStatusDisplay.textContent = multistartBranchStatusLabel(previewBranchStatus);
+                    }
+                    if (orchestratorStatusDot) {
+                        if (normalizedBranchStatus === 'failed') orchestratorStatusDot.classList.add('status-error');
+                        else if (normalizedBranchStatus === 'paused') orchestratorStatusDot.classList.add('status-paused');
+                        else if (['interviewing', 'waiting_quiescent', 'pending'].includes(normalizedBranchStatus)) orchestratorStatusDot.classList.add('status-waiting');
+                        else if (normalizedBranchStatus === 'completed') orchestratorStatusDot.classList.add('status-prepared');
+                        else orchestratorStatusDot.classList.add('status-running');
+                    }
+                } else if (status.is_running) {
                     if (status.is_waiting) {
                         // Waiting state (running but waiting for conditions to resolve)
                         if(orchestratorStatusDisplay) orchestratorStatusDisplay.textContent = 'Waiting';
@@ -1852,7 +3004,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Update pause/wait reason display
                 let reasonText = "";
-                if (status.is_waiting) {
+                if (status.read_only) {
+                    reasonText = previewBranch.note || 'Read-only Seed 1 candidate; this branch may not be selected.';
+                } else if (status.is_waiting) {
                     reasonText = Object.values(status.waiting_reasons || {}).join(', ');
                 } else if (status.is_paused) {
                     reasonText = status.pause_reason || "Manual Pause";
@@ -1861,14 +3015,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 
                 // Update next agent display
                 if(orchestratorNextAgentDisplay) {
-                    const syncMode = String(status.sync_mode || cachedSyncMode || 'parallel').trim().toLowerCase();
-                    const parallelStatusText = syncMode === 'parallel' ? formatParallelTickStatus(status.parallel_tick_status) : '';
-                    if (syncMode === 'parallel' && status.is_running && !status.is_paused && parallelStatusText) {
+                    const parallelStatusText = formatParallelTickStatus(status.parallel_tick_status);
+                    if (status.read_only) {
+                        const currentTick = previewBranch.current_tick ?? status.current_tick ?? '-';
+                        const targetTick = previewBranch.target_tick ?? status.target_tick ?? '-';
+                        orchestratorNextAgentDisplay.textContent =
+                            `Seed 1: ${multistartBranchStatusLabel(previewBranchStatus)} · tick ${currentTick}/${targetTick}`;
+                    } else if (status.is_running && !status.is_paused && parallelStatusText) {
                         orchestratorNextAgentDisplay.textContent = parallelStatusText;
-                    } else if (syncMode === 'parallel' && status.is_running && !status.is_paused && !status.is_waiting) {
-                        orchestratorNextAgentDisplay.textContent = "Parallel mode: preparing tick status...";
-                    } else if (status.is_running && !status.is_paused && !status.is_waiting && status.next_agent_to_act !== "N/A") {
-                        orchestratorNextAgentDisplay.textContent = `Next: ${status.next_agent_to_act} (Index: ${status.next_agent_index})`;
+                    } else if (status.is_running && !status.is_paused && !status.is_waiting) {
+                        orchestratorNextAgentDisplay.textContent = "Preparing tick status...";
                     } else if (status.is_waiting) {
                         orchestratorNextAgentDisplay.textContent = "Waiting for conditions to resolve...";
                     } else if (status.is_paused) {
@@ -1889,74 +3045,88 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
 
                 updateOrchestratorControlButtons(status);
+                updateMultistartPreviewBanner(status);
             } else {
                 showDashboardStatus(data.error || 'Failed to get orchestrator status.', 'error');
                 if(orchestratorStatusDisplay) orchestratorStatusDisplay.textContent = "Error";
                 if(orchestratorStatusDot) orchestratorStatusDot.className = 'status-dot status-error';
+                if (isMultistartPreview) {
+                    window.setTimeout(() => window.location.replace('/multistart'), 1000);
+                }
             }
+            return data;
         } catch (error) { 
             if(orchestratorStatusDisplay) orchestratorStatusDisplay.textContent = "Offline";
             if(orchestratorStatusDot) orchestratorStatusDot.className = 'status-dot status-error';
+            return null;
+        } finally {
+            orchestratorStatusRequest = null;
         }
+        })();
+        return orchestratorStatusRequest;
     }
 
-    async function fetchAgentsForDashboard() {
+    async function fetchAgentsForDashboard(orchestratorStatusData = null) {
          try {
             const data = await fetchApi('/api/agents');
-            const orchestratorStatusData = await fetchApi('/api/orchestrator/status');
+            const statusData = orchestratorStatusData || await fetchApi('/api/orchestrator/status');
             
             if (data.success && agentSelectorDashboard) {
                 fullAgentListCache = data.agents;
-                const currentTurnOrder = orchestratorStatusData.success ? orchestratorStatusData.status.turn_order : [];
-                
-                const currentVal = agentSelectorDashboard.value;
-                agentSelectorDashboard.innerHTML = '<option value="all">Global Notifications</option><option value="Reviewer">Reviewer</option>';
-                
-                let activeAgentsInOrder = [];
-                let otherAgents = [];
+                const currentTurnOrder = statusData?.success ? statusData.status.turn_order : [];
+                isRefreshingAgentSelector = true;
+                try {
+                    const currentVal = agentSelectorDashboard.value;
+                    agentSelectorDashboard.innerHTML = '<option value="all">Global Notifications</option><option value="Reviewer">Reviewer</option>';
 
-                currentTurnOrder.forEach(nameInOrder => {
-                    const agentInfo = fullAgentListCache.find(a => a.name === nameInOrder);
-                    if (agentInfo) activeAgentsInOrder.push(agentInfo);
-                });
+                    let activeAgentsInOrder = [];
+                    let otherAgents = [];
 
-                fullAgentListCache.forEach(agentInfo => {
-                    if (!currentTurnOrder.includes(agentInfo.name)) otherAgents.push(agentInfo);
-                });
+                    currentTurnOrder.forEach(nameInOrder => {
+                        const agentInfo = fullAgentListCache.find(a => a.name === nameInOrder);
+                        if (agentInfo) activeAgentsInOrder.push(agentInfo);
+                    });
 
-                otherAgents.sort((a, b) => {
-                    if (a.status.startsWith("Ascended") && !b.status.startsWith("Ascended")) return 1;
-                    if (!a.status.startsWith("Ascended") && b.status.startsWith("Ascended")) return -1;
-                    if (a.status.startsWith("Session Ended") && !b.status.startsWith("Session Ended")) return 1;
-                    if (!a.status.startsWith("Session Ended") && b.status.startsWith("Session Ended")) return -1;
-                    return a.name.localeCompare(b.name);
-                });
+                    fullAgentListCache.forEach(agentInfo => {
+                        if (!currentTurnOrder.includes(agentInfo.name)) otherAgents.push(agentInfo);
+                    });
 
-                activeAgentsInOrder.forEach(agent => {
-                    const option = document.createElement('option');
-                    option.value = agent.name;
-                    option.textContent = formatAgentDisplayName(agent);
-                    agentSelectorDashboard.appendChild(option);
-                });
+                    otherAgents.sort((a, b) => {
+                        if (a.status.startsWith("Ascended") && !b.status.startsWith("Ascended")) return 1;
+                        if (!a.status.startsWith("Ascended") && b.status.startsWith("Ascended")) return -1;
+                        if (a.status.startsWith("Session Ended") && !b.status.startsWith("Session Ended")) return 1;
+                        if (!a.status.startsWith("Session Ended") && b.status.startsWith("Session Ended")) return -1;
+                        return a.name.localeCompare(b.name);
+                    });
 
-                if (activeAgentsInOrder.length > 0 && otherAgents.length > 0) {
-                    const separator = document.createElement('option');
-                    separator.disabled = true;
-                    separator.textContent = '--- Other Agents ---';
-                    agentSelectorDashboard.appendChild(separator);
-                }
-                
-                otherAgents.forEach(agent => {
-                    const option = document.createElement('option');
-                    option.value = agent.name;
-                    option.textContent = formatAgentDisplayName(agent);
-                    agentSelectorDashboard.appendChild(option);
-                });
+                    activeAgentsInOrder.forEach(agent => {
+                        const option = document.createElement('option');
+                        option.value = agent.name;
+                        option.textContent = formatAgentDisplayName(agent);
+                        agentSelectorDashboard.appendChild(option);
+                    });
 
-                if (Array.from(agentSelectorDashboard.options).some(opt => opt.value === currentVal)) {
-                    agentSelectorDashboard.value = currentVal;
-                } else { 
-                    agentSelectorDashboard.value = "all"; 
+                    if (activeAgentsInOrder.length > 0 && otherAgents.length > 0) {
+                        const separator = document.createElement('option');
+                        separator.disabled = true;
+                        separator.textContent = '--- Other Agents ---';
+                        agentSelectorDashboard.appendChild(separator);
+                    }
+
+                    otherAgents.forEach(agent => {
+                        const option = document.createElement('option');
+                        option.value = agent.name;
+                        option.textContent = formatAgentDisplayName(agent);
+                        agentSelectorDashboard.appendChild(option);
+                    });
+
+                    if (Array.from(agentSelectorDashboard.options).some(opt => opt.value === currentVal)) {
+                        agentSelectorDashboard.value = currentVal;
+                    } else {
+                        agentSelectorDashboard.value = "all";
+                    }
+                } finally {
+                    isRefreshingAgentSelector = false;
                 }
                 updateCopySystemPromptButtonState();
             }
@@ -1971,6 +3141,7 @@ document.addEventListener('DOMContentLoaded', () => {
             params.set('window', options.window || historyWindowMode);
             params.set('ticks', String(options.ticks || HISTORY_WINDOW_TICKS));
         }
+        if (options.modifiedAtNs) params.set('modified_at_ns', String(options.modifiedAtNs));
         const query = params.toString();
         return `/api/agent_dialogue_history/${encodeURIComponent(agentName)}${query ? `?${query}` : ''}`;
     }
@@ -2039,6 +3210,7 @@ document.addEventListener('DOMContentLoaded', () => {
     function isHistoricalThinkingEntry(entryType) {
         return entryType === 'thinking_block' ||
             entryType === 'thinking_block_internal' ||
+            entryType === 'thinking_block_context_compaction' ||
             entryType === 'manual_llm_thinking_for_human';
     }
 
@@ -2052,6 +3224,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const targetTypes = new Set([
             'submission',
             'internal_response',
+            'context_compaction_response',
             'manual_llm_response_to_human',
             'final_agent_response_to_human',
         ]);
@@ -2069,74 +3242,264 @@ document.addEventListener('DOMContentLoaded', () => {
         return !pendingAgent || !entryAgent || pendingAgent === entryAgent;
     }
 
-    function renderHistoryEntries(historyToDisplay) {
-        let pendingHistoricalThinking = null;
-        const previousHistoryRenderFragment = agentHistoryRenderFragment;
-        agentHistoryRenderFragment = document.createDocumentFragment();
+    function historyRenderWasSuperseded(options = {}) {
+        return (options.requestId !== undefined && options.requestId !== historyLoadSequence) ||
+            (options.agentName && options.agentName !== currentSelectedAgentForDialogueView);
+    }
 
-        try {
-            historyToDisplay.forEach((logEntry) => {
-                const entryType = logEntry.type || 'historical_log';
+    function latestHistoryTimestamp(historyEntries) {
+        return historyEntries.reduce((latest, entry) => {
+            const timestamp = Number(entry && entry.timestamp);
+            return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+        }, Number.NEGATIVE_INFINITY);
+    }
 
-                if (isHistoricalThinkingEntry(entryType)) {
-                    pendingHistoricalThinking = {
-                        text: String(logEntry.content || ""),
-                        tick: logEntry.tick,
-                        agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
-                    };
-                    return;
-                }
+    function multistartPreviewDialogueSignature(historyEntries) {
+        if (!Array.isArray(historyEntries) || historyEntries.length === 0) return 'empty';
+        const tail = historyEntries.slice(-4).map(entry => {
+            const content = String(
+                entry?.content || entry?.text_content || entry?.next_prompt || entry?.completion_message || ''
+            );
+            return `${getHistoryEntryKey(entry || {})}|${content.length}|${entry?.timestamp ?? ''}`;
+        });
+        return `${historyEntries.length}|${tail.join('||')}`;
+    }
 
-                const attachedHistoricalThinking = isHistoricalThinkingTarget(logEntry, pendingHistoricalThinking)
-                    ? pendingHistoricalThinking.text
-                    : null;
-                pendingHistoricalThinking = null;
+    function dialogueEntryFingerprint(tick, type, internalStep, content) {
+        if (content === undefined || content === null) return null;
+        return JSON.stringify([
+            tick ?? '',
+            type || '',
+            internalStep ?? '',
+            String(content),
+        ]);
+    }
 
-                const sseLikeEventData = {
-                    event: entryType,
-                    historyKey: getHistoryEntryKey(logEntry),
-                    data: {
-                        agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
-                        tick: logEntry.tick,
-                        speaker: logEntry.speaker,
-                        text_content: logEntry.text_content || logEntry.content,
-                        content: logEntry.content,
-                        actions_executed_summary: logEntry.actions_executed_summary,
-                        error: logEntry.error,
-                        internal_action_initiated: logEntry.internal_action_initiated,
-                        status: logEntry.status,
-                        handler: logEntry.handler,
-                        direction: logEntry.direction,
-                        type: logEntry.type,
-                        snippet: logEntry.snippet,
-                        full_length: logEntry.full_length,
-                        interaction_id: logEntry.interaction_id,
-                        next_prompt: logEntry.next_prompt,
-                        actions_executed_in_step: logEntry.actions_executed_in_step,
-                        completion_message: logEntry.completion_message,
-                        token_info: logEntry.token_info,
-                        historical_thinking_text: attachedHistoricalThinking,
-                        ...(logEntry.data && typeof logEntry.data === 'object' ? logEntry.data : {})
-                    },
-                    timestamp: logEntry.timestamp || (logEntry.tick !== undefined ? (Date.now()/1000 - (200000 - logEntry.tick*1000 - (logEntry.internal_step || 0)*10 )) : Date.now()/1000)
-                };
+    function liveDialogueFingerprint(eventData) {
+        const data = eventData && typeof eventData.data === 'object' ? eventData.data : {};
+        let type = data.type || eventData?.event || '';
+        let content = data.text_content;
 
-                if(logEntry.content && !sseLikeEventData.data.text_content) {
-                    sseLikeEventData.data.text_content = logEntry.content;
-                }
-                if(logEntry.next_prompt && (entryType === 'internal_outcome') && !sseLikeEventData.data.text_content) {
-                    sseLikeEventData.data.text_content = logEntry.next_prompt;
-                }
-                addMessageToAgentBubbleLog(sseLikeEventData, true);
-            });
-
-            if (agentSpecificBubbleLog && agentHistoryRenderFragment.childNodes.length > 0) {
-                agentSpecificBubbleLog.appendChild(agentHistoryRenderFragment);
-                agentSpecificBubbleLog.scrollTop = agentSpecificBubbleLog.scrollHeight;
+        if (eventData?.event === 'llm_event' && type === 'response') {
+            type = 'submission';
+        } else if (eventData?.event === 'human_assist_event') {
+            if (type === 'manual_message_human_part_sent') type = 'manual_message_to_agent_llm';
+            if (type === 'manual_llm_response_received') type = 'manual_llm_response_to_human';
+        } else if (eventData?.event === 'final_chat_event') {
+            if (type === 'human_message_sent') {
+                type = 'final_message_to_agent';
+                content = data.human_message;
+            } else if (type === 'agent_response_received') {
+                type = 'final_agent_response_to_human';
+                content = data.llm_response;
             }
-        } finally {
-            agentHistoryRenderFragment = previousHistoryRenderFragment;
         }
+
+        return dialogueEntryFingerprint(
+            data.tick,
+            type,
+            data.internal_loop_step,
+            content,
+        );
+    }
+
+    function latestTickAttemptView(historyEntries) {
+        const numericTicks = historyEntries
+            .map(entry => Number(entry && entry.tick))
+            .filter(Number.isFinite);
+        if (numericTicks.length === 0) return { entries: historyEntries, pendingObservation: null };
+
+        const latestTickKey = String(Math.max(...numericTicks));
+        const observationIndexes = [];
+        historyEntries.forEach((entry, index) => {
+            const isLatestTick = String(entry && entry.tick) === latestTickKey;
+            const isStationObservation = entry?.type === 'observation' && isStationSpeaker(entry?.speaker);
+            if (isLatestTick && isStationObservation) observationIndexes.push(index);
+        });
+        if (observationIndexes.length === 0) return { entries: historyEntries, pendingObservation: null };
+
+        const attempts = observationIndexes.map((startIndex, attemptIndex) => {
+            const boundedEnd = observationIndexes[attemptIndex + 1] ?? historyEntries.length;
+            const hasAgentResponse = historyEntries
+                .slice(startIndex, boundedEnd)
+                .some(entry => entry?.type === 'submission');
+            return { startIndex, endIndex: boundedEnd, hasAgentResponse };
+        });
+
+        const latestAttempt = attempts[attempts.length - 1];
+        const selectedAttempt = [...attempts].reverse().find(attempt => attempt.hasAgentResponse) || latestAttempt;
+        const pendingObservation = latestAttempt.hasAgentResponse
+            ? null
+            : historyEntries[latestAttempt.startIndex];
+        const entries = historyEntries.filter((entry, index) => {
+            if (String(entry && entry.tick) !== latestTickKey) return true;
+            return index >= selectedAttempt.startIndex && index < selectedAttempt.endIndex;
+        });
+        return { entries, pendingObservation };
+    }
+
+    function historyObservationToLiveEvent(logEntry, agentName) {
+        if (!logEntry) return null;
+        return {
+            event: 'llm_event',
+            data: {
+                agent_name: agentName,
+                tick: logEntry.tick,
+                direction: 'to_llm',
+                type: 'observation',
+                text_content: logEntry.content || logEntry.text_content || '',
+                full_length: String(logEntry.content || logEntry.text_content || '').length,
+            },
+            timestamp: logEntry.timestamp ?? null,
+        };
+    }
+
+    function yieldToBrowserRender() {
+        return new Promise(resolve => {
+            if (document.visibilityState === 'visible' && typeof window.requestAnimationFrame === 'function') {
+                window.requestAnimationFrame(() => resolve());
+            } else {
+                setTimeout(resolve, 0);
+            }
+        });
+    }
+
+    async function renderHistoryEntries(historyToDisplay, options = {}) {
+        let pendingHistoricalThinking = null;
+        const renderFragment = document.createDocumentFragment();
+        let entriesInChunk = 0;
+        let renderedTextInChunk = 0;
+
+        for (const logEntry of historyToDisplay) {
+            if (historyRenderWasSuperseded(options)) return false;
+            const entryType = logEntry.type || 'historical_log';
+
+            if (isHistoricalThinkingEntry(entryType)) {
+                pendingHistoricalThinking = {
+                    text: String(logEntry.content || ""),
+                    tick: logEntry.tick,
+                    agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
+                };
+                continue;
+            }
+
+            const attachedHistoricalThinking = isHistoricalThinkingTarget(logEntry, pendingHistoricalThinking)
+                ? pendingHistoricalThinking.text
+                : null;
+            pendingHistoricalThinking = null;
+
+            const sseLikeEventData = {
+                event: entryType,
+                historyKey: getHistoryEntryKey(logEntry),
+                data: {
+                    agent_name: logEntry.agent_name || currentSelectedAgentForDialogueView,
+                    tick: logEntry.tick,
+                    speaker: logEntry.speaker,
+                    text_content: logEntry.text_content || logEntry.content,
+                    content: logEntry.content,
+                    actions_executed_summary: logEntry.actions_executed_summary,
+                    error: logEntry.error,
+                    internal_action_initiated: logEntry.internal_action_initiated,
+                    status: logEntry.status,
+                    handler: logEntry.handler,
+                    direction: logEntry.direction,
+                    type: logEntry.type,
+                    snippet: logEntry.snippet,
+                    full_length: logEntry.full_length,
+                    interaction_id: logEntry.interaction_id,
+                    next_prompt: logEntry.next_prompt,
+                    actions_executed_in_step: logEntry.actions_executed_in_step,
+                    completion_message: logEntry.completion_message,
+                    token_info: logEntry.token_info,
+                    historical_thinking_text: attachedHistoricalThinking,
+                    ...(logEntry.data && typeof logEntry.data === 'object' ? logEntry.data : {})
+                },
+                timestamp: logEntry.timestamp ?? null
+            };
+
+            if (logEntry.content && !sseLikeEventData.data.text_content) {
+                sseLikeEventData.data.text_content = logEntry.content;
+            }
+            if (logEntry.next_prompt && entryType === 'internal_outcome' && !sseLikeEventData.data.text_content) {
+                sseLikeEventData.data.text_content = logEntry.next_prompt;
+            }
+            addMessageToAgentBubbleLog(sseLikeEventData, true, renderFragment);
+            entriesInChunk += 1;
+            renderedTextInChunk += String(
+                logEntry.content || logEntry.text_content || logEntry.next_prompt || logEntry.completion_message || ''
+            ).length + String(attachedHistoricalThinking || '').length;
+
+            if (entriesInChunk >= HISTORY_RENDER_CHUNK_SIZE ||
+                renderedTextInChunk >= HISTORY_RENDER_CHUNK_TEXT_BUDGET) {
+                entriesInChunk = 0;
+                renderedTextInChunk = 0;
+                await yieldToBrowserRender();
+            }
+        }
+
+        if (historyRenderWasSuperseded(options)) return false;
+        if (agentSpecificBubbleLog && options.replaceExisting) {
+            agentSpecificBubbleLog.replaceChildren(renderFragment);
+        } else if (agentSpecificBubbleLog && renderFragment.childNodes.length > 0) {
+            // Commit the completed history in one DOM update so the transcript
+            // appears at its final position instead of visibly growing chunk by chunk.
+            agentSpecificBubbleLog.appendChild(renderFragment);
+        }
+        if (agentSpecificBubbleLog && options.stickToBottom) {
+            agentSpecificBubbleLog.scrollTop = agentSpecificBubbleLog.scrollHeight;
+        }
+        return true;
+    }
+
+    function cancelActiveHistoryRequest() {
+        if (!activeHistoryAbortController) return;
+        activeHistoryAbortController.abort();
+        activeHistoryAbortController = null;
+    }
+
+    async function fetchHistoryWithRetry(apiUrl, requestId, agentName) {
+        let lastError = null;
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            if (requestId !== historyLoadSequence) throw new Error('History request superseded.');
+            const controller = new AbortController();
+            activeHistoryAbortController = controller;
+            let timedOut = false;
+            const timeoutId = setTimeout(() => {
+                timedOut = true;
+                controller.abort();
+            }, HISTORY_REQUEST_TIMEOUT_MS);
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' },
+                    signal: controller.signal,
+                });
+                if (!response.ok) {
+                    let message = `History request failed: ${response.status}`;
+                    try {
+                        const errorData = await response.json();
+                        message = errorData.error || errorData.message || message;
+                    } catch (_error) {}
+                    throw new Error(message);
+                }
+                return await response.json();
+            } catch (error) {
+                if (requestId !== historyLoadSequence) throw error;
+                lastError = timedOut
+                    ? new Error(`History request timed out after ${HISTORY_REQUEST_TIMEOUT_MS / 1000} seconds.`)
+                    : error;
+                if (attempt < 2) {
+                    showDashboardStatus(`History for ${agentName} is taking longer than expected. Retrying once...`, 'info', 0);
+                }
+            } finally {
+                clearTimeout(timeoutId);
+                if (activeHistoryAbortController === controller) {
+                    activeHistoryAbortController = null;
+                }
+            }
+        }
+        throw lastError || new Error('History request failed.');
     }
 
     async function handleAgentDialogueViewChange(loadFullHistory = false) {
@@ -2145,8 +3508,13 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
         
+        const requestId = ++historyLoadSequence;
+        cancelActiveHistoryRequest();
+        bufferedLiveEventsDuringHistory = [];
+        renderedAgentDialogueFingerprints.clear();
+        pendingLiveStationObservations.clear();
+        let loadedHistoryTimestampCutoff = Number.NEGATIVE_INFINITY;
         const newSelectedAgent = agentSelectorDashboard.value;
-        const wasLoadingAgent = isLoadingHistoryForAgent;
         isLoadingHistoryForAgent = (newSelectedAgent !== "all") ? newSelectedAgent : null; 
         currentSelectedAgentForDialogueView = newSelectedAgent;
         updateHistoryWindowSelector();
@@ -2158,29 +3526,26 @@ document.addEventListener('DOMContentLoaded', () => {
             agentSpecificBubbleLog.style.display = "none";
             logViewTitle.textContent = "Global Notifications";
             isLoadingHistoryForAgent = null; 
+            hideDashboardStatus();
+            updateHistoryWindowSelector();
             showHistoryWindowSelector(true);
         } else {
             globalNotificationBubbleLog.style.display = "none";
             agentSpecificBubbleLog.style.display = "flex"; 
             logViewTitle.textContent = `Dialogue: ${currentSelectedAgentForDialogueView}`;
             
-            if (newSelectedAgent !== wasLoadingAgent) {
-                agentSpecificBubbleLog.innerHTML = ''; 
-                const initialMessageDiv = document.createElement('div');
-                initialMessageDiv.classList.add('chat-bubble', 'chat-bubble-system', 'initial-log-message'); 
-                initialMessageDiv.textContent = `Loading history for ${currentSelectedAgentForDialogueView}...`;
-                agentSpecificBubbleLog.appendChild(initialMessageDiv);
-            }
+            agentSpecificBubbleLog.innerHTML = '';
+            const initialMessageDiv = document.createElement('div');
+            initialMessageDiv.classList.add('chat-bubble', 'chat-bubble-system', 'initial-log-message');
+            initialMessageDiv.textContent = `Loading history for ${currentSelectedAgentForDialogueView}...`;
+            agentSpecificBubbleLog.appendChild(initialMessageDiv);
 
             showDashboardStatus(`Loading ${historyWindowMode} ${HISTORY_WINDOW_TICKS} tick history for ${currentSelectedAgentForDialogueView}...`, 'info', 0);
             try {
                 const apiUrl = buildHistoryApiUrl(currentSelectedAgentForDialogueView, { full: loadFullHistory });
-                const apiData = await fetchApi(apiUrl);
+                const apiData = await fetchHistoryWithRetry(apiUrl, requestId, newSelectedAgent);
                 
-                if (currentSelectedAgentForDialogueView !== newSelectedAgent) {
-                    isLoadingHistoryForAgent = null; 
-                    return;
-                }
+                if (requestId !== historyLoadSequence || currentSelectedAgentForDialogueView !== newSelectedAgent) return;
 
                 if (agentSpecificBubbleLog.firstChild && agentSpecificBubbleLog.firstChild.classList.contains('initial-log-message')) {
                     agentSpecificBubbleLog.innerHTML = ''; 
@@ -2189,12 +3554,37 @@ document.addEventListener('DOMContentLoaded', () => {
                 let historyToDisplay = [];
                 
                 if (apiData.success && apiData.history) {
+                    if (isMultistartPreview) {
+                        multistartPreviewDialogueSignatures.set(
+                            newSelectedAgent,
+                            multistartPreviewDialogueSignature(apiData.history),
+                        );
+                        if (apiData.source_modified_at_ns) {
+                            multistartPreviewDialogueMtimes.set(newSelectedAgent, apiData.source_modified_at_ns);
+                        }
+                    }
                     if (loadFullHistory) {
                         fullDialogueHistoryCache[currentSelectedAgentForDialogueView] = apiData.history;
                     } else {
                         delete fullDialogueHistoryCache[currentSelectedAgentForDialogueView];
                     }
-                    historyToDisplay = apiData.history;
+                    if (loadFullHistory) {
+                        historyToDisplay = apiData.history;
+                    } else {
+                        const latestTickView = latestTickAttemptView(apiData.history);
+                        historyToDisplay = latestTickView.entries;
+                        const pendingObservationEvent = historyObservationToLiveEvent(
+                            latestTickView.pendingObservation,
+                            newSelectedAgent,
+                        );
+                        if (pendingObservationEvent) {
+                            pendingLiveStationObservations.set(
+                                String(pendingObservationEvent.data.tick),
+                                pendingObservationEvent,
+                            );
+                        }
+                    }
+                    loadedHistoryTimestampCutoff = latestHistoryTimestamp(apiData.history);
                     
                     if (apiData.history.length === 0) {
                         addMessageToAgentBubbleLog({event: "system_message", data: {message: `No dialogue history found for ${currentSelectedAgentForDialogueView}. New live messages for this agent will be appended.`}, timestamp: Date.now()/1000}, true);
@@ -2210,7 +3600,12 @@ document.addEventListener('DOMContentLoaded', () => {
                             }, true);
                         }
                         
-                        renderHistoryEntries(historyToDisplay);
+                        const rendered = await renderHistoryEntries(historyToDisplay, {
+                            requestId,
+                            agentName: newSelectedAgent,
+                            stickToBottom: !loadFullHistory && historyWindowMode === 'recent',
+                        });
+                        if (!rendered) return;
                         if (!loadFullHistory && historyWindowMode === 'earliest') {
                             agentSpecificBubbleLog.scrollTop = 0;
                         }
@@ -2223,12 +3618,31 @@ document.addEventListener('DOMContentLoaded', () => {
                     showDashboardStatus(apiData.error || `Failed to load history for ${currentSelectedAgentForDialogueView}.`, 'error');
                      addMessageToAgentBubbleLog({event: "error", data: {message: `Failed to load history for ${currentSelectedAgentForDialogueView}. ${apiData.error || ''}`}, timestamp: Date.now()/1000}, true);
                 }
-            } catch (error) { 
+            } catch (error) {
+                if (requestId !== historyLoadSequence) return;
                 console.error(`Error in handleAgentDialogueViewChange for ${newSelectedAgent}:`, error);
+                agentSpecificBubbleLog.innerHTML = '';
+                addMessageToAgentBubbleLog({
+                    event: "error",
+                    data: { message: `Could not load history for ${newSelectedAgent}. ${error.message || ''}` },
+                    timestamp: Date.now() / 1000,
+                }, true);
+                showDashboardStatus(`Could not load history for ${newSelectedAgent}. Please try selecting the agent again.`, 'error');
             }
             finally {
-                if (isLoadingHistoryForAgent === newSelectedAgent) {
+                if (requestId === historyLoadSequence && isLoadingHistoryForAgent === newSelectedAgent) {
                     isLoadingHistoryForAgent = null;
+                    updateHistoryWindowSelector();
+                    const bufferedEvents = bufferedLiveEventsDuringHistory;
+                    bufferedLiveEventsDuringHistory = [];
+                    bufferedEvents
+                        .filter(eventData => {
+                            const eventTimestamp = Number(eventData && eventData.timestamp);
+                            return !Number.isFinite(loadedHistoryTimestampCutoff) ||
+                                !Number.isFinite(eventTimestamp) ||
+                                eventTimestamp > loadedHistoryTimestampCutoff;
+                        })
+                        .forEach(appendLiveEventToAgentDialogue);
                 }
             }
         }
@@ -2236,15 +3650,89 @@ document.addEventListener('DOMContentLoaded', () => {
         getOrchestratorStatus(); 
     }
 
+    async function refreshMultistartPreviewDialogue() {
+        if (!isMultistartPreview || multistartPreviewDialogueRefreshInFlight) return;
+        if (document.visibilityState !== 'visible') return;
+        const agentName = currentSelectedAgentForDialogueView;
+        if (!agentName || agentName === 'all' || isLoadingHistoryForAgent) return;
+        if (!agentSpecificBubbleLog || agentSpecificBubbleLog.style.display === 'none') return;
+
+        multistartPreviewDialogueRefreshInFlight = true;
+        try {
+            const response = await fetch(
+                buildHistoryApiUrl(agentName, {
+                    window: 'recent',
+                    ticks: HISTORY_WINDOW_TICKS,
+                    modifiedAtNs: multistartPreviewDialogueMtimes.get(agentName),
+                }),
+                {method: 'GET', headers: {'Accept': 'application/json'}, cache: 'no-store'},
+            );
+            if (!response.ok) return;
+            const apiData = await response.json();
+            if (apiData.unchanged) return;
+            if (!apiData.success || !Array.isArray(apiData.history)) return;
+            if (currentSelectedAgentForDialogueView !== agentName) return;
+
+            const signature = multistartPreviewDialogueSignature(apiData.history);
+            if (multistartPreviewDialogueSignatures.get(agentName) === signature) return;
+
+            const scrollAnchor = captureAgentLogScrollAnchor();
+            const distanceFromBottom = agentSpecificBubbleLog.scrollHeight -
+                agentSpecificBubbleLog.scrollTop - agentSpecificBubbleLog.clientHeight;
+            const stickToBottom = distanceFromBottom < 120;
+            const sourceCollapseState = captureCurrentSourceCollapseState();
+            const latestTickView = latestTickAttemptView(apiData.history);
+            const renderRequestId = historyLoadSequence;
+
+            renderedAgentDialogueFingerprints.clear();
+            pendingLiveStationObservations.clear();
+            const pendingObservationEvent = historyObservationToLiveEvent(
+                latestTickView.pendingObservation,
+                agentName,
+            );
+            if (pendingObservationEvent) {
+                pendingLiveStationObservations.set(
+                    String(pendingObservationEvent.data.tick),
+                    pendingObservationEvent,
+                );
+            }
+
+            const rendered = await renderHistoryEntries(latestTickView.entries, {
+                requestId: renderRequestId,
+                agentName,
+                replaceExisting: true,
+                stickToBottom,
+            });
+            if (!rendered || currentSelectedAgentForDialogueView !== agentName) return;
+            restoreCurrentSourceCollapseState(sourceCollapseState);
+            if (!stickToBottom) restoreAgentLogScrollAnchor(scrollAnchor);
+            multistartPreviewDialogueSignatures.set(agentName, signature);
+            if (apiData.source_modified_at_ns) {
+                multistartPreviewDialogueMtimes.set(agentName, apiData.source_modified_at_ns);
+            }
+        } catch (error) {
+            console.debug('Seed 1 dialogue refresh failed; retrying on the next poll.', error);
+        } finally {
+            multistartPreviewDialogueRefreshInFlight = false;
+        }
+    }
+
     async function loadFullHistoryInBackground() {
         if (!currentSelectedAgentForDialogueView || currentSelectedAgentForDialogueView === "all") return;
         const agentName = currentSelectedAgentForDialogueView;
         const cachedFullHistory = fullDialogueHistoryCache[agentName];
         if (Array.isArray(cachedFullHistory) && cachedFullHistory.length > 0) {
+            const renderRequestId = historyLoadSequence;
             const scrollAnchor = captureAgentLogScrollAnchor();
             const sourceCollapseState = captureCurrentSourceCollapseState();
+            renderedAgentDialogueFingerprints.clear();
+            pendingLiveStationObservations.clear();
             agentSpecificBubbleLog.innerHTML = '';
-            renderHistoryEntries(cachedFullHistory);
+            const rendered = await renderHistoryEntries(cachedFullHistory, {
+                requestId: renderRequestId,
+                agentName,
+            });
+            if (!rendered) return;
             restoreCurrentSourceCollapseState(sourceCollapseState);
             restoreAgentLogScrollAnchor(scrollAnchor);
             showLoadFullHistoryButton(false, 'Load Full History');
@@ -2273,10 +3761,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
             fullDialogueHistoryCache[agentName] = apiData.history;
             if (currentSelectedAgentForDialogueView === agentName) {
+                const renderRequestId = historyLoadSequence;
                 const scrollAnchor = captureAgentLogScrollAnchor();
                 const sourceCollapseState = captureCurrentSourceCollapseState();
+                renderedAgentDialogueFingerprints.clear();
+                pendingLiveStationObservations.clear();
                 agentSpecificBubbleLog.innerHTML = '';
-                renderHistoryEntries(apiData.history);
+                const rendered = await renderHistoryEntries(apiData.history, {
+                    requestId: renderRequestId,
+                    agentName,
+                });
+                if (!rendered) return;
                 restoreCurrentSourceCollapseState(sourceCollapseState);
                 restoreAgentLogScrollAnchor(scrollAnchor);
                 showLoadFullHistoryButton(false, 'Load Full History');
@@ -2296,87 +3791,191 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     
-    // Fetch recent events for polling mode (fallback when SSE fails)
-    async function fetchRecentEvents() {
-        try {
-            const data = await fetchApi(buildRecentEventsEndpoint());
-            if (data.success && data.events) {
-                data.events.forEach(eventData => {
-                    const { event: topLevelEventType, data: ssePayload, timestamp } = eventData;
+    function scheduleLiveUiRefresh(refreshAgents = false) {
+        liveAgentRefreshNeeded = liveAgentRefreshNeeded || refreshAgents;
+        if (liveUiRefreshTimer) return;
+        liveUiRefreshTimer = setTimeout(async () => {
+            liveUiRefreshTimer = null;
+            const orchestratorStatusData = await getOrchestratorStatus();
+            updateStationStatistics();
+            if (liveAgentRefreshNeeded) fetchAgentsForDashboard(orchestratorStatusData);
+            liveAgentRefreshNeeded = false;
+        }, 150);
+    }
 
-                    addMessageToGlobalNotificationBubbleLog(eventData); 
+    function applyLiveStreamIdentity(epoch, sequence, forceCursor = false) {
+        const nextEpoch = typeof epoch === 'string' && epoch ? epoch : null;
+        if (nextEpoch && nextEpoch !== liveStreamEpoch) {
+            liveStreamEpoch = nextEpoch;
+            liveEventCursor = null;
+            forceCursor = true;
+        }
+        const nextSequence = Number(sequence);
+        if (!Number.isFinite(nextSequence) || nextSequence < 0) return;
+        if (forceCursor || liveEventCursor === null || nextSequence > liveEventCursor) {
+            liveEventCursor = nextSequence;
+        }
+    }
 
-                    if (currentSelectedAgentForDialogueView !== "all" && 
-                        ssePayload.agent_name === currentSelectedAgentForDialogueView &&
-                        !isLoadingHistoryForAgent) { 
-                        
-                        if (topLevelEventType === 'human_assist_event') {
-                            if (ssePayload.type === 'manual_message_human_part_sent') {
-                                const humanMessageEvent = {
-                                    event: 'manual_message_to_agent_llm', // Effective type for addMessageToAgentBubbleLog
-                                    data: {
-                                        agent_name: ssePayload.agent_name,
-                                        tick: ssePayload.tick || timestamp,
-                                        speaker: 'HumanAssistant', 
-                                        text_content: ssePayload.text_content, // This is the human_message
-                                        // No thinking_text or token_info for the human's sent message
-                                    },
-                                    timestamp: timestamp
-                                };
-                                addMessageToAgentBubbleLog(humanMessageEvent, false);
-                            } else if (ssePayload.type === 'manual_llm_response_received') {
-                                const agentResponseEvent = {
-                                    event: 'manual_llm_response_to_human', // Effective type
-                                    data: {
-                                        agent_name: ssePayload.agent_name,
-                                        tick: ssePayload.tick || timestamp, 
-                                        speaker: `${ssePayload.agent_name} (LLM)`, 
-                                        text_content: ssePayload.text_content, // LLM's response
-                                        thinking_text: ssePayload.thinking_text, // LLM's thinking
-                                        token_info: ssePayload.token_info
-                                    },
-                                    timestamp: timestamp
-                                };
-                                addMessageToAgentBubbleLog(agentResponseEvent, false);
-                            }
-                            // Other human_assist_event types might be notifications, handled by global log
-                        } else if (topLevelEventType === 'final_chat_event') {
-                            if (ssePayload.type === 'human_message_sent') {
-                                const humanFinalMessageEvent = {
-                                    event: 'final_message_to_agent', // Effective type
-                                    data: {
-                                        agent_name: ssePayload.agent_name,
-                                        tick: ssePayload.tick || timestamp,
-                                        speaker: 'HumanFinalChat',
-                                        text_content: ssePayload.human_message // Content from payload
-                                    },
-                                    timestamp: timestamp
-                                };
-                                addMessageToAgentBubbleLog(humanFinalMessageEvent, false);
-                            } else if (ssePayload.type === 'agent_response_received') {
-                                const agentFinalResponseEvent = {
-                                    event: 'final_agent_response_to_human', // Effective type
-                                    data: {
-                                        agent_name: ssePayload.agent_name,
-                                        tick: ssePayload.tick || timestamp,
-                                        speaker: `${ssePayload.agent_name} (FinalResponse)`,
-                                        text_content: ssePayload.llm_response, // Content from payload
-                                        thinking_text: ssePayload.thinking_text, // Thinking from payload
-                                        token_info: ssePayload.token_info
-                                    },
-                                    timestamp: timestamp
-                                };
-                                addMessageToAgentBubbleLog(agentFinalResponseEvent, false);
-                            }
-                            // Errors in final_chat_event are handled by global log or if status indicates error
-                        } else {
-                            addMessageToAgentBubbleLog(eventData, false);
-                        }
-                    }
-                });
+    function showLiveGapNotice(droppedCount) {
+        if ((Number(droppedCount) || 0) <= 0) return;
+        showDashboardStatus('Live updates resumed. Older transient notifications were skipped; saved agent history remains available.', 'info');
+    }
+
+    function removeRenderedDialogueTick(tick) {
+        const tickKey = String(tick);
+        agentSpecificBubbleLog
+            .querySelectorAll('.chat-bubble[data-dialogue-tick]')
+            .forEach(existingBubble => {
+                if (existingBubble.dataset.dialogueTick !== tickKey) return;
+                const existingFingerprint = existingBubble.dataset.dialogueFingerprint;
+                if (existingFingerprint) renderedAgentDialogueFingerprints.delete(existingFingerprint);
+                existingBubble.remove();
+            });
+    }
+
+    function appendLiveEventToAgentDialogue(eventData) {
+        const topLevelEventType = eventData.event;
+        const ssePayload = eventData.data && typeof eventData.data === 'object' ? eventData.data : {};
+        const timestamp = eventData.timestamp;
+        if (currentSelectedAgentForDialogueView === "all" ||
+            ssePayload.agent_name !== currentSelectedAgentForDialogueView) {
+            return;
+        }
+        if (topLevelEventType === 'llm_event' && ssePayload.type === 'observation') {
+            pendingLiveStationObservations.set(String(ssePayload.tick), eventData);
+            return;
+        }
+        if (topLevelEventType === 'llm_event' && ssePayload.type === 'response') {
+            const tickKey = String(ssePayload.tick);
+            const pendingObservation = pendingLiveStationObservations.get(tickKey);
+            if (pendingObservation) {
+                removeRenderedDialogueTick(tickKey);
+                addMessageToAgentBubbleLog(pendingObservation, false);
+                pendingLiveStationObservations.delete(tickKey);
             }
+            addMessageToAgentBubbleLog(eventData, false);
+            return;
+        }
+        if (topLevelEventType === 'human_assist_event') {
+            if (ssePayload.type === 'manual_message_human_part_sent') {
+                addMessageToAgentBubbleLog({
+                    event: 'manual_message_to_agent_llm',
+                    data: {
+                        agent_name: ssePayload.agent_name,
+                        tick: ssePayload.tick || timestamp,
+                        speaker: 'HumanAssistant',
+                        text_content: ssePayload.text_content
+                    },
+                    timestamp
+                }, false);
+            } else if (ssePayload.type === 'manual_llm_response_received') {
+                addMessageToAgentBubbleLog({
+                    event: 'manual_llm_response_to_human',
+                    data: {
+                        agent_name: ssePayload.agent_name,
+                        tick: ssePayload.tick || timestamp,
+                        speaker: `${ssePayload.agent_name} (LLM)`,
+                        text_content: ssePayload.text_content,
+                        thinking_text: ssePayload.thinking_text,
+                        token_info: ssePayload.token_info
+                    },
+                    timestamp
+                }, false);
+            }
+        } else if (topLevelEventType === 'final_chat_event') {
+            if (ssePayload.type === 'human_message_sent') {
+                addMessageToAgentBubbleLog({
+                    event: 'final_message_to_agent',
+                    data: {
+                        agent_name: ssePayload.agent_name,
+                        tick: ssePayload.tick || timestamp,
+                        speaker: 'HumanFinalChat',
+                        text_content: ssePayload.human_message
+                    },
+                    timestamp
+                }, false);
+            } else if (ssePayload.type === 'agent_response_received') {
+                addMessageToAgentBubbleLog({
+                    event: 'final_agent_response_to_human',
+                    data: {
+                        agent_name: ssePayload.agent_name,
+                        tick: ssePayload.tick || timestamp,
+                        speaker: `${ssePayload.agent_name} (FinalResponse)`,
+                        text_content: ssePayload.llm_response,
+                        thinking_text: ssePayload.thinking_text,
+                        token_info: ssePayload.token_info
+                    },
+                    timestamp
+                }, false);
+            }
+        } else {
+            addMessageToAgentBubbleLog(eventData, false);
+        }
+    }
+
+    function processLiveEvent(eventData) {
+        if (!eventData || typeof eventData !== 'object') return;
+        const sequence = Number(eventData.stream_sequence);
+        const epochChanged = Boolean(eventData.stream_epoch && eventData.stream_epoch !== liveStreamEpoch);
+        if (eventData.stream_control) {
+            applyLiveStreamIdentity(eventData.stream_epoch, sequence, epochChanged || Boolean(eventData.data?.cursor_reset));
+            showLiveGapNotice(eventData.data?.dropped_count);
+            return;
+        }
+        if (!epochChanged && Number.isFinite(sequence) && liveEventCursor !== null && sequence <= liveEventCursor) {
+            return;
+        }
+        applyLiveStreamIdentity(eventData.stream_epoch, sequence, epochChanged);
+
+        const topLevelEventType = eventData.event;
+        const ssePayload = eventData.data && typeof eventData.data === 'object' ? eventData.data : {};
+
+        addMessageToGlobalNotificationBubbleLog(eventData);
+
+        if (currentSelectedAgentForDialogueView !== "all" &&
+            ssePayload.agent_name === currentSelectedAgentForDialogueView) {
+            if (isLoadingHistoryForAgent) {
+                bufferedLiveEventsDuringHistory.push(eventData);
+            } else {
+                appendLiveEventToAgentDialogue(eventData);
+            }
+        }
+
+        if (['orchestrator_status', 'orchestrator_control', 'tick_event', 'agent_management', 'human_assist_event', 'connector_status', 'connector_error', 'final_chat_event'].includes(topLevelEventType)) {
+            const refreshAgents = topLevelEventType === 'agent_management' ||
+                (topLevelEventType === 'tick_event' && ssePayload.type === 'end') ||
+                topLevelEventType === 'connector_status' ||
+                (topLevelEventType === 'orchestrator_status' && ['paused_agent_departure', 'stopped'].includes(ssePayload.status));
+            scheduleLiveUiRefresh(refreshAgents);
+        }
+        if (topLevelEventType === 'tick_event' && ssePayload.type === 'end' && ssePayload.next_tick !== undefined) {
+            if (stationTickDashboard) stationTickDashboard.textContent = ssePayload.next_tick;
+        }
+    }
+
+    // Lightweight fallback used only while SSE is unavailable.
+    async function fetchRecentEvents() {
+        if (pollingRequestInFlight) return;
+        pollingRequestInFlight = true;
+        try {
+            const response = await fetch(buildRecentEventsEndpoint(), {
+                method: 'GET',
+                headers: { 'Accept': 'application/json' }
+            });
+            if (!response.ok) throw new Error(`Fallback request failed: ${response.status}`);
+            const data = await response.json();
+            if (!data.success) return;
+            if (liveTransportMode === 'sse' && data.stream_epoch !== liveStreamEpoch) return;
+            const epochChanged = Boolean(data.stream_epoch && data.stream_epoch !== liveStreamEpoch);
+            if (epochChanged) applyLiveStreamIdentity(data.stream_epoch, 0, true);
+            (Array.isArray(data.events) ? data.events : []).forEach(processLiveEvent);
+            applyLiveStreamIdentity(data.stream_epoch, data.cursor, Boolean(data.cursor_reset) && epochChanged);
+            showLiveGapNotice(data.dropped_count);
         } catch (error) {
             console.error("Error fetching recent events:", error);
+        } finally {
+            pollingRequestInFlight = false;
         }
     }
 
@@ -2384,12 +3983,16 @@ document.addEventListener('DOMContentLoaded', () => {
         return encodeURIComponent(currentSelectedAgentForDialogueView || 'all');
     }
 
+    function liveEventCursorParam() {
+        return liveEventCursor === null ? 'latest' : String(liveEventCursor);
+    }
+
     function buildLiveLogStreamEndpoint() {
-        return `/api/orchestrator/live_log_stream?agent_name=${selectedAgentStreamParam()}`;
+        return `/api/orchestrator/live_log_stream?agent_name=${selectedAgentStreamParam()}&cursor=${encodeURIComponent(liveEventCursorParam())}`;
     }
 
     function buildRecentEventsEndpoint() {
-        return `/api/orchestrator/recent_events?agent_name=${selectedAgentStreamParam()}`;
+        return `/api/orchestrator/recent_events?agent_name=${selectedAgentStreamParam()}&cursor=${encodeURIComponent(liveEventCursorParam())}&limit=50`;
     }
 
     function stopPollingFallback() {
@@ -2399,190 +4002,94 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    function clearSseReconnectTimer() {
+        if (!sseReconnectTimer) return;
+        clearTimeout(sseReconnectTimer);
+        sseReconnectTimer = null;
+    }
+
+    function scheduleSseReconnect() {
+        if (sseReconnectTimer || document.visibilityState !== 'visible') return;
+        sseReconnectTimer = setTimeout(() => {
+            sseReconnectTimer = null;
+            connectSseLogStream();
+        }, 15000);
+    }
+
     function startPollingFallback() {
-        if (pollingFallbackInterval) {
+        liveTransportMode = 'polling';
+        if (!pollingFallbackInterval) {
+            void fetchRecentEvents();
+            pollingFallbackInterval = setInterval(() => {
+                void fetchRecentEvents();
+            }, 5000);
+        }
+        scheduleSseReconnect();
+    }
+
+    function connectSseLogStream() {
+        clearSseReconnectTimer();
+        if (sseSource) {
+            const previousSource = sseSource;
+            sseSource = null;
+            previousSource.close();
+        }
+        if (operationMode !== 'api') {
+            stopPollingFallback();
+            liveTransportMode = 'idle';
             return;
         }
-        getOrchestratorStatus();
-        fetchRecentEvents();
-        pollingFallbackInterval = setInterval(() => {
-            getOrchestratorStatus();
-            fetchRecentEvents();
-        }, 3000);
-    }
-    
-    function connectSseLogStream() {
-        if (sseSource) { sseSource.close(); }
-        stopPollingFallback();
+        if (document.visibilityState !== 'visible') {
+            liveTransportMode = 'idle';
+            return;
+        }
 
         const sseEndpoint = buildLiveLogStreamEndpoint();
-        
+        liveTransportMode = 'connecting';
         try {
             sseSource = new EventSource(sseEndpoint);
         } catch (error) {
             console.error("Failed to create EventSource:", error);
-            addMessageToGlobalNotificationBubbleLog({
-                event: "stream_status",
-                data: { message: "Failed to create SSE connection" },
-                timestamp: Date.now() / 1000
-            });
             startPollingFallback();
             return;
         }
         const activeSource = sseSource;
-        
-        // Set a timeout for SSE connection
+
         const connectionTimeout = setTimeout(() => {
-            if (sseSource !== activeSource) {
-                return;
-            }
-            if (sseSource) {
-                sseSource.close();
+            if (sseSource !== activeSource) return;
+            activeSource.close();
+            if (sseSource === activeSource) {
                 sseSource = null;
             }
-            addMessageToGlobalNotificationBubbleLog({
-                event: "stream_status",
-                data: { message: "SSE connection timeout, switching to polling mode" },
-                timestamp: Date.now() / 1000
-            });
             startPollingFallback();
-        }, 5000); // 5 second timeout
+        }, 5000);
 
-        sseSource.onopen = function(event) {
-            if (sseSource !== activeSource) {
-                return;
-            }
-            clearTimeout(connectionTimeout); // Cancel timeout if connection succeeds
+        sseSource.onopen = function() {
+            if (sseSource !== activeSource) return;
+            clearTimeout(connectionTimeout);
+            clearSseReconnectTimer();
             stopPollingFallback();
-            addMessageToGlobalNotificationBubbleLog({
-                event: "stream_status", 
-                data: {message: "SSE live log stream connected."}, 
-                timestamp: Date.now()/1000
-            });
+            liveTransportMode = 'sse';
         };
 
         sseSource.onmessage = function(event) {
-            if (sseSource !== activeSource) {
-                return;
-            }
+            if (sseSource !== activeSource) return;
             try {
-                const eventData = JSON.parse(event.data); 
-                const { event: topLevelEventType, data: ssePayload, timestamp } = eventData; 
-
-                // Always log to global notifications
-                addMessageToGlobalNotificationBubbleLog(eventData); 
-
-                // Conditional logging to agent-specific bubble log
-                if (currentSelectedAgentForDialogueView !== "all" && 
-                    ssePayload.agent_name === currentSelectedAgentForDialogueView &&
-                    !isLoadingHistoryForAgent) { 
-                    
-                    if (topLevelEventType === 'human_assist_event') {
-                        if (ssePayload.type === 'manual_message_human_part_sent') {
-                            const humanMessageEvent = {
-                                event: 'manual_message_to_agent_llm', // Effective type for addMessageToAgentBubbleLog
-                                data: {
-                                    agent_name: ssePayload.agent_name,
-                                    tick: ssePayload.tick || timestamp,
-                                    speaker: 'HumanAssistant', 
-                                    text_content: ssePayload.text_content, // This is the human_message
-                                    // No thinking_text or token_info for the human's sent message
-                                },
-                                timestamp: timestamp
-                            };
-                            addMessageToAgentBubbleLog(humanMessageEvent, false);
-                        } else if (ssePayload.type === 'manual_llm_response_received') {
-                            const agentResponseEvent = {
-                                event: 'manual_llm_response_to_human', // Effective type
-                                data: {
-                                    agent_name: ssePayload.agent_name,
-                                    tick: ssePayload.tick || timestamp, 
-                                    speaker: `${ssePayload.agent_name} (LLM)`, 
-                                    text_content: ssePayload.text_content, // LLM's response
-                                    thinking_text: ssePayload.thinking_text, // LLM's thinking
-                                    token_info: ssePayload.token_info
-                                },
-                                timestamp: timestamp
-                            };
-                            addMessageToAgentBubbleLog(agentResponseEvent, false);
-                        }
-                        // Other human_assist_event types might be notifications, handled by global log
-                    } else if (topLevelEventType === 'final_chat_event') {
-                        if (ssePayload.type === 'human_message_sent') {
-                            const humanFinalMessageEvent = {
-                                event: 'final_message_to_agent', // Effective type
-                                data: {
-                                    agent_name: ssePayload.agent_name,
-                                    tick: ssePayload.tick || timestamp,
-                                    speaker: 'HumanFinalChat',
-                                    text_content: ssePayload.human_message // Content from payload
-                                },
-                                timestamp: timestamp
-                            };
-                            addMessageToAgentBubbleLog(humanFinalMessageEvent, false);
-                        } else if (ssePayload.type === 'agent_response_received') {
-                            const agentFinalResponseEvent = {
-                                event: 'final_agent_response_to_human', // Effective type
-                                data: {
-                                    agent_name: ssePayload.agent_name,
-                                    tick: ssePayload.tick || timestamp,
-                                    speaker: `${ssePayload.agent_name} (FinalResponse)`,
-                                    text_content: ssePayload.llm_response, // Content from payload
-                                    thinking_text: ssePayload.thinking_text, // Thinking from payload
-                                    token_info: ssePayload.token_info
-                                },
-                                timestamp: timestamp
-                            };
-                            addMessageToAgentBubbleLog(agentFinalResponseEvent, false);
-                        }
-                        // Errors in final_chat_event are handled by global log or if status indicates error
-                    } else {
-                        // For other existing events like 'llm_event', 'observation', etc.
-                        addMessageToAgentBubbleLog(eventData, false);
-                    }
-                }
-
-                // UI updates for orchestrator status, agent list, etc. (as before)
-                if (['orchestrator_status', 'orchestrator_control', 'tick_event', 'agent_management', 'human_assist_event', 'connector_status', 'connector_error', 'final_chat_event'].includes(topLevelEventType)) {
-                    getOrchestratorStatus(); 
-                    updateStationStatistics(); // Update statistics alongside orchestrator status
-                    if (topLevelEventType === 'agent_management' || 
-                        (topLevelEventType === 'tick_event' && ssePayload.type === 'end') || 
-                        topLevelEventType === 'connector_status' ||
-                        (topLevelEventType === 'orchestrator_status' && (ssePayload.status === 'paused_agent_departure' || ssePayload.status === 'stopped'))) {
-                        fetchAgentsForDashboard(); 
-                    }
-                }
-                if (topLevelEventType === 'tick_event' && ssePayload.type === 'end' && ssePayload.next_tick !== undefined){
-                    if (stationTickDashboard) stationTickDashboard.textContent = ssePayload.next_tick;
-                }
+                processLiveEvent(JSON.parse(event.data));
             } catch (e) {
                 console.error("Error parsing SSE data: ", e, "Raw data: ", event.data);
-                const errorLogEntry = {event: "error", data: {message: "Malformed SSE event: " + event.data}, timestamp: Date.now()/1000 };
-                addMessageToGlobalNotificationBubbleLog(errorLogEntry);
             }
-        }; // End of sseSource.onmessage
+        };
 
         sseSource.onerror = function(error) {
-            if (sseSource !== activeSource) {
-                return;
-            }
+            if (sseSource !== activeSource) return;
             clearTimeout(connectionTimeout);
             console.error("SSE connection error:", error);
-            const errorMessage = "Live log stream connection error. Falling back to polling mode.";
-
-            const errorData = {event: "error", data: {message: errorMessage}, timestamp: Date.now()/1000};
-            addMessageToGlobalNotificationBubbleLog(errorData);
-            if (currentSelectedAgentForDialogueView !== "all") {
-                addMessageToAgentBubbleLog(errorData, false);
+            activeSource.close();
+            if (sseSource === activeSource) sseSource = null;
+            if (liveTransportMode === 'sse') {
+                showDashboardStatus('Live connection interrupted. Updates will continue through the fallback connection.', 'info');
             }
-
-            const statusMessage = 'Log stream disconnected. Switched to polling mode.';
-            showDashboardStatus(statusMessage, 'info');
-            
-            if(sseSource) { sseSource.close(); sseSource = null; }
-            
-            // Fallback to polling for ANY SSE error.
             startPollingFallback();
         };
     }
@@ -2662,10 +4169,29 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     if (agentSelectorDashboard) agentSelectorDashboard.addEventListener('change', () => {
+        if (isRefreshingAgentSelector || agentSelectorDashboard.value === currentSelectedAgentForDialogueView) return;
         handleAgentDialogueViewChange();
         connectSseLogStream();
     });
     if (agentSelectorDashboard) agentSelectorDashboard.addEventListener('change', updateCopySystemPromptButtonState);
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') {
+            clearSseReconnectTimer();
+            stopPollingFallback();
+            if (sseSource) {
+                const hiddenSource = sseSource;
+                sseSource = null;
+                hiddenSource.close();
+            }
+            liveTransportMode = 'idle';
+            return;
+        }
+        updateStationStatistics();
+        getOrchestratorStatus();
+        connectSseLogStream();
+        void refreshMultistartPreviewDialogue();
+    });
 
     if (copySystemPromptButton) {
         copySystemPromptButton.addEventListener('click', async () => {
@@ -2697,6 +4223,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if(globalNotificationBubbleLog) globalNotificationBubbleLog.innerHTML = `<div class="chat-bubble chat-bubble-system initial-log-message">Global notifications cleared by user. New messages will appear here.</div>`;
         } else {
             if(agentSpecificBubbleLog) agentSpecificBubbleLog.innerHTML = `<div class="chat-bubble chat-bubble-system initial-log-message">Log for ${currentSelectedAgentForDialogueView} cleared by user.</div>`;
+            renderedAgentDialogueFingerprints.clear();
+            pendingLiveStationObservations.clear();
             if (fullDialogueHistoryCache[currentSelectedAgentForDialogueView]) {
                 fullDialogueHistoryCache[currentSelectedAgentForDialogueView] = [];
             }
@@ -2712,6 +4240,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (historyWindowSelector) {
         historyWindowSelector.value = historyWindowMode;
         historyWindowSelector.addEventListener('change', () => {
+            if (isMultistartPreview) return;
             const nextMode = historyWindowSelector.value;
             if (!['recent', 'earliest'].includes(nextMode)) return;
             historyWindowMode = nextMode;
@@ -3016,6 +4545,36 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    if (openWebArchiveSurveysModalButton) {
+        openWebArchiveSurveysModalButton.addEventListener('click', () => {
+            void openWebArchiveSurveysModal();
+        });
+    }
+
+    if (closeWebArchiveSurveysModalButton) {
+        closeWebArchiveSurveysModalButton.addEventListener('click', () => {
+            hideModalWithoutReset(webArchiveSurveysModal);
+        });
+    }
+
+    if (openWebArchiveSurveyRequestButton) {
+        openWebArchiveSurveyRequestButton.addEventListener('click', () => {
+            void openWebArchiveSurveyRequestModal();
+        });
+    }
+
+    if (closeWebArchiveSurveyRequestModalButton) {
+        closeWebArchiveSurveyRequestModalButton.addEventListener('click', () => {
+            closeWebArchiveSurveyRequestModal(true);
+        });
+    }
+
+    if (cancelWebArchiveSurveyRequestButton) {
+        cancelWebArchiveSurveyRequestButton.addEventListener('click', () => {
+            closeWebArchiveSurveyRequestModal(true);
+        });
+    }
+
     if (copyAllArchiveAbstractsButton) {
         copyAllArchiveAbstractsButton.addEventListener('click', () => {
             if (!archiveAllAbstractsMarkdown.trim()) {
@@ -3042,6 +4601,103 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    if (archiveRowCountSelect) {
+        archiveRowCountSelect.addEventListener('change', () => {
+            const nextCount = Number(archiveRowCountSelect.value);
+            archiveRowCount = [25, 50, 100, 200].includes(nextCount) ? nextCount : 100;
+            archivePage = 1;
+            renderArchivePapersTable();
+        });
+    }
+
+    if (archivePreviousPageButton) {
+        archivePreviousPageButton.addEventListener('click', () => {
+            if (archivePage <= 1) return;
+            archivePage -= 1;
+            renderArchivePapersTable();
+        });
+    }
+
+    if (archiveNextPageButton) {
+        archiveNextPageButton.addEventListener('click', () => {
+            const totalPages = Math.max(1, Math.ceil(archivePapersCache.length / archiveRowCount));
+            if (archivePage >= totalPages) return;
+            archivePage += 1;
+            renderArchivePapersTable();
+        });
+    }
+
+    if (clearWebArchiveSurveyPromptButton) {
+        clearWebArchiveSurveyPromptButton.addEventListener('click', () => {
+            if (webArchiveSurveyPrompt) {
+                webArchiveSurveyPrompt.value = '';
+                webArchiveSurveyPrompt.focus();
+            }
+        });
+    }
+
+    if (submitWebArchiveSurveyButton) {
+        submitWebArchiveSurveyButton.addEventListener('click', () => {
+            void submitWebArchiveSurvey();
+        });
+    }
+
+    if (refreshWebArchiveSurveysButton) {
+        refreshWebArchiveSurveysButton.addEventListener('click', () => {
+            void loadWebArchiveSurveys();
+        });
+    }
+
+    if (webArchiveSurveyRowCountSelect) {
+        webArchiveSurveyRowCountSelect.addEventListener('change', () => {
+            const nextCount = Number(webArchiveSurveyRowCountSelect.value);
+            webArchiveSurveyRowCount = [25, 50, 100, 200].includes(nextCount) ? nextCount : 100;
+            webArchiveSurveyPage = 1;
+            renderWebArchiveSurveysTable();
+        });
+    }
+
+    if (webArchiveSurveyPreviousPageButton) {
+        webArchiveSurveyPreviousPageButton.addEventListener('click', () => {
+            if (webArchiveSurveyPage <= 1) return;
+            webArchiveSurveyPage -= 1;
+            renderWebArchiveSurveysTable();
+        });
+    }
+
+    if (webArchiveSurveyNextPageButton) {
+        webArchiveSurveyNextPageButton.addEventListener('click', () => {
+            const totalPages = Math.max(1, Math.ceil(webArchiveSurveys.length / webArchiveSurveyRowCount));
+            if (webArchiveSurveyPage >= totalPages) return;
+            webArchiveSurveyPage += 1;
+            renderWebArchiveSurveysTable();
+        });
+    }
+
+    if (copyWebArchiveSurveyMarkdownButton) {
+        copyWebArchiveSurveyMarkdownButton.addEventListener('click', () => {
+            const markdown = webArchiveSelectedSurvey ? String(webArchiveSelectedSurvey.report_markdown || '') : '';
+            if (!markdown.trim()) {
+                showDashboardStatus('No finished survey report is currently open.', 'error');
+                return;
+            }
+            void copyTextToClipboard(markdown, 'Survey report Markdown copied to clipboard.');
+        });
+    }
+
+    if (removeWebArchiveSurveyButton) {
+        removeWebArchiveSurveyButton.addEventListener('click', () => {
+            const surveyId = webArchiveSelectedSurvey ? Number(webArchiveSelectedSurvey.id) : NaN;
+            if (Number.isFinite(surveyId)) void removeWebArchiveSurvey(surveyId);
+        });
+    }
+
+    if (closeWebArchiveSurveyReportButton) {
+        closeWebArchiveSurveyReportButton.addEventListener('click', () => {
+            showWebArchiveSurveysListView();
+        });
+    }
+
     document.querySelectorAll('.archive-sort-button').forEach(button => {
         button.addEventListener('click', () => {
             const key = button.getAttribute('data-sort-key');
@@ -3054,7 +4710,66 @@ document.addEventListener('DOMContentLoaded', () => {
                     direction: key === 'title' || key === 'author' ? 'asc' : 'desc'
                 };
             }
+            archivePage = 1;
             renderArchivePapersTable();
+        });
+    });
+
+    if (openQuestionRoomModalButton) {
+        openQuestionRoomModalButton.addEventListener('click', () => {
+            void openQuestionRoomModal();
+        });
+    }
+
+    if (closeQuestionRoomModalButton) {
+        closeQuestionRoomModalButton.addEventListener('click', () => {
+            hideModalWithoutReset(questionRoomModal);
+        });
+    }
+
+    if (backToQuestionRoomListButton) {
+        backToQuestionRoomListButton.addEventListener('click', () => {
+            showQuestionRoomListView();
+        });
+    }
+
+    if (questionPreviousPageButton) {
+        questionPreviousPageButton.addEventListener('click', () => {
+            if (questionListState.page <= 1) return;
+            questionListState.page -= 1;
+            void loadQuestionRoomPage();
+        });
+    }
+
+    if (questionNextPageButton) {
+        questionNextPageButton.addEventListener('click', () => {
+            if (questionListState.page >= questionListState.totalPages) return;
+            questionListState.page += 1;
+            void loadQuestionRoomPage();
+        });
+    }
+
+    if (questionPageSizeSelect) {
+        questionPageSizeSelect.addEventListener('change', () => {
+            const nextSize = Number(questionPageSizeSelect.value);
+            questionListState.pageSize = [25, 50, 100].includes(nextSize) ? nextSize : 100;
+            questionListState.page = 1;
+            void loadQuestionRoomPage();
+        });
+    }
+
+    document.querySelectorAll('.question-sort-button').forEach(button => {
+        button.addEventListener('click', () => {
+            const key = button.getAttribute('data-sort-key');
+            if (!key) return;
+            if (questionListState.sortBy === key) {
+                questionListState.sortDirection = questionListState.sortDirection === 'asc' ? 'desc' : 'asc';
+            } else {
+                questionListState.sortBy = key;
+                questionListState.sortDirection = ['title', 'author', 'status'].includes(key) ? 'asc' : 'desc';
+            }
+            questionListState.page = 1;
+            void loadQuestionRoomPage();
         });
     });
 
@@ -3712,15 +5427,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     
     function initializeDashboard() {
-        const operationMode = document.body.dataset.operationMode;
         applyLogDisplayMode();
-        if (operationMode === 'api') {
+        if (operationMode === 'api' || isMultistartPreview) {
             getStationVersion(); // Load version first
             loadStationConfig(); // Load station config and update top bar
-            getOrchestratorStatus();
+            const orchestratorStatusPromise = getOrchestratorStatus();
             updateStationStatistics(); // Initial load of statistics
             renderTimeSinceLastTick();
-            fetchAgentsForDashboard().then(() => {
+            orchestratorStatusPromise.then(fetchAgentsForDashboard).then(() => {
                 if (window.location.hash) {
                     const agentNameFromHash = window.location.hash.substring(1);
                     if (agentSelectorDashboard && Array.from(agentSelectorDashboard.options).some(opt => opt.value === agentNameFromHash)) {
@@ -3728,27 +5442,190 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 }
                 handleAgentDialogueViewChange();
-                connectSseLogStream();
+                if (operationMode === 'api') {
+                    connectSseLogStream();
+                } else if (globalNotificationBubbleLog) {
+                    addMessageToGlobalNotificationBubbleLog({
+                        event: 'system_message',
+                        data: {message: 'Read-only Seed 1 preview. Select an agent to inspect its durable dialogue history.'},
+                        timestamp: Date.now() / 1000,
+                    });
+                }
             });
+            applyMultistartPreviewReadOnlyState();
         } else {
             if(globalNotificationBubbleLog) addMessageToGlobalNotificationBubbleLog({event: "system_message", data: {message: "Orchestrator live log inactive in Manual Mode."}, timestamp: Date.now()/1000});
-            const apiControls = [startLoopButton, pauseOrchestratorButton, resumeOrchestratorButton, stopOrchestratorButton, createApiAgentModalButton, endApiAgentSessionButton, openDirectMessageModalButton, resolveHumanInterventionButton];
+            const apiControls = [startLoopButton, pauseOrchestratorButton, resumeOrchestratorButton, stopOrchestratorButton, createApiAgentModalButton, endApiAgentSessionButton, openDirectMessageModalButton, resolveHumanInterventionButton, openResearchTaskSpecModalButton];
             apiControls.forEach(btn => { if(btn) btn.disabled = true; });
             showDashboardStatus("Station is in Manual Mode. Use the Manual Interface tab for agent interaction.", "info", 0);
         }
 
-        setInterval(() => {
-        if (document.visibilityState === 'visible' && operationMode === 'api') { 
-            getOrchestratorStatus();
+        setInterval(async () => {
+        if (document.visibilityState === 'visible' && (operationMode === 'api' || isMultistartPreview)) {
+            const orchestratorStatusData = await getOrchestratorStatus();
             updateStationStatistics(); // Periodic update of statistics
             // Always fetch agents to keep the list updated
-            fetchAgentsForDashboard();
+            fetchAgentsForDashboard(orchestratorStatusData);
             }
         }, 7000); 
 
         setInterval(() => {
             renderTimeSinceLastTick();
         }, 1000);
+
+        if (isMultistartPreview) {
+            setInterval(() => {
+                void refreshMultistartPreviewDialogue();
+            }, 3 * 60 * 1000);
+        }
+    }
+
+    function setTaskSpecDirty(dirty) {
+        taskSpecState.dirty = !!dirty;
+        if (taskSpecDirtyIndicator) taskSpecDirtyIndicator.classList.toggle('hidden', !taskSpecState.dirty);
+        if (saveTaskSpecButton) saveTaskSpecButton.disabled = isMultistartPreview || !taskSpecState.dirty;
+    }
+
+    function renderTaskSpecPreview() {
+        if (!taskSpecPreviewPane) return;
+        const rawMarkdown = taskSpecRawEditor ? taskSpecRawEditor.value : taskSpecState.rawMarkdown;
+        taskSpecPreviewPane.innerHTML = renderMarkdownForDashboard(rawMarkdown || '_No Research Task specification is available._');
+        taskSpecPreviewPane.scrollTop = 0;
+    }
+
+    function showTaskSpecMode(mode) {
+        const nextMode = !isMultistartPreview && mode === 'edit' ? 'edit' : 'preview';
+        taskSpecState.mode = nextMode;
+        const previewActive = nextMode === 'preview';
+        if (taskSpecPreviewPane) taskSpecPreviewPane.classList.toggle('hidden', !previewActive);
+        if (taskSpecEditPane) taskSpecEditPane.classList.toggle('hidden', previewActive);
+        if (taskSpecPreviewTab) {
+            taskSpecPreviewTab.classList.toggle('is-active', previewActive);
+            taskSpecPreviewTab.setAttribute('aria-selected', previewActive ? 'true' : 'false');
+        }
+        if (taskSpecEditTab) {
+            taskSpecEditTab.classList.toggle('is-active', !previewActive);
+            taskSpecEditTab.setAttribute('aria-selected', previewActive ? 'false' : 'true');
+        }
+        if (previewActive) {
+            renderTaskSpecPreview();
+        } else if (taskSpecRawEditor) {
+            taskSpecRawEditor.focus();
+        }
+    }
+
+    function applyTaskSpecSnapshot(snapshot) {
+        taskSpecState.rawMarkdown = String(snapshot.raw_markdown || '');
+        taskSpecState.savedRawMarkdown = taskSpecState.rawMarkdown;
+        taskSpecState.revision = String(snapshot.revision || '');
+        taskSpecState.relativePath = String(snapshot.relative_path || 'rooms/research/research_task.md');
+        taskSpecState.loaded = true;
+        if (taskSpecRawEditor) taskSpecRawEditor.value = taskSpecState.rawMarkdown;
+        if (taskSpecPath) taskSpecPath.textContent = `Path: ${taskSpecState.relativePath}`;
+        if (taskSpecRevision) taskSpecRevision.textContent = `Revision: ${taskSpecState.revision.slice(0, 12) || 'unknown'}`;
+        setTaskSpecDirty(false);
+        showTaskSpecMode(taskSpecState.mode);
+    }
+
+    async function loadResearchTaskSpec() {
+        showDashboardStatus('Loading Research Task specification...', 'info', 0);
+        if (reloadTaskSpecButton) reloadTaskSpecButton.disabled = true;
+        if (saveTaskSpecButton) saveTaskSpecButton.disabled = true;
+        try {
+            const snapshot = await fetchApi('/api/station/research_task_spec', 'GET');
+            applyTaskSpecSnapshot(snapshot);
+            showDashboardStatus('Research Task specification loaded.', 'success');
+            return true;
+        } catch (error) {
+            return false;
+        } finally {
+            if (reloadTaskSpecButton) reloadTaskSpecButton.disabled = false;
+            if (saveTaskSpecButton) saveTaskSpecButton.disabled = isMultistartPreview || !taskSpecState.dirty;
+        }
+    }
+
+    async function openResearchTaskSpecModal() {
+        if (!researchTaskSpecModal) return;
+        const preserveDraft = consumeBackdropDraftFlag(researchTaskSpecModal);
+        researchTaskSpecModal.style.display = 'block';
+        if (preserveDraft && taskSpecState.loaded && taskSpecState.dirty) {
+            showTaskSpecMode(taskSpecState.mode);
+            return;
+        }
+        await loadResearchTaskSpec();
+    }
+
+    async function saveResearchTaskSpec() {
+        if (!taskSpecRawEditor || !taskSpecState.loaded || !taskSpecState.revision) {
+            showDashboardStatus('Load the Research Task specification before saving.', 'error');
+            return false;
+        }
+        if (!taskSpecState.dirty) return true;
+        if (!confirm('Save these changes to the active Research Task specification? New task reads and newly launched coder sessions will use the updated text immediately.')) {
+            return false;
+        }
+
+        if (saveTaskSpecButton) saveTaskSpecButton.disabled = true;
+        if (reloadTaskSpecButton) reloadTaskSpecButton.disabled = true;
+        showDashboardStatus('Saving Research Task specification...', 'info', 0);
+        try {
+            const snapshot = await fetchApi('/api/station/research_task_spec', 'PUT', {
+                raw_markdown: taskSpecRawEditor.value,
+                expected_revision: taskSpecState.revision,
+            });
+            applyTaskSpecSnapshot(snapshot);
+            showDashboardStatus(snapshot.message || 'Research Task specification saved.', 'success');
+            return true;
+        } catch (error) {
+            return false;
+        } finally {
+            if (reloadTaskSpecButton) reloadTaskSpecButton.disabled = false;
+            if (saveTaskSpecButton) saveTaskSpecButton.disabled = isMultistartPreview || !taskSpecState.dirty;
+        }
+    }
+
+    if (openResearchTaskSpecModalButton) {
+        openResearchTaskSpecModalButton.addEventListener('click', openResearchTaskSpecModal);
+    }
+
+    if (closeResearchTaskSpecModalButton) {
+        closeResearchTaskSpecModalButton.addEventListener('click', () => {
+            hideModalWithoutReset(researchTaskSpecModal, true);
+        });
+    }
+
+    if (taskSpecPreviewTab) {
+        taskSpecPreviewTab.addEventListener('click', () => showTaskSpecMode('preview'));
+    }
+
+    if (taskSpecEditTab) {
+        taskSpecEditTab.addEventListener('click', () => showTaskSpecMode('edit'));
+    }
+
+    if (taskSpecRawEditor) {
+        taskSpecRawEditor.addEventListener('input', () => {
+            taskSpecState.rawMarkdown = taskSpecRawEditor.value;
+            setTaskSpecDirty(taskSpecState.rawMarkdown !== taskSpecState.savedRawMarkdown);
+        });
+        taskSpecRawEditor.addEventListener('keydown', (event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+                event.preventDefault();
+                saveResearchTaskSpec();
+            }
+        });
+    }
+
+    if (reloadTaskSpecButton) {
+        reloadTaskSpecButton.addEventListener('click', async () => {
+            if (taskSpecState.dirty && !confirm('Discard the unsaved task specification changes and reload from disk?')) {
+                return;
+            }
+            await loadResearchTaskSpec();
+        });
+    }
+
+    if (saveTaskSpecButton) {
+        saveTaskSpecButton.addEventListener('click', saveResearchTaskSpec);
     }
 
     // --- Station Config Functionality ---
@@ -3762,12 +5639,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (currentStationStatus) currentStationStatus.textContent = `Current: ${config.station_status || '(empty)'}`;
                 if (currentStationName) currentStationName.textContent = `Current: ${config.station_name || '(empty)'}`;
                 if (currentStationDescription) currentStationDescription.textContent = `Current: ${config.station_description || '(empty)'}`;
-                cachedSyncMode = config.sync_mode || 'parallel';
-                const syncModeDisplay = formatSyncModeForDisplay(cachedSyncMode);
-                
                 // Set read-only field
                 if (updateStationId) updateStationId.value = config.station_id || 'Unknown';
-                if (updateStationSyncMode) updateStationSyncMode.value = syncModeDisplay;
                 
                 // Clear input fields so placeholders show (users must type to change)
                 if (updateStationStatus) updateStationStatus.value = '';
@@ -3797,7 +5670,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const currentVersion = stationVersionDashboard ? stationVersionDashboard.textContent : "N/A";
         const currentTick = stationTickDashboard ? stationTickDashboard.textContent : "N/A";
         const currentStatus = cachedStationStatus || "Unknown";
-        const currentSyncMode = formatSyncModeForDisplay(cachedSyncMode);
 
         if (stationName && stationName.trim()) {
             // Update page title with station name
@@ -3808,7 +5680,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 `Station: <span class="font-semibold text-cyan-400">${escapeHtml(stationName)}</span> | ` +
                 `Version: <span id="station-version-dashboard" class="font-semibold">${currentVersion}</span> | ` +
                 `Station Tick: <span id="station-tick-dashboard" class="font-semibold">${currentTick}</span> | ` +
-                `Sync: <span id="station-sync-mode-dashboard" class="font-semibold">${escapeHtml(currentSyncMode)}</span> | ` +
                 `Status: <span id="station-status-dashboard" class="font-semibold">${currentStatus}</span>`;
         } else {
             // Update page title to default
@@ -3818,22 +5689,13 @@ document.addEventListener('DOMContentLoaded', () => {
             headerRightDiv.innerHTML =
                 `Station Version: <span id="station-version-dashboard" class="font-semibold">${currentVersion}</span> | ` +
                 `Station Tick: <span id="station-tick-dashboard" class="font-semibold">${currentTick}</span> | ` +
-                `Sync: <span id="station-sync-mode-dashboard" class="font-semibold">${escapeHtml(currentSyncMode)}</span> | ` +
                 `Status: <span id="station-status-dashboard" class="font-semibold">${currentStatus}</span>`;
         }
 
         // Important: Re-cache element references after DOM manipulation
         stationTickDashboard = document.getElementById('station-tick-dashboard');
         stationVersionDashboard = document.getElementById('station-version-dashboard');
-        stationSyncModeDashboard = document.getElementById('station-sync-mode-dashboard');
         stationStatusDashboard = document.getElementById('station-status-dashboard');
-    }
-
-    function formatSyncModeForDisplay(syncMode) {
-        const normalized = String(syncMode || 'parallel').trim().toLowerCase();
-        if (normalized === 'parallel') return 'Parallel';
-        if (normalized === 'sequential') return 'Sequential';
-        return normalized ? normalized.charAt(0).toUpperCase() + normalized.slice(1) : 'Parallel';
     }
 
     function updateStationStatusInHeader(newStatus) {

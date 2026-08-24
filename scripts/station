@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m station_tools.cli "$@"

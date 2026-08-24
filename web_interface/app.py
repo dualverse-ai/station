@@ -18,11 +18,11 @@ import sys
 import json
 import argparse
 import hashlib
+import html
 import threading
 import time
 from datetime import timedelta
 from functools import wraps
-from queue import Queue, Empty as QueueEmpty # Renamed to avoid conflict
 from flask import Flask, request, jsonify, render_template, Response, session, redirect, url_for
 from flask_httpauth import HTTPBasicAuth
 from typing import Dict, Any, Optional
@@ -46,20 +46,46 @@ from station import file_io_utils
 from station import runtime_api_config
 from station import capsule as capsule_module
 from station import __version__ 
+from station.multistart import ipc as multistart_ipc
+from station.multistart import waiting as multistart_waiting
+from web_interface import multistart_preview
 from station.llm_connectors.presets import load_model_presets
 from station.system_messages import build_station_level_system_prompt
 from web_interface.archive_utils import (
     build_archive_detail_payload,
     build_archive_list_payload,
 )
+from web_interface.archive_survey_service import (
+    WebArchiveSurveyBusyError,
+    WebArchiveSurveyNotFoundError,
+    WebArchiveSurveyService,
+    build_web_archive_survey_templates,
+)
+from web_interface.question_utils import (
+    build_question_detail_payload,
+    build_question_list_payload,
+    build_question_survey_preview,
+)
+from web_interface.task_spec_utils import (
+    TaskSpecConflictError,
+    get_task_spec_snapshot,
+    save_task_spec_snapshot,
+)
 from web_interface.input_utils import normalize_optional_role_definition
+from web_interface.live_event_broker import DashboardEventBroker
 from web_interface.stream_utils import sanitize_stream_event_payload as _sanitize_stream_event_payload
 
 # --- Global Variables ---
 OPERATION_MODE: str = "api" 
 station_instance: Optional[Station] = None
 orchestrator_instance: Optional[Orchestrator] = None
-orchestrator_log_queue = Queue() 
+orchestrator_event_broker = DashboardEventBroker()
+web_archive_survey_service: Optional[WebArchiveSurveyService] = None
+web_archive_survey_service_lock = threading.Lock()
+station_statistics_lock = threading.Lock()
+station_statistics_cache: Optional[Dict[str, Any]] = None
+research_evaluator_refresh_lock = threading.Lock()
+research_evaluator_refresh_state: Dict[str, Any] = {"status": "idle"}
 
 
 
@@ -85,6 +111,415 @@ app.config["SESSION_COOKIE_NAME"] = _env_cookie_name or _build_session_cookie_na
 # ProxyFix for handling X-Forwarded headers correctly
 from werkzeug.middleware.proxy_fix import ProxyFix
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+
+def _multistart_waiting_response():
+    status = multistart_waiting.public_status()
+    initial_status_json = json.dumps(status, separators=(",", ":")).replace("</", "<\\/")
+    page_title = html.escape(str(status.get("station_name") or "Station"), quote=True)
+    response_html = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{page_title}</title>
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --line: #d7dde8;
+      --text: #18212f;
+      --muted: #5f6f86;
+      --accent: #2563eb;
+      --good: #0f766e;
+      --warn: #9a5b00;
+      --bad: #b42318;
+      --chip: #eef2f8;
+    }}
+    body {{
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }}
+    main {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 42px; }}
+    header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+    }}
+    .title-row {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }}
+    h1 {{ margin: 0; font-size: 26px; line-height: 1.2; letter-spacing: 0; }}
+    p {{ margin: 0; line-height: 1.55; color: var(--muted); }}
+    .updated {{ font-size: 13px; color: var(--muted); white-space: nowrap; padding-top: 6px; }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }}
+    .metric .label {{ font-size: 12px; color: var(--muted); margin-bottom: 4px; }}
+    .metric .value {{ font-size: 18px; font-weight: 650; overflow-wrap: anywhere; }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }}
+    .panel-head {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .panel-head h2 {{ margin: 0; font-size: 16px; }}
+    .hint {{ color: var(--muted); font-size: 13px; }}
+    .controls {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }}
+    .control-button {{
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 650;
+      line-height: 1;
+      padding: 8px 11px;
+      cursor: pointer;
+    }}
+    .control-button.primary {{
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }}
+    .control-button:disabled {{
+      cursor: not-allowed;
+      opacity: 0.45;
+    }}
+    .control-state {{
+      color: var(--muted);
+      font-size: 13px;
+      min-width: 0;
+      text-align: right;
+    }}
+    .action-message {{
+      color: var(--muted);
+      font-size: 13px;
+      min-height: 18px;
+      text-align: right;
+      white-space: nowrap;
+    }}
+    .action-message.error {{ color: var(--bad); }}
+    .table-wrap {{ overflow-x: auto; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 900px; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid #edf0f5; text-align: left; font-size: 13px; vertical-align: top; }}
+    th {{ color: var(--muted); font-weight: 650; background: #fafbfe; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    .status {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: var(--chip);
+      color: var(--text);
+      font-weight: 600;
+      white-space: nowrap;
+    }}
+    .status.running, .status.interviewing {{ color: var(--accent); background: #eaf1ff; }}
+    .status.paused {{ color: var(--warn); background: #fff7e8; }}
+    .status.completed {{ color: var(--good); background: #e7f6f2; }}
+    .status.failed {{ color: var(--bad); background: #fff0ed; }}
+    .status.waiting_quiescent {{ color: var(--warn); background: #fff7e8; }}
+    .progress {{
+      height: 8px;
+      border-radius: 999px;
+      background: #e7ebf2;
+      overflow: hidden;
+      width: 100%;
+      min-width: 86px;
+      margin-top: 5px;
+    }}
+    .bar {{ height: 100%; width: 0; background: var(--accent); }}
+    .small {{ color: var(--muted); font-size: 12px; margin-top: 3px; }}
+    .tick-value {{ font-size: 15px; font-weight: 650; }}
+    .progress-cell {{ min-width: 130px; }}
+    .note {{ max-width: 270px; overflow-wrap: anywhere; }}
+    .empty {{ padding: 24px 16px; color: var(--muted); }}
+    .preview-link {{
+      display: inline-flex;
+      align-items: center;
+      margin-top: 12px;
+      padding: 8px 12px;
+      border-radius: 7px;
+      background: var(--accent);
+      color: white;
+      font-weight: 650;
+      text-decoration: none;
+    }}
+    @media (max-width: 900px) {{
+      header {{ display: block; }}
+      .updated {{ margin-top: 8px; }}
+      .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .panel-head {{ grid-template-columns: 1fr; }}
+      .controls {{ justify-content: flex-start; overflow-x: auto; }}
+      .control-state, .action-message {{ text-align: left; }}
+    }}
+    @media (max-width: 520px) {{
+      main {{ width: min(100vw - 20px, 1180px); padding-top: 18px; }}
+      .summary {{ grid-template-columns: 1fr; }}
+      h1 {{ font-size: 22px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="title-row">
+          <h1>Multistart is working</h1>
+        </div>
+        <p>Candidate starts are running independently. Seed 1 is available as a read-only Station preview and may not be the branch ultimately selected.</p>
+        <a class="preview-link" href="/dashboard">View Seed 1 dashboard</a>
+      </div>
+      <div class="updated" id="updated">Loading...</div>
+    </header>
+    <section class="summary" aria-label="Multistart summary">
+      <div class="metric"><div class="label">Mode</div><div class="value" id="mode">-</div></div>
+      <div class="metric"><div class="label">Stage</div><div class="value" id="stage">-</div></div>
+      <div class="metric"><div class="label">Job</div><div class="value mono" id="job">-</div></div>
+      <div class="metric"><div class="label">Branch span tick</div><div class="value" id="branchTick">-</div></div>
+      <div class="metric"><div class="label">Seeds</div><div class="value" id="seeds">-</div></div>
+      <div class="metric"><div class="label">Parallel</div><div class="value" id="parallel">-</div></div>
+      <div class="metric"><div class="label">Active coders</div><div class="value" id="activeCoders">-</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Candidate Branches</h2>
+        <div class="controls">
+          <span class="control-state" id="controlState">Control: -</span>
+          <button class="control-button" id="pauseButton" type="button">Pause</button>
+          <button class="control-button primary" id="resumeButton" type="button">Resume</button>
+          <div class="action-message" id="actionMessage"></div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Seed</th>
+              <th>Status</th>
+              <th>Station</th>
+              <th>Tick</th>
+              <th>Progress</th>
+              <th>Top eval</th>
+              <th>Top score</th>
+              <th>Coders</th>
+              <th>PID</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="branches"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="empty" hidden>No branch information is available yet.</div>
+    </section>
+  </main>
+  <script>
+    const initialStatus = {initial_status_json};
+    const text = (value) => value === null || value === undefined || value === "" ? "-" : String(value);
+    const esc = (value) => text(value).replace(/[&<>"']/g, (ch) => ({{"&": "&amp;", "<": "&lt;", ">": "&gt;", "\\"": "&quot;", "'": "&#39;"}}[ch]));
+    const cls = (value) => text(value).toLowerCase().replace(/[^a-z0-9_]+/g, "_");
+
+    function setText(id, value) {{
+      document.getElementById(id).textContent = text(value);
+    }}
+
+    function tickCell(branch) {{
+      const current = branch.current_tick ?? "-";
+      const age = branch.last_tick_timestamp ? formatAge((Date.now() / 1000) - branch.last_tick_timestamp) : text(branch.last_tick_age_display);
+      return `
+        <div class="mono tick-value">${{esc(current)}}</div>
+        <div class="small">last tick ${{esc(age)}} ago</div>
+      `;
+    }}
+
+    function progressCell(branch) {{
+      const percent = branch.progress_percent ?? 0;
+      const done = Number(branch.progress_done_ticks);
+      const total = Number(branch.progress_total_ticks);
+      const branchProgress = Number.isFinite(done) && Number.isFinite(total) && total > 0
+        ? `<div class="small mono">${{done}} / ${{total}} branch ticks</div>`
+        : "";
+      return `
+        ${{branchProgress}}
+        <div class="progress" aria-hidden="true"><div class="bar" style="width:${{percent}}%"></div></div>
+      `;
+    }}
+
+    function formatAge(seconds) {{
+      const value = Number(seconds);
+      if (!Number.isFinite(value)) return "-";
+      const clamped = Math.max(0, value);
+      if (clamped < 60) return `${{Math.floor(clamped)}}s`;
+      if (clamped < 3600) return `${{Math.floor(clamped / 60)}}m`;
+      return `${{Math.floor(clamped / 3600)}}h ${{Math.floor((clamped % 3600) / 60)}}m`;
+    }}
+
+    function coderCell(branch) {{
+      const ev = branch.evaluations || {{}};
+      const count = ev.active_coders ?? 0;
+      const ids = ev.active_evaluation_ids || [];
+      return `<div>${{esc(count)}}</div><div class="small mono">${{ids.length ? "eval " + ids.map(esc).join(", ") : ""}}</div>`;
+    }}
+
+    function render(status) {{
+      setText("mode", status.mode || "multistart");
+      setText("stage", status.stage || status.status || "-");
+      setText("job", status.job_id || "pending");
+      document.title = status.station_name || "Station";
+      const branchStart = Number(status.branch_tick);
+      const rollTicks = Number(status.roll_ticks);
+      const branchSpan = Number.isFinite(branchStart) && Number.isFinite(rollTicks)
+        ? `${{branchStart}}/${{branchStart + rollTicks}}`
+        : status.branch_tick;
+      setText("branchTick", branchSpan);
+      setText("seeds", `${{status.counts?.completed ?? 0}}/${{status.seed_count ?? "?"}} done`);
+      setText("parallel", status.max_parallel);
+      setText("activeCoders", status.active_coders ?? 0);
+      document.getElementById("updated").textContent = `Last refresh: ${{new Date().toLocaleString()}} (Refresh every 5s)`;
+      renderControls(status);
+
+      const tbody = document.getElementById("branches");
+      const empty = document.getElementById("empty");
+      const branches = status.branches || [];
+      empty.hidden = branches.length > 0;
+      tbody.innerHTML = branches.map((branch) => `
+        <tr>
+          <td class="mono">s${{branch.seed}}${{branch.selected ? " *" : ""}}</td>
+          <td><span class="status ${{cls(branch.status)}}">${{esc(branch.status)}}</span></td>
+          <td>
+            <div>${{esc(branch.station_label || branch.station_name || ("Seed " + branch.seed))}}</div>
+            <div class="small mono">${{esc(branch.data_dir)}}</div>
+          </td>
+          <td>${{tickCell(branch)}}</td>
+          <td class="progress-cell">${{progressCell(branch)}}</td>
+          <td class="mono">${{esc(branch.top_evaluation_id)}}<div class="small">tick ${{esc(branch.top_tick)}}</div></td>
+          <td class="mono">${{esc(branch.top_score_display)}}</td>
+          <td>${{coderCell(branch)}}</td>
+          <td class="mono">${{esc(branch.pid)}}</td>
+          <td class="note">${{esc(branch.note)}}</td>
+        </tr>
+      `).join("");
+    }}
+
+    function hasPauseTarget(status) {{
+      return (status.branches || []).some((branch) => {{
+        const statusText = text(branch.status).toLowerCase();
+        const current = Number(branch.current_tick);
+        const target = Number(branch.target_tick);
+        if (["completed", "failed", "interviewing", "waiting_quiescent"].includes(statusText)) return false;
+        if (Number.isFinite(current) && Number.isFinite(target) && current >= target) return false;
+        return ["pending", "running", "paused"].includes(statusText);
+      }});
+    }}
+
+    function hasResumeTarget(status) {{
+      return (status.branches || []).some((branch) => {{
+        const statusText = text(branch.status).toLowerCase();
+        if (["completed", "interviewing", "waiting_quiescent"].includes(statusText)) return false;
+        return ["pending", "running", "paused", "failed"].includes(statusText);
+      }});
+    }}
+
+    function renderControls(status) {{
+      const control = text(status.control || "running").toLowerCase();
+      const pauseButton = document.getElementById("pauseButton");
+      const resumeButton = document.getElementById("resumeButton");
+      const active = Boolean(status.active);
+      const canPause = hasPauseTarget(status);
+      const jobFailed = text(status.status).toLowerCase() === "failed";
+      const canResume = jobFailed || hasResumeTarget(status);
+      pauseButton.disabled = !active || control === "paused" || !canPause;
+      resumeButton.disabled = !active || !canResume;
+      document.getElementById("controlState").textContent = `Control: ${{control}}`;
+    }}
+
+    async function sendControl(action) {{
+      const pauseButton = document.getElementById("pauseButton");
+      const resumeButton = document.getElementById("resumeButton");
+      const message = document.getElementById("actionMessage");
+      pauseButton.disabled = true;
+      resumeButton.disabled = true;
+      message.classList.remove("error");
+      message.textContent = `${{action === "pause" ? "Pause" : "Resume"}} requested...`;
+      try {{
+        const response = await fetch(`/api/multistart/${{action}}`, {{method: "POST", cache: "no-store"}});
+        const payload = await response.json();
+        if (!payload.success) {{
+          message.classList.add("error");
+          message.textContent = payload.message || payload.error || "Control request failed.";
+        }} else {{
+          message.textContent = payload.message || "Control request accepted.";
+          if (payload.status) render(payload.status);
+        }}
+      }} catch (_error) {{
+        message.classList.add("error");
+        message.textContent = "Control request failed; retry after the controller is reachable.";
+      }} finally {{
+        refresh();
+      }}
+    }}
+
+    async function refresh() {{
+      try {{
+        const response = await fetch("/api/multistart/status", {{cache: "no-store"}});
+        const payload = await response.json();
+        if (payload.success && !payload.multistart?.active) {{
+          window.location.replace("/dashboard");
+          return;
+        }}
+        if (payload.success) render(payload.multistart);
+      }} catch (_error) {{
+        document.getElementById("updated").textContent = "Refresh failed; retrying...";
+      }}
+    }}
+
+    document.getElementById("pauseButton").addEventListener("click", () => sendControl("pause"));
+    document.getElementById("resumeButton").addEventListener("click", () => sendControl("resume"));
+    render(initialStatus);
+    window.setInterval(refresh, 5000);
+  </script>
+</body>
+</html>"""
+    return Response(response_html, mimetype="text/html")
 
 # Import Flask utilities after app creation
 # --- Authentication Setup ---
@@ -153,6 +588,18 @@ def require_auth():
     # Default: send to login form
     return redirect(url_for("login_page", next=request.path))
 
+
+@app.before_request
+def lock_multistart_preview_mutations():
+    """Keep the seed preview observational even if a client bypasses disabled controls."""
+    if OPERATION_MODE != "multistart_preview" or multistart_preview.request_allowed(request.method, request.path):
+        return None
+    return jsonify({
+        "success": False,
+        "error": "multistart_preview_read_only",
+        "message": "Seed 1 is a read-only multistart preview. Use the multistart page for job controls.",
+    }), 423
+
 @app.route("/login", methods=["GET"])
 def login_page():
     if not constants.WEB_AUTH_ENABLED:
@@ -185,9 +632,6 @@ def logout():
     return redirect(url_for("login_page"))
 
 def _get_parallel_tick_status() -> Optional[Dict[str, Any]]:
-    if getattr(constants, "SYNC_MODE", constants.SYNC_MODE_PARALLEL) != constants.SYNC_MODE_PARALLEL:
-        return None
-
     try:
         from station.sync.parallel_status import load_parallel_tick_status
 
@@ -196,9 +640,33 @@ def _get_parallel_tick_status() -> Optional[Dict[str, Any]]:
         return {"active": False, "error": str(exc)}
 
 
+def _web_archive_survey_owner() -> str:
+    if session.get("user"):
+        return str(session["user"])
+    if request.authorization and request.authorization.username:
+        return str(request.authorization.username)
+    return "dashboard"
+
+
+def _get_web_archive_survey_service() -> WebArchiveSurveyService:
+    global web_archive_survey_service
+    if web_archive_survey_service is None:
+        with web_archive_survey_service_lock:
+            if web_archive_survey_service is None:
+                web_archive_survey_service = WebArchiveSurveyService(constants.BASE_STATION_DATA_PATH)
+    web_archive_survey_service.ensure_worker_started()
+    return web_archive_survey_service
+
+
 # --- Initialization ---
 def initialize_station_and_orchestrator():
     global station_instance, orchestrator_instance, OPERATION_MODE
+    if multistart_waiting.waiting_mode_active():
+        OPERATION_MODE = "multistart_preview"
+        station_instance = None
+        orchestrator_instance = None
+        print("Initializing application in read-only multistart seed preview mode.")
+        return
     OPERATION_MODE = "api"
     print(f"Initializing application in '{OPERATION_MODE}' mode.")
     runtime_api_config.validate_provider_backup_env_config()
@@ -210,14 +678,14 @@ def initialize_station_and_orchestrator():
                 getattr(station_instance, "station_id", "unknown")
             )
             app.config["SESSION_COOKIE_NAME"] = station_cookie_name
-        orchestrator_log_queue.put({"event": "status_update", "data": {"message": "Station instance initialized."}, "timestamp": time.time()})
+        orchestrator_event_broker.put({"event": "status_update", "data": {"message": "Station instance initialized."}, "timestamp": time.time()})
 
         orchestrator_instance = Orchestrator(
             station_instance, 
             auto_prepare_on_init=True, # Will be prepared by UI action
-            log_event_queue=orchestrator_log_queue
+            log_event_queue=orchestrator_event_broker
         )
-        orchestrator_log_queue.put({"event": "status_update", "data": {"message": "Orchestrator instance created for API mode (idle)."}, "timestamp": time.time()})
+        orchestrator_event_broker.put({"event": "status_update", "data": {"message": "Orchestrator instance created for API mode (idle)."}, "timestamp": time.time()})
 
     except Exception as e:
         print(f"CRITICAL ERROR during initialization: {e}")
@@ -225,7 +693,7 @@ def initialize_station_and_orchestrator():
         traceback.print_exc()
         station_instance = None
         orchestrator_instance = None
-        orchestrator_log_queue.put({"event": "error", "data": {"message": f"Station/Orchestrator initialization failed: {str(e)}"}, "timestamp": time.time()})
+        orchestrator_event_broker.put({"event": "error", "data": {"message": f"Station/Orchestrator initialization failed: {str(e)}"}, "timestamp": time.time()})
 
 # --- HTML Serving Routes ---
 @app.route('/')
@@ -236,12 +704,70 @@ def root_redirect_route():
 @app.route('/dashboard')
 @auth_required
 def dashboard_page():
+    preview = None
+    if OPERATION_MODE == "multistart_preview":
+        preview = multistart_preview.dashboard_context()
+        if preview is None:
+            return _multistart_waiting_response()
     model_presets = load_model_presets()
-    return render_template('dashboard.html', operation_mode=OPERATION_MODE, model_presets=model_presets)
+    return render_template(
+        'dashboard.html',
+        operation_mode=OPERATION_MODE,
+        model_presets=model_presets,
+        multistart_preview=preview,
+    )
+
+
+@app.route('/multistart')
+@auth_required
+def multistart_page():
+    if not multistart_waiting.waiting_mode_active():
+        return redirect(url_for('dashboard_page'))
+    return _multistart_waiting_response()
+
+
+@app.route('/api/multistart/status', methods=['GET'])
+@auth_required
+def multistart_status_route():
+    return jsonify({
+        "success": True,
+        "multistart": multistart_waiting.public_status(),
+    })
+
+
+@app.route('/api/multistart/pause', methods=['POST'])
+@auth_required
+def multistart_pause_route():
+    response = multistart_ipc.request_pause_branches()
+    status = response.get("status") if isinstance(response, dict) else None
+    return jsonify({
+        "success": bool(response.get("success")) if isinstance(response, dict) else False,
+        "message": response.get("message") if isinstance(response, dict) else None,
+        "error": response.get("error") if isinstance(response, dict) else "invalid controller response",
+        "status": status,
+    })
+
+
+@app.route('/api/multistart/resume', methods=['POST'])
+@auth_required
+def multistart_resume_route():
+    response = multistart_ipc.request_resume_branches()
+    status = response.get("status") if isinstance(response, dict) else None
+    return jsonify({
+        "success": bool(response.get("success")) if isinstance(response, dict) else False,
+        "message": response.get("message") if isinstance(response, dict) else None,
+        "error": response.get("error") if isinstance(response, dict) else "invalid controller response",
+        "status": status,
+    })
 
 
 @app.route('/api/archive/papers', methods=['GET'])
 def archive_papers_list_route():
+    if OPERATION_MODE == "multistart_preview":
+        view = multistart_preview.capsule_view()
+        if view is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        return jsonify({"success": True, **build_archive_list_payload(view)})
     if OPERATION_MODE != "api" or not station_instance:
         return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
 
@@ -255,6 +781,12 @@ def archive_papers_list_route():
 
 @app.route('/api/archive/papers/<int:numeric_id>', methods=['GET'])
 def archive_paper_detail_route(numeric_id: int):
+    if OPERATION_MODE == "multistart_preview":
+        view = multistart_preview.capsule_view()
+        payload = build_archive_detail_payload(view, numeric_id) if view else None
+        if not payload:
+            return jsonify({"success": False, "error": f"Archive paper #{numeric_id} not found."}), 404
+        return jsonify({"success": True, **payload})
     if OPERATION_MODE != "api" or not station_instance:
         return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
 
@@ -267,9 +799,191 @@ def archive_paper_detail_route(numeric_id: int):
         app.logger.error(f"Error loading archive paper #{numeric_id}: {e}")
         return jsonify({"success": False, "error": f"Failed to load archive paper #{numeric_id}: {str(e)}"}), 500
 
+
+@app.route('/api/web/archive-surveys/templates', methods=['GET'])
+@auth_required
+def web_archive_survey_templates_route():
+    return jsonify({"success": True, "templates": build_web_archive_survey_templates()})
+
+
+@app.route('/api/web/archive-surveys', methods=['GET'])
+@auth_required
+def web_archive_surveys_list_route():
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    try:
+        service = _get_web_archive_survey_service()
+        return jsonify({
+            "success": True,
+            "surveys": service.store.list(_web_archive_survey_owner()),
+        })
+    except Exception as exc:
+        app.logger.error(f"Error loading web Archive surveys: {exc}")
+        return jsonify({"success": False, "error": f"Failed to load web surveys: {exc}"}), 500
+
+
+@app.route('/api/web/archive-surveys', methods=['POST'])
+@auth_required
+def web_archive_survey_submit_route():
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    if not constants.ARCHIVE_SURVEY_ENABLED:
+        return jsonify({"success": False, "error": "Archive Surveyor is disabled."}), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        archive_payload = build_archive_list_payload(capsule_module)
+        question_preview = build_question_survey_preview(capsule_module)
+        task_snapshot = get_task_spec_snapshot(constants)
+        current_tick = station_instance._get_current_tick() if hasattr(station_instance, "_get_current_tick") else None
+        service = _get_web_archive_survey_service()
+        record = service.submit(
+            owner=_web_archive_survey_owner(),
+            prompt=data.get("prompt"),
+            selected_archive_ids=data.get("selected_archive_ids"),
+            source_tick=current_tick,
+            task_spec_snapshot=task_snapshot.get("raw_markdown") or "",
+            archive_preview_snapshot=archive_payload.get("all_abstracts_markdown") or "",
+            question_preview_snapshot=question_preview,
+        )
+        summaries = service.store.list(_web_archive_survey_owner())
+        summary = next((item for item in summaries if int(item.get("id") or 0) == int(record["id"])), None)
+        return jsonify({
+            "success": True,
+            "survey": summary,
+            "message": f"Archive Survey #{record['id']} queued.",
+        })
+    except (ValueError, WebArchiveSurveyBusyError) as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.error(f"Error queueing web Archive survey: {exc}")
+        return jsonify({"success": False, "error": f"Failed to queue web survey: {exc}"}), 500
+
+
+@app.route('/api/web/archive-surveys/<int:survey_id>', methods=['GET'])
+@auth_required
+def web_archive_survey_detail_route(survey_id: int):
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    try:
+        record = _get_web_archive_survey_service().store.get(
+            survey_id,
+            owner=_web_archive_survey_owner(),
+            include_report=True,
+        )
+        session_data = record.get("session") if isinstance(record.get("session"), dict) else {}
+        return jsonify({
+            "success": True,
+            "survey": {
+                "id": record.get("id"),
+                "status": record.get("status"),
+                "prompt": record.get("prompt") or "",
+                "selected_archive_ids": record.get("selected_archive_ids") or [],
+                "source_tick": record.get("source_tick"),
+                "submitted_timestamp": record.get("submitted_timestamp"),
+                "started_timestamp": session_data.get("started_timestamp"),
+                "completed_timestamp": record.get("completed_timestamp"),
+                "error": record.get("error") or session_data.get("last_error"),
+                "report_markdown": record.get("report_markdown") or "",
+            },
+        })
+    except WebArchiveSurveyNotFoundError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    except Exception as exc:
+        app.logger.error(f"Error loading web Archive survey #{survey_id}: {exc}")
+        return jsonify({"success": False, "error": f"Failed to load web survey: {exc}"}), 500
+
+
+@app.route('/api/web/archive-surveys/<int:survey_id>', methods=['DELETE'])
+@auth_required
+def web_archive_survey_delete_route(survey_id: int):
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    try:
+        _get_web_archive_survey_service().store.delete(survey_id, _web_archive_survey_owner())
+        return jsonify({"success": True, "message": f"Archive Survey #{survey_id} removed."})
+    except WebArchiveSurveyNotFoundError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+    except WebArchiveSurveyBusyError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 409
+    except Exception as exc:
+        app.logger.error(f"Error deleting web Archive survey #{survey_id}: {exc}")
+        return jsonify({"success": False, "error": f"Failed to remove web survey: {exc}"}), 500
+
+
+@app.route('/api/questions', methods=['GET'])
+def question_room_list_route():
+    if OPERATION_MODE == "multistart_preview":
+        view = multistart_preview.capsule_view()
+        if view is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        payload = build_question_list_payload(
+            view,
+            page=request.args.get("page", default=1, type=int) or 1,
+            page_size=request.args.get("page_size", default=100, type=int) or 100,
+            sort_by=request.args.get("sort_by", default="authored_tick", type=str),
+            sort_direction=request.args.get("sort_direction", default="desc", type=str),
+        )
+        return jsonify({"success": True, **payload})
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+
+    try:
+        payload = build_question_list_payload(
+            capsule_module,
+            page=request.args.get("page", default=1, type=int) or 1,
+            page_size=request.args.get("page_size", default=100, type=int) or 100,
+            sort_by=request.args.get("sort_by", default="authored_tick", type=str),
+            sort_direction=request.args.get("sort_direction", default="desc", type=str),
+        )
+        return jsonify({"success": True, **payload})
+    except Exception as e:
+        app.logger.error(f"Error loading Question Room activity: {e}")
+        return jsonify({"success": False, "error": f"Could not load questions: {str(e)}"}), 500
+
+
+@app.route('/api/questions/<int:numeric_id>', methods=['GET'])
+def question_room_detail_route(numeric_id: int):
+    if OPERATION_MODE == "multistart_preview":
+        view = multistart_preview.capsule_view()
+        payload = build_question_detail_payload(view, numeric_id) if view else None
+        if not payload:
+            return jsonify({"success": False, "error": f"Question #{numeric_id} not found."}), 404
+        return jsonify({"success": True, **payload})
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+
+    try:
+        payload = build_question_detail_payload(capsule_module, numeric_id)
+        if not payload:
+            return jsonify({"success": False, "error": f"Question #{numeric_id} not found."}), 404
+        return jsonify({"success": True, **payload})
+    except Exception as e:
+        app.logger.error(f"Error loading Question Room thread #{numeric_id}: {e}")
+        return jsonify({"success": False, "error": f"Could not load Question #{numeric_id}: {str(e)}"}), 500
+
 # --- API Endpoints - Orchestrator Control (API Mode) ---
 @app.route('/api/orchestrator/status', methods=['GET'])
 def get_orchestrator_status_route():
+    if OPERATION_MODE == "multistart_preview":
+        status = multistart_preview.orchestrator_status()
+        if status is None:
+            return jsonify({
+                "success": False,
+                "error": "Seed 1 preview is unavailable during multistart finalization.",
+                "status": {
+                    "is_running": False,
+                    "is_prepared": False,
+                    "is_paused": True,
+                    "current_tick": -1,
+                    "turn_order": [],
+                    "agents_awaiting_human": [],
+                    "read_only": True,
+                },
+            }), 200
+        return jsonify({
+            "success": True,
+            "status": status,
+        })
     if OPERATION_MODE != "api" or not orchestrator_instance or not station_instance:
         return jsonify({"success": False, "error": "Orchestrator not active or not in API mode.", 
                         "status": {"is_running": False, "is_prepared": False, "is_paused": False, "current_tick": -1, "turn_order":[], "agents_awaiting_human": []}}), 200
@@ -279,7 +993,6 @@ def get_orchestrator_status_route():
         "is_prepared": orchestrator_instance.is_prepared, # ADDED
         "is_running": orchestrator_instance.is_running,
         "is_paused": orchestrator_instance.is_paused,
-        "sync_mode": getattr(constants, "SYNC_MODE", constants.SYNC_MODE_PARALLEL),
         "pause_requested": orchestrator_instance.pause_requested,
         "pause_condition_met": orchestrator_instance.pause_condition_met,
         "pause_reason": orchestrator_instance.get_pause_reason(),
@@ -288,11 +1001,6 @@ def get_orchestrator_status_route():
         "current_tick": station_instance._get_current_tick(),
         "station_status": station_instance.config.get(constants.STATION_CONFIG_STATION_STATUS, "Unknown"),
         "turn_order": list(orchestrator_instance.agent_turn_order),
-        "next_agent_index": orchestrator_instance.current_agent_index_in_turn_order,
-        "next_agent_to_act": (orchestrator_instance.agent_turn_order[orchestrator_instance.current_agent_index_in_turn_order]
-                              if orchestrator_instance.agent_turn_order and
-                                 0 <= orchestrator_instance.current_agent_index_in_turn_order < len(orchestrator_instance.agent_turn_order)
-                              else "N/A"),
         "parallel_tick_status": _get_parallel_tick_status(),
         "agents_awaiting_human": agents_awaiting_human_list
     }
@@ -619,7 +1327,7 @@ def _transform_reviewer_history_to_agent_format(reviewer_entries):
 
 @app.route('/api/agent_dialogue_history/<agent_name>', methods=['GET'])
 def get_agent_dialogue_history_route(agent_name: str):
-    if not station_instance or not station_instance.agent_module:
+    if OPERATION_MODE != "multistart_preview" and (not station_instance or not station_instance.agent_module):
         return jsonify({"success": False, "error": "Station not properly initialized."}), 500
 
     load_full = request.args.get('full', 'false').lower() == 'true'
@@ -630,8 +1338,25 @@ def get_agent_dialogue_history_route(agent_name: str):
         tick_limit = 50
     tick_limit = max(1, min(tick_limit, 1000))
 
+    preview_source_modified_at_ns = None
+    if OPERATION_MODE == "multistart_preview":
+        preview_path = multistart_preview.dialogue_log_path(agent_name)
+        if preview_path is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        log_file_path = str(preview_path)
+        try:
+            preview_source_modified_at_ns = str(preview_path.stat().st_mtime_ns)
+        except OSError:
+            preview_source_modified_at_ns = None
+        requested_modified_at_ns = request.args.get("modified_at_ns")
+        if requested_modified_at_ns and requested_modified_at_ns == preview_source_modified_at_ns:
+            return jsonify({
+                "success": True,
+                "unchanged": True,
+                "source_modified_at_ns": preview_source_modified_at_ns,
+            })
     # Handle special case for Reviewer
-    if agent_name == "Reviewer":
+    elif agent_name == "Reviewer":
         # Use the archive room's LLM chat history file
         log_file_path = os.path.join(
             constants.BASE_STATION_DATA_PATH,
@@ -692,6 +1417,8 @@ def get_agent_dialogue_history_route(agent_name: str):
 
         # Use json.dumps with Response instead of jsonify to avoid Content-Length mismatch
         response_data = {"success": True, "history": history_entries, "is_truncated": is_truncated, "range": range_meta}
+        if OPERATION_MODE == "multistart_preview":
+            response_data["source_modified_at_ns"] = preview_source_modified_at_ns
         json_str = json.dumps(response_data)
         return Response(json_str, mimetype='application/json')
     except Exception as e:
@@ -701,11 +1428,21 @@ def get_agent_dialogue_history_route(agent_name: str):
 # --- General Station Info (Shared) ---
 @app.route('/api/station_tick', methods=['GET'])
 def get_station_tick_ep_v2(): # Renamed
+    if OPERATION_MODE == "multistart_preview":
+        status = multistart_preview.orchestrator_status()
+        if status is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        return jsonify({"success": True, "current_tick": status.get("current_tick", -1), "read_only": True})
     if not station_instance: return jsonify({"success": False, "error": "Station not initialized"}), 500
     return jsonify({"success": True, "current_tick": station_instance._get_current_tick()})
 
 @app.route('/api/agents', methods=['GET'])
 def get_agents_ep_v2(): # Renamed
+    if OPERATION_MODE == "multistart_preview":
+        preview_agents = multistart_preview.agents()
+        if preview_agents is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        return jsonify({"success": True, "agents": preview_agents, "read_only": True})
     if not station_instance: return jsonify({"success": False, "error": "Station not initialized"}), 500
     return jsonify({"success": True, "agents": station_instance.get_all_agents_summary()})
 
@@ -763,11 +1500,40 @@ def get_agent_system_prompt_ep(agent_name: str):
 @app.route('/api/station/statistics', methods=['GET'])
 def get_station_statistics():
     """Get station-wide statistics including pending human requests and top research submission"""
+    global station_statistics_cache
+    if OPERATION_MODE == "multistart_preview":
+        preview_stats = multistart_preview.statistics()
+        if preview_stats is None:
+            # Finalization clears current_job.yaml before start.sh stops the old
+            # preview process. Keep the safe-stop drain endpoint available for
+            # that short handoff window.
+            preview_stats = multistart_preview.handoff_statistics()
+        return jsonify({"success": True, "statistics": preview_stats})
     if not station_instance: 
         return jsonify({"success": False, "error": "Station not initialized"}), 500
     
+    # At most one request may refresh statistics. Polling clients receive the
+    # last complete snapshot instead of occupying every Gunicorn request thread
+    # behind a slow control-plane refresh.
+    if not station_statistics_lock.acquire(timeout=0.05):
+        if station_statistics_cache is not None:
+            return jsonify({
+                "success": True,
+                "statistics": station_statistics_cache,
+                "stale": True,
+            })
+        return jsonify({
+            "success": False,
+            "error": "Station statistics refresh is already in progress.",
+        }), 503
+
+    started_at = time.perf_counter()
     try:
         stats = station_instance.get_station_statistics()
+        station_statistics_cache = stats
+        elapsed = time.perf_counter() - started_at
+        if elapsed >= 1.0:
+            app.logger.warning("Station statistics refresh took %.3fs", elapsed)
         return jsonify({
             "success": True,
             "statistics": stats
@@ -778,6 +1544,8 @@ def get_station_statistics():
             "success": False,
             "error": f"Error getting station statistics: {str(e)}"
         }), 500
+    finally:
+        station_statistics_lock.release()
 
 @app.route('/api/station/version', methods=['GET'])
 def get_station_version():
@@ -790,6 +1558,11 @@ def get_station_version():
 @app.route('/api/station/config', methods=['GET'])
 def get_station_config():
     """Get station configuration information"""
+    if OPERATION_MODE == "multistart_preview":
+        config = multistart_preview.station_config()
+        if config is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        return jsonify({"success": True, "config": config})
     if not station_instance:
         return jsonify({"success": False, "error": "Station not initialized"}), 500
         
@@ -799,7 +1572,6 @@ def get_station_config():
             "station_name": station_instance.config.get(constants.STATION_CONFIG_NAME, ""),
             "station_description": station_instance.config.get(constants.STATION_CONFIG_DESCRIPTION, ""),
             "station_id": station_instance.config.get(constants.STATION_ID_KEY, "Unknown"),
-            "sync_mode": getattr(constants, "SYNC_MODE", "parallel"),
         }
         return jsonify({"success": True, "config": config})
     except Exception as e:
@@ -824,6 +1596,130 @@ def update_station_config():
         return jsonify(result)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/station/research_task_spec', methods=['GET'])
+@auth_required
+def get_research_task_spec():
+    """Return the complete raw Research Task Markdown for the admin editor."""
+    if OPERATION_MODE == "multistart_preview":
+        snapshot = multistart_preview.task_spec_snapshot()
+        if snapshot is None:
+            return jsonify({"success": False, "error": "Seed 1 preview is unavailable."}), 503
+        return jsonify({"success": True, **snapshot})
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    try:
+        return jsonify({"success": True, **get_task_spec_snapshot(constants)})
+    except Exception as e:
+        app.logger.error(f"Error loading Research Task specification: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/station/research_task_spec', methods=['PUT'])
+@auth_required
+def update_research_task_spec():
+    """Atomically replace the active Research Task Markdown."""
+    if OPERATION_MODE != "api" or not station_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "Invalid JSON payload."}), 400
+    try:
+        snapshot = save_task_spec_snapshot(
+            data.get("raw_markdown"),
+            expected_revision=str(data.get("expected_revision") or ""),
+            consts_module=constants,
+        )
+        return jsonify({
+            "success": True,
+            "message": "Research Task specification saved atomically.",
+            **snapshot,
+        })
+    except TaskSpecConflictError as e:
+        return jsonify({"success": False, "error": str(e), "conflict": True}), 409
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        app.logger.error(f"Error updating Research Task specification: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _set_research_evaluator_refresh_state(**values):
+    with research_evaluator_refresh_lock:
+        research_evaluator_refresh_state.clear()
+        research_evaluator_refresh_state.update(values)
+
+
+def _run_research_evaluator_refresh(evaluator_service, orchestrator, current_job_path):
+    try:
+        while orchestrator.is_running and not orchestrator.is_paused:
+            time.sleep(0.5)
+        if not orchestrator.is_running:
+            raise RuntimeError("Orchestrator stopped before evaluator refresh.")
+
+        _set_research_evaluator_refresh_state(status="draining")
+        while evaluator_service.has_pending_or_running():
+            time.sleep(1.0)
+        if file_io_utils.load_yaml(current_job_path):
+            raise RuntimeError("Evaluator refresh became invalid because multistart started.")
+
+        evaluator = evaluator_service.refresh_task_registry()
+        _set_research_evaluator_refresh_state(
+            status="completed",
+            evaluator_class=type(evaluator).__name__,
+            task_description=evaluator.get_task_description(),
+        )
+    except Exception as e:
+        app.logger.error(f"Error refreshing Research evaluator: {e}")
+        _set_research_evaluator_refresh_state(status="failed", error=str(e))
+
+
+@app.route('/api/station/research_evaluator/refresh', methods=['GET', 'POST'])
+@auth_required
+def refresh_research_evaluator():
+    """Request or inspect an asynchronous Research evaluator refresh."""
+    if OPERATION_MODE != "api" or not station_instance or not orchestrator_instance:
+        return jsonify({"success": False, "error": "Station not active or not in API mode."}), 503
+
+    if request.method == "GET":
+        with research_evaluator_refresh_lock:
+            refresh = dict(research_evaluator_refresh_state)
+        return jsonify({
+            "success": True,
+            "refresh": refresh,
+            "is_paused": bool(orchestrator_instance.is_paused),
+        })
+
+    current_job_path = os.path.join(project_root, "station_multistart", "current_job.yaml")
+    if file_io_utils.load_yaml(current_job_path):
+        return jsonify({"success": False, "error": "Evaluator refresh is unavailable during multistart."}), 409
+
+    evaluator_service = getattr(station_instance, "auto_research_evaluator", None)
+    if evaluator_service is None:
+        return jsonify({"success": False, "error": "Research evaluator is not running."}), 503
+    if not orchestrator_instance.is_running:
+        return jsonify({"success": False, "error": "Orchestrator is not running."}), 409
+
+    with research_evaluator_refresh_lock:
+        current_status = str(research_evaluator_refresh_state.get("status") or "idle")
+        if current_status not in {"requested", "draining"}:
+            research_evaluator_refresh_state.clear()
+            research_evaluator_refresh_state.update(status="requested")
+    if current_status in {"requested", "draining"}:
+        return jsonify({"success": True, "status": current_status}), 202
+
+    orchestrator_instance.request_manual_pause()
+    threading.Thread(
+        target=_run_research_evaluator_refresh,
+        args=(evaluator_service, orchestrator_instance, current_job_path),
+        daemon=True,
+    ).start()
+    return jsonify({
+        "success": True,
+        "status": "requested",
+        "message": "Evaluator refresh requested. Poll this endpoint for completion.",
+    }), 202
 
 
 @app.route('/api/station/api_runtime_config', methods=['GET'])
@@ -853,6 +1749,10 @@ def update_api_runtime_config():
                 orchestrator_instance.handle_runtime_api_config_updated(config.get("generation", 0))
             except Exception as e:
                 app.logger.warning(f"Failed to notify orchestrator of runtime API config update: {e}")
+        try:
+            multistart_ipc.notify_runtime_api_update(data)
+        except Exception as e:
+            app.logger.warning(f"Failed to notify multistart controller of runtime API config update: {e}")
 
         return jsonify({
             "success": True,
@@ -866,68 +1766,91 @@ def update_api_runtime_config():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-# --- SSE Stream ---
-@app.route('/api/orchestrator/live_log_stream') # Or your actual SSE route path
-def live_log_stream_route_ep_v2(): # Ensure this is the correct function name
+# --- Dashboard live-event transport ---
+@app.route('/api/orchestrator/live_log_stream')
+def live_log_stream_route():
     if OPERATION_MODE != "api":
         return Response("SSE only available in API mode.", status=403, mimetype='text/event-stream')
     selected_agent_name = request.args.get("agent_name") or None
+    requested_cursor = request.args.get("cursor")
     
     def event_stream():
-        # ... (connect_event yield as before) ...
-        app.logger.info("SSE client connected for live log stream.") # Use app.logger
-        connect_event = {"event": "stream_status", "data": {"message": "SSE client connected to live log."}, "timestamp": time.time()}
-        yield f"data: {json.dumps(connect_event)}\n\n"
-        
+        app.logger.info("SSE client connected for live log stream.")
+        cursor_state = orchestrator_event_broker.open_cursor(requested_cursor)
+        cursor = cursor_state.cursor
+        connect_event = {
+            "event": "stream_cursor",
+            "data": {
+                "cursor_reset": cursor_state.reset,
+                "dropped_count": cursor_state.dropped_count,
+            },
+            "timestamp": time.time(),
+            "stream_sequence": cursor,
+            "stream_epoch": orchestrator_event_broker.epoch,
+            "stream_control": True,
+        }
+        yield f"id: {cursor}\ndata: {json.dumps(connect_event)}\n\n"
+
         try:
             while True:
                 try:
-                    log_entry = orchestrator_log_queue.get(timeout=1) # Waits up to 1 second
-                    log_entry = _sanitize_stream_event_payload(log_entry, selected_agent_name)
-                    yield f"data: {json.dumps(log_entry)}\n\n"
-                except QueueEmpty:
-                    # Send a comment as a keep-alive signal
-                    yield ": keepalive\n\n"
-                except Exception as e_inner: 
+                    batch = orchestrator_event_broker.read_after(cursor, limit=50, wait_timeout=5)
+                    cursor = batch.cursor
+                    if not batch.events:
+                        yield ": keepalive\n\n"
+                        continue
+                    for sequence, raw_event in batch.events:
+                        log_entry = _sanitize_stream_event_payload(raw_event, selected_agent_name)
+                        log_entry = dict(log_entry)
+                        log_entry["stream_sequence"] = sequence
+                        log_entry["stream_epoch"] = orchestrator_event_broker.epoch
+                        yield f"id: {sequence}\ndata: {json.dumps(log_entry)}\n\n"
+                        cursor = sequence
+                except Exception as e_inner:
                     app.logger.error(f"Error during SSE event generation: {e_inner}")
-                    error_event = {"event": "stream_error", "data": {"message": f"SSE internal error: {str(e_inner)}"}}
-                    try:
-                        yield f"data: {json.dumps(error_event)}\n\n"
-                    except Exception as e_yield:
-                        app.logger.error(f"Error yielding SSE error event: {e_yield}")
-                    time.sleep(0.1) # Small delay before retrying get
-        except GeneratorExit: 
+                    return
+        except GeneratorExit:
             app.logger.info("SSE client disconnected (GeneratorExit).")
         except Exception as e_outer:
             app.logger.error(f"Critical error in SSE event_stream: {e_outer}")
         finally:
             app.logger.info("SSE event_stream closing for this client.")
             
-    return Response(event_stream(), content_type='text/event-stream')
+    return Response(
+        event_stream(),
+        content_type='text/event-stream',
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
-# --- Polling API (fallback for when SSE doesn't work) ---
 @app.route('/api/orchestrator/recent_events')
 def recent_events_route():
-    """Get recent events from the log queue for polling mode (fallback)"""
+    """Cursor-based fallback for clients that cannot keep an SSE connection."""
     if OPERATION_MODE != "api":
         return jsonify({"success": False, "message": "Recent events only available in API mode"}), 403
     selected_agent_name = request.args.get("agent_name") or None
-    
-    events = []
+    requested_cursor = request.args.get("cursor")
+    requested_limit = request.args.get("limit", default=50, type=int) or 50
+
     try:
-        # Drain up to 50 events from the queue without blocking
-        for _ in range(50):
-            try:
-                event = orchestrator_log_queue.get_nowait()
-                event = _sanitize_stream_event_payload(event, selected_agent_name)
-                events.append(event)
-            except QueueEmpty:
-                break
-        
+        batch = orchestrator_event_broker.read_after(requested_cursor, limit=requested_limit)
+        events = []
+        for sequence, raw_event in batch.events:
+            event = _sanitize_stream_event_payload(raw_event, selected_agent_name)
+            event = dict(event)
+            event["stream_sequence"] = sequence
+            event["stream_epoch"] = orchestrator_event_broker.epoch
+            events.append(event)
         return jsonify({
             "success": True,
             "events": events,
-            "count": len(events)
+            "count": len(events),
+            "cursor": batch.cursor,
+            "cursor_reset": batch.reset,
+            "dropped_count": batch.dropped_count,
+            "stream_epoch": orchestrator_event_broker.epoch,
         })
     except Exception as e:
         app.logger.error(f"Error getting recent events: {e}")
@@ -1175,6 +2098,11 @@ def create_backup_route():
 # For Gunicorn, initialize with default API mode since __name__ != '__main__'
 if station_instance is None:
     initialize_station_and_orchestrator()
+if station_instance is not None and constants.ARCHIVE_SURVEY_ENABLED:
+    try:
+        _get_web_archive_survey_service()
+    except Exception as exc:
+        app.logger.error(f"Failed to start or recover web Archive Surveyor: {exc}")
 
 # --- Shutdown API ---
 @app.route('/api/shutdown', methods=['POST'])
@@ -1182,6 +2110,8 @@ if station_instance is None:
 def api_shutdown():
     """Gracefully shutdown research evaluations"""
     try:
+        if web_archive_survey_service:
+            web_archive_survey_service.stop()
         if station_instance:
             print("API: Received shutdown request, cleaning up station...")
             # Stop all evaluation loops
@@ -1191,6 +2121,8 @@ def api_shutdown():
                 station_instance.stop_auto_archive_evaluator()
             if hasattr(station_instance, 'auto_archive_surveyor') and station_instance.auto_archive_surveyor:
                 station_instance.stop_auto_archive_surveyor()
+            if hasattr(station_instance, 'auto_external_reporter') and station_instance.auto_external_reporter:
+                station_instance.stop_auto_external_reporter()
             print("API: Station cleanup completed")
             return jsonify({"status": "success", "message": "Station cleanup completed"})
         else:
@@ -1219,7 +2151,9 @@ if __name__ == '__main__':
     if station_instance is None:
         initialize_station_and_orchestrator()
 
-    if not station_instance or not orchestrator_instance:
+    if OPERATION_MODE == "multistart_preview":
+        pass
+    elif not station_instance or not orchestrator_instance:
         print("FATAL: Station or Orchestrator instance could not be initialized. Exiting.")
         sys.exit(1)
 

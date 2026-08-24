@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import copy
 import os
+import re
+import shutil
 import threading
 import time
 from contextlib import contextmanager
@@ -40,6 +42,11 @@ from .runtime_paths import build_runtime_paths
 
 TERMINAL_EVALUATION_STATUSES = {"completed", "success", "failed", "blocked", "partial"}
 ACTIVE_EVALUATION_STATUSES = {"queued", "running"}
+STDOUT_STDERR_HIDDEN_NOTICE = (
+    "Stdout/stderr are not shown here. To retrieve information that was only printed in those logs, submit "
+    "another instruction asking the coder to summarize it in the Coder Report or copy the relevant data to "
+    "accessible Research storage."
+)
 
 
 def _normalize_evaluation_status(status: Optional[str]) -> Optional[str]:
@@ -181,6 +188,50 @@ def _get_final_attempt(eval_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not attempts:
         return None
     return attempts[-1]
+
+
+def _cleanup_eval_tmp_storage(eval_data: Dict[str, Any], evaluations_dir: str) -> bool:
+    eval_id = str(eval_data.get("id") or "")
+    status = _normalize_evaluation_status(eval_data.get("status"))
+    if not eval_id or status not in TERMINAL_EVALUATION_STATUSES:
+        return False
+
+    lineage = str(eval_data.get("lineage") or "unknown").lower()
+    research_root = _research_root_from_evaluations_dir(evaluations_dir)
+    storage_root = os.path.join(research_root, constants.RESEARCH_STORAGE_DIR)
+    storage_real_root = os.path.realpath(storage_root)
+    tmp_root = os.path.realpath(os.path.join(storage_real_root, "tmp"))
+    lineage_tmp = os.path.realpath(os.path.join(tmp_root, lineage))
+    eval_tmp = os.path.realpath(os.path.join(lineage_tmp, f"eval_{eval_id}"))
+
+    expected_basename = f"eval_{eval_id}"
+    if os.path.basename(eval_tmp) != expected_basename:
+        return False
+    try:
+        lineage_common = os.path.commonpath([tmp_root, lineage_tmp])
+        eval_common = os.path.commonpath([lineage_tmp, eval_tmp])
+    except ValueError:
+        return False
+    if lineage_common != tmp_root or eval_common != lineage_tmp:
+        return False
+    if not os.path.isdir(eval_tmp):
+        return False
+
+    try:
+        shutil.rmtree(eval_tmp)
+        try:
+            os.rmdir(lineage_tmp)
+        except OSError:
+            pass
+        return True
+    except Exception as exc:
+        print(
+            "EvaluationManager: failed to remove research tmp storage "
+            f"eval_id={eval_id!r} path={eval_tmp!r}: {exc}"
+        )
+        return False
+
+
 def format_tags_for_display(tags: Optional[List[str]]) -> str:
     if not tags:
         return "—"
@@ -235,6 +286,33 @@ def _format_secondary_metrics_for_display(evaluation_details: Any) -> Tuple[str,
     return message, formatted
 
 
+def _build_evaluation_preview_from_display_info(eval_id: str, display_info: Dict[str, Any]) -> str:
+    title = display_info.get(constants.EVALUATION_TITLE_KEY, "No title")
+    author = display_info.get(constants.EVALUATION_AUTHOR_KEY, "Unknown")
+    tags = display_info.get(constants.EVALUATION_TAGS_KEY, [])
+    abstract = display_info.get(constants.EVALUATION_ABSTRACT_KEY, "No abstract")
+    score = display_info.get(constants.EVALUATION_SCORE_KEY, constants.RESEARCH_SCORE_NA)
+
+    preview = (
+        f"**Evaluation {eval_id}: {title}**\n"
+        f"Author: {author}\n"
+        f"Tags: {format_tags_for_display(tags)}\n"
+        f"Abstract: {abstract}"
+    )
+    if not constants.RESEARCH_NO_SCORE:
+        display_score = "running" if score == constants.RESEARCH_SCORE_PENDING else format_score_for_display(score)
+        details_message = ""
+        if score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA):
+            details_message, metrics = extract_secondary_metrics_for_display_info(display_info)
+            score_parts = [display_score]
+            score_parts.extend(f"{key}: {value}" for key, value in metrics.items())
+            display_score = " | ".join(score_parts)
+        preview += f"\nScore: {display_score}"
+        if details_message:
+            preview += f"\nMessage:\n{details_message}"
+    return preview
+
+
 def _build_new_schema_display_info(eval_data: Dict[str, Any]) -> Dict[str, Any]:
     final = eval_data.get("final") or {}
     status = _normalize_evaluation_status(eval_data.get("status")) or "queued"
@@ -279,27 +357,7 @@ def build_evaluation_previews(eval_ids: List[str], evaluations_dir: Optional[str
             previews.append(f"**Evaluation {eval_id}:** Not found")
             continue
 
-        title = display_info.get(constants.EVALUATION_TITLE_KEY, "No title")
-        author = display_info.get(constants.EVALUATION_AUTHOR_KEY, "Unknown")
-        tags = display_info.get(constants.EVALUATION_TAGS_KEY, [])
-        abstract = display_info.get(constants.EVALUATION_ABSTRACT_KEY, "No abstract")
-        score = display_info.get(constants.EVALUATION_SCORE_KEY, constants.RESEARCH_SCORE_NA)
-
-        preview = (
-            f"**Evaluation {eval_id}: {title}**\n"
-            f"Author: {author}\n"
-            f"Tags: {format_tags_for_display(tags)}\n"
-            f"Abstract: {abstract}"
-        )
-        if not constants.RESEARCH_NO_SCORE:
-            display_score = "running" if score == constants.RESEARCH_SCORE_PENDING else format_score_for_display(score)
-            if score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA):
-                _, metrics = extract_secondary_metrics_for_display_info(display_info)
-                if metrics:
-                    metrics_string = " | ".join(f"{key}: {value}" for key, value in metrics.items())
-                    display_score = f"{display_score} | {metrics_string}"
-            preview += f"\nScore: {display_score}"
-        previews.append(preview)
+        previews.append(_build_evaluation_preview_from_display_info(eval_id, display_info))
     return previews
 
 
@@ -312,7 +370,6 @@ def _build_new_schema_review_info(eval_data: Dict[str, Any], evaluations_dir: Op
         }
 
     score = final.get("primary_score", constants.RESEARCH_SCORE_NA)
-    stdout_visible = _truncate_visible_stdout(_strip_attempt_footer(_load_eval_final_artifact(eval_data, "stdout", evaluations_dir)))
     coder_report = _load_eval_final_artifact(eval_data, "report", evaluations_dir).strip()
     instruction = str(eval_data.get("instruction", "")).strip()
     details = final.get(constants.EVALUATION_DETAILS_KEY, "")
@@ -338,7 +395,7 @@ def _build_new_schema_review_info(eval_data: Dict[str, Any], evaluations_dir: Op
 
     message += "\n\n**Coder Report:**\n"
     message += coder_report if coder_report else "_No coder report available._"
-    message += f"\n\n**Final Stdout:**\n```\n{stdout_visible}\n```"
+    message += f"\n\n**Stdout/Stderr:** {STDOUT_STDERR_HIDDEN_NOTICE}"
 
     return {"status": "completed", "message": message}
 
@@ -446,6 +503,7 @@ class EvaluationManager:
             rebuild=evaluation_index.should_rebuild_from_process_args(),
             log_status=preload,
         )
+        evaluation_index.refresh_top_submission_from_index(self.evaluations_dir)
         self.top_submission = evaluation_index.get_top_submission(self.evaluations_dir)
         self._preload_complete = True
 
@@ -570,27 +628,7 @@ class EvaluationManager:
                 previews.append(f"**Evaluation {eval_id}:** Not found")
                 continue
 
-            title = display_info.get(constants.EVALUATION_TITLE_KEY, "No title")
-            author = display_info.get(constants.EVALUATION_AUTHOR_KEY, "Unknown")
-            tags = display_info.get(constants.EVALUATION_TAGS_KEY, [])
-            abstract = display_info.get(constants.EVALUATION_ABSTRACT_KEY, "No abstract")
-            score = display_info.get(constants.EVALUATION_SCORE_KEY, constants.RESEARCH_SCORE_NA)
-
-            preview = (
-                f"**Evaluation {eval_id}: {title}**\n"
-                f"Author: {author}\n"
-                f"Tags: {format_tags_for_display(tags)}\n"
-                f"Abstract: {abstract}"
-            )
-            if not constants.RESEARCH_NO_SCORE:
-                display_score = "running" if score == constants.RESEARCH_SCORE_PENDING else format_score_for_display(score)
-                if score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA):
-                    _, metrics = extract_secondary_metrics_for_display_info(display_info)
-                    if metrics:
-                        metrics_string = " | ".join(f"{key}: {value}" for key, value in metrics.items())
-                        display_score = f"{display_score} | {metrics_string}"
-                preview += f"\nScore: {display_score}"
-            previews.append(preview)
+            previews.append(_build_evaluation_preview_from_display_info(eval_id, display_info))
         return previews
 
     @staticmethod
@@ -708,12 +746,6 @@ class EvaluationManager:
     def get_all_evaluation_ids(self) -> List[str]:
         return evaluation_index.get_all_evaluation_ids(self.evaluations_dir)
 
-    def needs_artifact_migration(self) -> bool:
-        return evaluation_index.needs_artifact_migration(self.evaluations_dir)
-
-    def get_artifact_migration_eval_ids(self) -> List[str]:
-        return evaluation_index.get_artifact_migration_eval_ids(self.evaluations_dir)
-
     def refresh_from_disk(self):
         self._rebuild_indexes_and_top_submission()
 
@@ -729,7 +761,6 @@ class EvaluationManager:
         tick: int,
         tags: Optional[List[str]] = None,
         abstract: str = "",
-        cpu_only: bool = False,
         lineage: Optional[str] = None,
         backend: Optional[str] = None,
         model_name: Optional[str] = None,
@@ -760,7 +791,6 @@ class EvaluationManager:
                 "submitted_tick": tick,
                 "submitted_timestamp": now,
                 "status": "queued",
-                "cpu_only": bool(cpu_only),
                 "artifacts": _default_artifact_map(eval_id),
                 "coder": {
                     "backend": backend or constants.RESEARCH_CODER_BACKEND,
@@ -781,6 +811,24 @@ class EvaluationManager:
                     "exit_code": None,
                     "failure_category": None,
                     "resume_token": None,
+                    "last_error": None,
+                },
+                "audit": {
+                    "status": "not_started",
+                    "active": False,
+                    "spawn_count": 0,
+                    "max_spawns": constants.RESEARCH_CODER_MAX_SPAWNS,
+                    "resume_count": 0,
+                    "max_resumes": constants.RESEARCH_CODER_MAX_RESUMES,
+                    "next_resume_timestamp": None,
+                    "resume_delay_seconds": None,
+                    "failure_category": None,
+                    "resume_token": None,
+                    "session_id": None,
+                    "active_pid": None,
+                    "repair_round": 0,
+                    "last_verdict": None,
+                    "last_report_path": None,
                     "last_error": None,
                 },
                 "attempts": [],
@@ -806,7 +854,6 @@ class EvaluationManager:
         tick: int,
         tags: Optional[List[str]] = None,
         abstract: str = "",
-        cpu_only: bool = False,
         lineage: Optional[str] = None,
         max_active_for_author: int = 1,
         backend: Optional[str] = None,
@@ -842,7 +889,6 @@ class EvaluationManager:
                     tick=tick,
                     tags=tags,
                     abstract=abstract,
-                    cpu_only=cpu_only,
                     lineage=lineage,
                     backend=backend,
                     model_name=model_name,
@@ -1031,6 +1077,8 @@ class EvaluationManager:
         eval_id: str,
         submission_or_path: str,
         submission_path: Optional[str] = None,
+        *,
+        cpu_only: bool = False,
     ) -> Optional[int]:
         attempt_number: Optional[int] = None
         if submission_path is None:
@@ -1046,22 +1094,23 @@ class EvaluationManager:
             if submission_text is not None:
                 file_io_utils.save_text(submission_text, _get_artifact_path(eval_data, "submission", self.evaluations_dir))
             attempt_number = len(attempts) + 1
-            attempts.append(
-                {
-                    "attempt": attempt_number,
-                    "status": "queued",
-                    "requested_timestamp": time.time(),
-                    "started_timestamp": None,
-                    "completed_timestamp": None,
-                    "submission_path": submission_path,
-                    "stdout_path": artifacts.get("stdout") or _default_artifact_rel_path(str(eval_id), "stdout"),
-                    "stderr_path": artifacts.get("stderr") or _default_artifact_rel_path(str(eval_id), "stderr"),
-                    "primary_score": constants.RESEARCH_SCORE_PENDING,
-                    constants.EVALUATION_DETAILS_KEY: "",
-                    "sort_key": None,
-                    "error": None,
-                }
-            )
+            attempt_record = {
+                "attempt": attempt_number,
+                "status": "queued",
+                "requested_timestamp": time.time(),
+                "started_timestamp": None,
+                "completed_timestamp": None,
+                "submission_path": submission_path,
+                "stdout_path": artifacts.get("stdout") or _default_artifact_rel_path(str(eval_id), "stdout"),
+                "stderr_path": artifacts.get("stderr") or _default_artifact_rel_path(str(eval_id), "stderr"),
+                "primary_score": constants.RESEARCH_SCORE_PENDING,
+                constants.EVALUATION_DETAILS_KEY: "",
+                "sort_key": None,
+                "error": None,
+            }
+            if cpu_only:
+                attempt_record["cpu_only"] = True
+            attempts.append(attempt_record)
             eval_data["current_attempt"] = attempt_number
             eval_data["status"] = "running"
             if (
@@ -1103,6 +1152,7 @@ class EvaluationManager:
         error: Optional[str] = None,
         sort_key: Optional[Any] = None,
         status: Optional[str] = None,
+        progress_records: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, Any]]:
         persisted_stdout = truncate_persisted_stdout(stdout)
         persisted_stderr = stderr or ""
@@ -1122,6 +1172,7 @@ class EvaluationManager:
                 attempt[constants.EVALUATION_DETAILS_KEY] = details
                 attempt["error"] = error
                 attempt["sort_key"] = sort_key
+                attempt["progress_records"] = self._to_yaml_safe(progress_records or [])
                 break
             current_status = _normalize_evaluation_status(eval_data.get("status"))
             if eval_data.get("final") or current_status in TERMINAL_EVALUATION_STATUSES:
@@ -1147,16 +1198,20 @@ class EvaluationManager:
         eval_id: str,
         coder_report: str,
         final_status: Optional[str] = None,
+        notification_report_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         eval_id = str(eval_id)
         final_record: Optional[Dict[str, Any]] = None
         notification_message: Optional[str] = None
         author: Optional[str] = None
+        cleanup_eval_data: Optional[Dict[str, Any]] = None
 
         with self._file_lock(eval_id):
             eval_data = self._load_evaluation_yaml(eval_id)
             if not eval_data:
                 return None
+            if str(eval_data.get("parallel_commit_status") or "").strip().lower() == "rolled_back":
+                return eval_data
 
             existing_final = eval_data.get("final") or {}
             existing_final_status = _normalize_evaluation_status(existing_final.get("status"))
@@ -1164,8 +1219,11 @@ class EvaluationManager:
             latest_attempt = _get_final_attempt(eval_data) or {}
             derived_status = _normalize_evaluation_status(final_status)
             if derived_status is None:
+                latest_attempt_status = str(latest_attempt.get("status", "")).strip().lower()
                 score = latest_attempt.get("primary_score", constants.RESEARCH_SCORE_NA)
-                if score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA, None):
+                if latest_attempt_status in {"completed", "success"}:
+                    derived_status = "completed"
+                elif score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA, None):
                     derived_status = "completed"
                 elif latest_attempt:
                     derived_status = "failed"
@@ -1175,7 +1233,10 @@ class EvaluationManager:
             if (
                 existing_final
                 and existing_final_status in TERMINAL_EVALUATION_STATUSES
-                and existing_score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA, None)
+                and (
+                    existing_final_status == "completed"
+                    or existing_score not in (constants.RESEARCH_SCORE_PENDING, constants.RESEARCH_SCORE_NA, None)
+                )
                 and derived_status in {"failed", "blocked", "partial"}
             ):
                 coder = eval_data.setdefault("coder", {})
@@ -1192,6 +1253,7 @@ class EvaluationManager:
                 "primary_score": latest_attempt.get("primary_score", constants.RESEARCH_SCORE_NA),
                 constants.EVALUATION_DETAILS_KEY: latest_attempt.get(constants.EVALUATION_DETAILS_KEY, ""),
                 "sort_key": self._clone_sort_key_for_persistence(latest_attempt.get("sort_key")),
+                "progress_records": self._to_yaml_safe(latest_attempt.get("progress_records") or []),
                 "artifacts": _default_artifact_map(eval_id),
                 "error": latest_attempt.get("error"),
             }
@@ -1204,12 +1266,18 @@ class EvaluationManager:
             coder["active_pid"] = None
             coder["completed_timestamp"] = time.time()
             file_io_utils.save_text(coder_report or "", _get_artifact_path(eval_data, "report", self.evaluations_dir))
-            self._save_evaluation(eval_id, eval_data)
-
             notification = eval_data.setdefault("notification", {})
+            if notification_report_mode is not None:
+                notification["report_mode"] = notification_report_mode
+            self._save_evaluation(eval_id, eval_data)
+            cleanup_eval_data = copy.deepcopy(eval_data)
+
             author = eval_data.get("author")
             if self._notification_callback and not notification.get("sent"):
                 notification_message = self._generate_notification_message(eval_data)
+
+        if cleanup_eval_data:
+            _cleanup_eval_tmp_storage(cleanup_eval_data, self.evaluations_dir)
 
         if notification_message and author:
             self._notification_callback(author, notification_message)
@@ -1253,6 +1321,8 @@ class EvaluationManager:
             with self._file_lock(eval_id, timeout=0.0):
                 eval_data = self._load_evaluation_yaml(eval_id)
                 if not eval_data:
+                    return False
+                if str(eval_data.get("parallel_commit_status") or "").strip().lower() == "rolled_back":
                     return False
                 if _normalize_evaluation_status(eval_data.get("status")) not in TERMINAL_EVALUATION_STATUSES:
                     return False
@@ -1305,15 +1375,34 @@ class EvaluationManager:
             return None
         return self._generate_notification_message(eval_data)
 
-    def _generate_notification_message(self, eval_data: Dict[str, Any]) -> str:
+    def _generate_notification_message(
+        self,
+        eval_data: Dict[str, Any],
+        report_override: Optional[str] = None,
+    ) -> str:
         final = eval_data.get("final") or {}
         score = final.get("primary_score", constants.RESEARCH_SCORE_NA)
         details = final.get(constants.EVALUATION_DETAILS_KEY, "")
         details_message, secondary_metrics_string = _format_secondary_metrics_for_display(details)
-        report = _load_eval_final_artifact(eval_data, "report", self.evaluations_dir).strip() or "_No coder report available._"
-        stdout_visible = _truncate_visible_stdout(
-            _strip_attempt_footer(_load_eval_final_artifact(eval_data, "stdout", self.evaluations_dir))
-        )
+        report = report_override or _load_eval_final_artifact(eval_data, "report", self.evaluations_dir)
+        if (eval_data.get("notification") or {}).get("report_mode") == "latest_audit":
+            audit_heading = re.search(
+                r"\n## Independent Audit(?: Failure)?(?: \([^\n)]*\))?\s*\n",
+                report,
+                flags=re.IGNORECASE,
+            )
+            base_report = report[:audit_heading.start()].rstrip() if audit_heading else report.rstrip()
+            audit_path = str((eval_data.get("audit") or {}).get("last_report_path") or "").strip()
+            if audit_path:
+                if not os.path.isabs(audit_path):
+                    audit_path = os.path.join(os.path.dirname(self.evaluations_dir), audit_path)
+                latest_audit = file_io_utils.load_text(audit_path) if file_io_utils.file_exists(audit_path) else ""
+                if latest_audit.strip():
+                    report = (
+                        f"{base_report}\n\n## Final Independent Audit\n\n"
+                        f"{latest_audit.strip()}\n"
+                    )
+        report = report.strip() or "_No coder report available._"
 
         message = f"Your research submission '{eval_data.get('title', 'Untitled')}' (ID: {eval_data.get('id')}) has completed.\n\n"
 
@@ -1324,7 +1413,7 @@ class EvaluationManager:
             message += f"\n**Evaluation Details:** {details_message}\n\n"
 
         message += f"**Coder Report:**\n{report}\n\n"
-        message += f"**Final Stdout:**\n```\n{stdout_visible}\n```"
+        message += f"**Stdout/Stderr:** {STDOUT_STDERR_HIDDEN_NOTICE}"
         return message
 
     def _clone_sort_key_for_persistence(self, sort_key: Any) -> Any:
@@ -1345,6 +1434,16 @@ class EvaluationManager:
         with self._lock:
             self.top_submission = copy.deepcopy(top_submission) if top_submission else None
         return copy.deepcopy(top_submission) if top_submission else None
+
+    def get_breakthrough_events(self) -> List[Dict[str, Any]]:
+        from station.eval_research import breakthroughs
+
+        return [event.to_dict() for event in breakthroughs.get_breakthrough_events(self.evaluations_dir)]
+
+    def get_latest_breakthrough_summary(self) -> Dict[str, Any]:
+        from station.eval_research import breakthroughs
+
+        return breakthroughs.get_latest_breakthrough_summary(self.evaluations_dir)
 
     def get_active_evaluations(self) -> List[Dict[str, Any]]:
         return evaluation_index.get_active_evaluations(self.evaluations_dir)
@@ -1373,6 +1472,19 @@ class EvaluationManager:
 
     def get_retryable_blocked_instruction_eval_ids(self) -> List[str]:
         return evaluation_index.get_retryable_blocked_instruction_eval_ids(self.evaluations_dir)
+
+    def get_unfinished_requeue_candidate_instruction_eval_ids(
+        self,
+        *,
+        include_active_statuses: bool = True,
+    ) -> List[str]:
+        return evaluation_index.get_unfinished_requeue_candidate_instruction_eval_ids(
+            self.evaluations_dir,
+            include_active_statuses=include_active_statuses,
+        )
+
+    def get_no_report_terminal_requeueable_eval_ids(self) -> List[str]:
+        return evaluation_index.get_no_report_terminal_requeueable_eval_ids(self.evaluations_dir)
 
     def get_running_evaluation_count(self) -> int:
         return self.get_active_coder_count()

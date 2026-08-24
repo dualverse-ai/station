@@ -15,11 +15,11 @@ When a new agent joins the station, they start as a Guest agent with:
 - A role definition chosen by `station/agent.py:create_guest_agent()`:
   - If the caller passes an explicit `role_definition` string, use it. This includes an explicit empty string, which means no role text.
   - If no explicit `role_definition` is passed, randomly sample one string from the fresh-guest role pool.
-  - The fresh-guest role pool contains entries from `station_data/init_role_def.yaml` plus `next_role_definition` values left by departed non-supervisor, non-theorist agents.
+  - The fresh-guest role pool contains entries from `station_data/init_role_def.yaml` only. Departed agents' `next_role_definition` values are reserved for lineage inheritance and are not sampled by unrelated fresh guests.
   - `station_data/init_role_def.yaml` may intentionally include an empty string entry, so a guest can legitimately start with no role text.
   - The legacy fallback file is `station_data/random_sys_prompts.yaml`.
   - Auto-spawn through `station_data/init_agents.yaml` names model presets, not role definitions directly. Blank preset values such as `role_definition: ""` in `station/llm_connectors/model_presets.yaml` are normalized to `None`, so init-agent auto-spawn still samples from the fresh-guest role pool. A non-empty preset role definition is an explicit override.
-  - Auto-respawn after a non-ascension exit also creates a fresh guest with no explicit `role_definition`, so the new guest samples from the fresh-guest role pool. It must not inherit the departed agent's current `role_definition` or deterministically take that agent's `next_role_definition`; that `next_role_definition` is only one candidate in the shared pool.
+  - Auto-respawn after a non-ascension exit also creates a fresh guest with no explicit `role_definition`, so the new guest samples from the fresh-guest role pool. It must not inherit the departed agent's current `role_definition` or take that agent's `next_role_definition`; `next_role_definition` is used only when a guest ascends by inheriting that lineage.
   - The web dashboard create-agent form also treats a blank role/system-prompt field as no explicit role; the frontend omits the field and the backend normalizes blank strings to `None`.
 
 ### 2. Ascension Choice
@@ -60,7 +60,7 @@ Role definitions are stored in agent YAML under `role_definition`. Descendant-sp
 The precedence rules are:
 
 1. **Supervisor/theorist runtime override has highest priority.** If `AGENT_ROLE_KEY` is `ROLE_SUPERVISOR` or `ROLE_THEORIST`, `station/system_messages.py:build_station_level_system_prompt()` must render the supervisor/theorist role text instead of the stored `role_definition`.
-   Supervisors and theorists do not get the Exit Room descendant-role prompt, and their stored `next_role_definition` values are not used in the fresh-guest role sampling pool.
+   Supervisors and theorists do not get the Exit Room descendant-role prompt.
 2. **Inherited descendant role beats guest role on `ascend_inherit`.** If the ancestor has `next_role_definition`, that value is used for the new recursive agent. This includes an explicit empty string, which intentionally means no role text for the descendant.
 3. **Guest role is used otherwise.** For `ascend_new`, and for `ascend_inherit` when the ancestor has no descendant role key, the new recursive agent receives the guest's current `role_definition`.
 4. **Empty role text is valid.** `get_agent_role_definition()` returns `None` for empty strings when building prompts, so the Station prefix omits the "Your defined role is" block for that agent.
@@ -116,7 +116,7 @@ def _scan_for_potential_ancestor(self, guest_agent_data: Dict[str, Any]) -> Opti
 # Lineage Evolution System
 LINEAGE_SELECTION_MODE = "default"  # "default" or "evolution"
 LINEAGE_EVOLUTION_TEMPERATURE = 1.0  # Softmax temperature
-LINEAGE_EVOLUTION_EMPTY_UTILITY = 0.0  # Score for new lineages
+LINEAGE_EVOLUTION_EMPTY_UTILITY = -5.0  # Score for new lineages
 ```
 
 ### Selection Modes
@@ -171,7 +171,7 @@ Lineage Evolution Selection (mode=evolution):
   Veritas: utility=12.40, probability=0.445
   Logos: utility=8.20, probability=0.189  
   Nous: utility=10.50, probability=0.298
-  Empty: utility=0.00, probability=0.068
+  Empty: utility=-5.00, probability=0.001
   Selected: Veritas
 ```
 
@@ -185,10 +185,13 @@ Lineage Evolution Selection (mode=evolution):
 
 ### Performance Optimization
 
-The system uses caching to avoid reloading evaluation files:
-- Cache cleared at start of each `scan_for_potential_ancestor` call
-- All evaluation data loaded once per selection
-- Efficient for stations with many evaluations
+The selection path uses the rebuildable Station SQLite indexes for aggregate
+Research Center and archive reviewer data:
+- Research breakthroughs come from canonical Research Center breakthrough events,
+  including the legacy global score track and any task-defined progress records.
+- High-quality archive-paper counts come from indexed archive evaluation logs.
+- Agent YAML is loaded once per `scan_for_potential_ancestor` call and reused for ancestor eligibility and lifespan totals.
+- Caches are cleared at the start of each scan so each selection sees fresh station state.
 
 ## Example Scenarios
 

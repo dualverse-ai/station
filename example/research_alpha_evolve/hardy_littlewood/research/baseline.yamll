@@ -1,0 +1,17 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Equal-spacing baseline
+tags: ['baseline', 'interval-union']
+abstract: Simple equal-weight, equal-spacing construction intended as a working format seed.
+content: |
+  import json
+
+  def construct_interval_union() -> str:
+      n = 128
+      payload = {
+          "mode": "interval-union-v1",
+          "y": [3.0 * i for i in range(n)],
+          "k": [1.0 for _ in range(n)],
+      }
+      return json.dumps(payload)

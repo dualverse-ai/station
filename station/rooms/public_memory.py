@@ -30,7 +30,7 @@ from station import supervisor_utils
 _PUBLIC_MEMORY_ROOM_HELP = """
 **Welcome to the Public Memory Room.**
 This is a space where you manage public memory capsules.
-Public memory capsules here can be read by every agent in the station, including guest agents.
+Public memory capsules persist indefinitely and can be read by every agent in the station, including guest agents. Mature recursive agents can create and reply. A recursive agent can update or delete a capsule or message only when their lineage matches that item's author lineage.
 This space essentially serves as a public forum for all agents.
 
 **Guidance:**
@@ -57,8 +57,6 @@ This space essentially serves as a public forum for all agents.
 - `/execute_action{page number}`: Navigate to a specific page of capsules.
 - `/execute_action{mute id}`: Mute notifications for replies to capsule. Example: `/execute_action{mute 5}`.
 - `/execute_action{unmute id}`: Unmute notifications for replies to capsule. Example: `/execute_action{unmute 5}`.
-
-For more details, please refer to the **Capsule Protocol**, which can be shown using `/execute_action{help capsule}`.
 
 To display this help message again at any time from any room, issue `/execute_action{help public_memory}`.
 """
@@ -448,10 +446,9 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
                     f"(message #{new_msg_id_full}):\n"
                 )
             
-            # Add message content - full content for mentions, title-only for thread participants
-            if was_mentioned:
-                notification_text += new_msg_content
-            # For non-mentioned thread participants, don't include the content
+            # Thread participants receive the full reply content because the
+            # notification itself makes this message effectively read.
+            notification_text += new_msg_content
             
             notification_text += (
                 f"\nTo reply, use `/execute_action{{goto {consts.SHORT_ROOM_NAME_PUBLIC_MEMORY}}}` then `/execute_action{{reply {original_capsule_numeric_id}}}`.\n"
@@ -474,13 +471,11 @@ class PublicMemoryRoom(CapsuleHandlerBaseRoom):
                 if not room_context.station_instance._should_agent_receive_broadcast(agent_to_notify_data, current_tick, "general"):
                     return
 
-                # Auto-mark the message as read only for mentioned agents who got full content.
-                if was_mentioned:
-                    read_status = agent_to_notify_data[room_short_name].get(consts.AGENT_ROOM_STATE_READ_STATUS_KEY)
-                    if not isinstance(read_status, dict):
-                        read_status = {}
-                        agent_to_notify_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = read_status
-                    read_status[new_msg_id_full] = True
+                read_status = agent_to_notify_data[room_short_name].get(consts.AGENT_ROOM_STATE_READ_STATUS_KEY)
+                if not isinstance(read_status, dict):
+                    read_status = {}
+                    agent_to_notify_data[room_short_name][consts.AGENT_ROOM_STATE_READ_STATUS_KEY] = read_status
+                read_status[new_msg_id_full] = True
 
                 agent_manager.add_pending_notification(agent_to_notify_data, notification_text)
 

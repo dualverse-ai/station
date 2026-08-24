@@ -18,6 +18,7 @@ Python sandbox execution methods for research evaluation.
 """
 
 import os
+import contextlib
 
 # Force direct subprocess import to avoid asyncio integration issues
 import subprocess as _original_subprocess
@@ -51,6 +52,146 @@ from typing import Dict, Any, Optional
 from station import constants
 from station import file_io_utils
 from station.eval_research.evaluation_helpers import append_stdout_with_limit, resolve_conda_env, truncate_stderr
+from station.eval_research.runtime_paths import (
+    _set_read_only_tree,
+    _set_writable_tree,
+    parse_memory_limit_bytes,
+)
+
+
+_SANDBOX_RESERVED_STORAGE_NAMES = {
+    constants.RESEARCH_STORAGE_SHARED_DIR,
+    constants.RESEARCH_STORAGE_SYSTEM_DIR,
+    constants.RESEARCH_STORAGE_LINEAGES_DIR,
+    "architect",
+    "tmp",
+    "submission",
+    "stdout",
+    "stderr",
+    "report",
+}
+
+
+def _symlink_if_absent(source_path: str, link_path: str) -> None:
+    if os.path.lexists(link_path):
+        return
+    try:
+        os.symlink(source_path, link_path)
+    except FileExistsError:
+        pass
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{num_bytes} B"
+
+
+def _process_group_rss_bytes(process_group_id: int) -> int:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        proc_path = os.path.join("/proc", entry)
+        try:
+            with open(os.path.join(proc_path, "stat"), "r", encoding="utf-8", errors="replace") as handle:
+                stat = handle.read()
+            close_paren = stat.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = stat[close_paren + 2 :].split()
+            if len(fields) < 3 or int(fields[2]) != int(process_group_id):
+                continue
+            with open(os.path.join(proc_path, "statm"), "r", encoding="utf-8", errors="replace") as handle:
+                statm = handle.read().split()
+            if len(statm) >= 2:
+                total += int(statm[1]) * page_size
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, OSError):
+            continue
+    return total
+
+
+def _start_rss_watchdog(
+    process,
+    *,
+    memory_limit_bytes: int,
+    eval_id: str,
+    live_stderr_path: Optional[str],
+) -> tuple[threading.Event, threading.Thread, Dict[str, Any]]:
+    stop_event = threading.Event()
+    threshold_bytes = int(memory_limit_bytes * 1.05)
+    state: Dict[str, Any] = {
+        "triggered": False,
+        "max_rss_bytes": 0,
+        "threshold_bytes": threshold_bytes,
+        "message": "",
+    }
+
+    def watch() -> None:
+        while not stop_event.wait(1.0):
+            if process.poll() is not None:
+                return
+            rss_bytes = _process_group_rss_bytes(process.pid)
+            if rss_bytes > int(state["max_rss_bytes"]):
+                state["max_rss_bytes"] = rss_bytes
+            if rss_bytes <= threshold_bytes:
+                continue
+            message = (
+                "AutoResearchEvaluator: RSS memory limit exceeded for "
+                f"evaluation {eval_id}: rss={_format_bytes(rss_bytes)} "
+                f"limit={_format_bytes(memory_limit_bytes)} "
+                f"threshold={_format_bytes(threshold_bytes)}. "
+                "Terminating official attempt process group because RAM usage exploded."
+            )
+            state["triggered"] = True
+            state["message"] = message
+            print(message)
+            _append_live_log(live_stderr_path, message + "\n", truncate=True)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return
+
+    thread = threading.Thread(target=watch, daemon=True)
+    thread.start()
+    return stop_event, thread, state
+
+
+def _stop_rss_watchdog(
+    stop_event: Optional[threading.Event],
+    thread: Optional[threading.Thread],
+) -> None:
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None:
+        thread.join(timeout=5)
+
+
+def _memory_limit_result(
+    rss_state: Dict[str, Any],
+    stdout_output: str,
+    stderr_output: str,
+) -> Dict[str, Any]:
+    memory_message = str(
+        rss_state.get("message")
+        or "Official attempt exceeded the RSS memory limit and was killed."
+    )
+    if memory_message not in stderr_output:
+        stderr_output = (stderr_output + "\n" if stderr_output else "") + memory_message
+    truncated_stderr = truncate_stderr(stderr_output)
+    execution_logs = f"PYTHON SANDBOX MEMORY LIMIT:\nSTDOUT:\n{stdout_output}\n\nSTDERR:\n{truncated_stderr}"
+    return {
+        "success": False,
+        "error": memory_message,
+        "logs": execution_logs,
+        "stdout": stdout_output,
+        "stderr": truncated_stderr,
+    }
 
 
 def _function_result_paths(tmp_dir: str) -> tuple[str, str]:
@@ -117,6 +258,26 @@ def _build_sandbox_command(
     return command
 
 
+def _system_baseline_storage_writes_allowed(eval_entry: Dict[str, Any]) -> bool:
+    if not bool(eval_entry.get("system_baseline")):
+        return False
+    tick_limit = getattr(constants, "RESEARCH_SYSTEM_BASELINE_WRITABLE_TICK_LIMIT", 0)
+    if tick_limit is None:
+        return True
+    try:
+        tick_limit = int(tick_limit)
+    except (TypeError, ValueError):
+        return False
+    if tick_limit < 0:
+        return True
+    try:
+        submitted_tick = int(eval_entry.get(constants.EVALUATION_SUBMITTED_TICK_KEY, 0) or 0)
+        current_tick = int(eval_entry.get("current_tick", submitted_tick) or 0)
+    except (TypeError, ValueError):
+        return False
+    return submitted_tick <= tick_limit and current_tick <= tick_limit
+
+
 def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], evaluator,
                                           gpu_ids: Optional[list] = None,
                                           cpu_ids: Optional[list] = None,
@@ -125,6 +286,8 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
     """Execute research submission code in Python sandbox using conda environment"""
     content = eval_entry.get(constants.EVALUATION_CONTENT_KEY, "")
     author = eval_entry.get(constants.EVALUATION_AUTHOR_KEY, "Unknown")
+    is_system_baseline = bool(eval_entry.get("system_baseline"))
+    allow_system_storage_writes = _system_baseline_storage_writes_allowed(eval_entry)
     
     timeout = self.timeout
     
@@ -146,8 +309,6 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         tmp_dir = os.path.join(tmp_base, tmp_dir_name)
         os.makedirs(tmp_dir)
         
-        # Use context manager to ensure cleanup
-        import contextlib
         @contextlib.contextmanager
         def cleanup_tmp_dir():
             try:
@@ -167,7 +328,28 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         # Use the system tmp directory (original behavior)
         tmp_context = tempfile.TemporaryDirectory()
 
-    with tmp_context as tmp_dir:
+    system_storage_restore_state = {"path": None, "lifted": False}
+
+    def restore_system_storage_read_only():
+        system_storage_path = system_storage_restore_state["path"]
+        if not system_storage_restore_state["lifted"] or not system_storage_path or not os.path.exists(system_storage_path):
+            return
+        system_storage_restore_state["lifted"] = False
+        if not _set_read_only_tree(system_storage_path):
+            print(
+                "AutoResearchEvaluator: Warning - could not fully restore storage/system "
+                "read-only permissions after system baseline execution."
+            )
+
+    @contextlib.contextmanager
+    def tmp_context_with_permission_restore():
+        try:
+            with tmp_context as tmp_dir:
+                yield tmp_dir
+        finally:
+            restore_system_storage_read_only()
+
+    with tmp_context_with_permission_restore() as tmp_dir:
         # Set up storage symlinks
         storage_dir = os.path.join(tmp_dir, "storage")
         os.makedirs(storage_dir, exist_ok=True)
@@ -195,34 +377,56 @@ def _execute_submission_in_python_sandbox(self, eval_entry: Dict[str, Any], eval
         file_io_utils.ensure_dir_exists(author_lineage_storage_path)
         file_io_utils.ensure_dir_exists(author_tmp_storage_path)
         file_io_utils.ensure_dir_exists(architect_storage_path)
-        if os.path.exists(shared_storage_path): os.symlink(shared_storage_path, os.path.join(storage_dir, "shared"))
+        if os.path.exists(shared_storage_path): _symlink_if_absent(shared_storage_path, os.path.join(storage_dir, "shared"))
+        if allow_system_storage_writes and os.path.exists(system_storage_path):
+            system_storage_restore_state["path"] = system_storage_path
+            system_storage_restore_state["lifted"] = _set_writable_tree(system_storage_path)
+            if not system_storage_restore_state["lifted"]:
+                print(
+                    "AutoResearchEvaluator: Warning - could not fully make storage/system writable "
+                    "for system baseline execution."
+                )
         if os.path.exists(system_storage_path):
-            # Use symlink for system storage since it's already read-only
-            os.symlink(system_storage_path, os.path.join(storage_dir, "system"))
-        if os.path.exists(architect_storage_path): os.symlink(architect_storage_path, os.path.join(storage_dir, "architect"))
+            # System storage is normally read-only. Startup system baselines may
+            # receive a temporary write window for generated reference caches.
+            _symlink_if_absent(system_storage_path, os.path.join(storage_dir, "system"))
+        if os.path.exists(architect_storage_path): _symlink_if_absent(architect_storage_path, os.path.join(storage_dir, "architect"))
         if os.path.exists(author_tmp_storage_path):
             tmp_view_path = os.path.join(storage_dir, "tmp")
             os.makedirs(tmp_view_path, exist_ok=True)
-            os.symlink(author_tmp_storage_path, os.path.join(tmp_view_path, author_lineage))
-        if os.path.exists(author_lineage_storage_path):
-            os.symlink(author_lineage_storage_path, os.path.join(storage_dir, "lineage"))
-            os.symlink(author_lineage_storage_path, os.path.join(storage_dir, author_lineage))
+            _symlink_if_absent(author_tmp_storage_path, os.path.join(tmp_view_path, author_lineage))
+        if os.path.exists(author_lineage_storage_path) and author_lineage not in constants.RESEARCH_STORAGE_RESERVED_NAMES:
+            _symlink_if_absent(author_lineage_storage_path, os.path.join(storage_dir, "lineage"))
+            _symlink_if_absent(author_lineage_storage_path, os.path.join(storage_dir, author_lineage))
         if constants.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS and os.path.exists(lineages_base_path):
+            lineages_view_path = os.path.join(storage_dir, constants.RESEARCH_STORAGE_LINEAGES_DIR)
+            if not os.path.exists(lineages_view_path):
+                _symlink_if_absent(lineages_base_path, lineages_view_path)
             try:
                 for lineage_name in os.listdir(lineages_base_path):
                     lineage_path = os.path.join(lineages_base_path, lineage_name)
                     if os.path.isdir(lineage_path):
                         if lineage_name != author_lineage:
                             if not os.path.exists(os.path.join(storage_dir, lineage_name)):
-                                os.symlink(lineage_path, os.path.join(storage_dir, lineage_name))
+                                _symlink_if_absent(lineage_path, os.path.join(storage_dir, lineage_name))
                             capitalized_name = lineage_name.capitalize()
                             if capitalized_name != lineage_name and not os.path.exists(os.path.join(storage_dir, capitalized_name)):
-                                os.symlink(lineage_path, os.path.join(storage_dir, capitalized_name))
+                                _symlink_if_absent(lineage_path, os.path.join(storage_dir, capitalized_name))
             except OSError: pass
-        if os.path.exists(author_lineage_storage_path):
+            try:
+                for storage_name in os.listdir(storage_base):
+                    if storage_name in _SANDBOX_RESERVED_STORAGE_NAMES:
+                        continue
+                    legacy_storage_path = os.path.join(storage_base, storage_name)
+                    if not os.path.isdir(legacy_storage_path):
+                        continue
+                    _symlink_if_absent(legacy_storage_path, os.path.join(storage_dir, storage_name))
+            except OSError:
+                pass
+        if os.path.exists(author_lineage_storage_path) and author_lineage not in constants.RESEARCH_STORAGE_RESERVED_NAMES:
             author_capitalized = author_lineage.capitalize()
             if author_capitalized != author_lineage and not os.path.exists(os.path.join(storage_dir, author_capitalized)):
-                os.symlink(author_lineage_storage_path, os.path.join(storage_dir, author_capitalized))
+                _symlink_if_absent(author_lineage_storage_path, os.path.join(storage_dir, author_capitalized))
         
         execution_mode = evaluator.get_execution_mode() if hasattr(evaluator, 'get_execution_mode') else "function"
         
@@ -304,6 +508,7 @@ except Exception as e:
         
         try:
             env = os.environ.copy()
+            # An empty list is intentional for CPU-only attempts: hide CUDA devices.
             if gpu_ids is not None: env['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpu_ids))
             if 'HF_HOME' not in env and 'HOME' in env: env['HF_HOME'] = os.path.join(env['HOME'], '.cache', 'huggingface')
             if 'XDG_CACHE_HOME' not in env and 'HOME' in env: env['XDG_CACHE_HOME'] = os.path.join(env['HOME'], '.cache')
@@ -314,6 +519,9 @@ except Exception as e:
             env['STATION_EVAL_VERSION'] = '' if eval_entry.get('eval_version') is None else str(eval_entry.get('eval_version'))
             env['STATION_AUTHOR'] = str(eval_entry.get(constants.EVALUATION_AUTHOR_KEY, ''))
             env['STATION_RESEARCH_ROOT'] = research_room_abs_path
+            if bool(getattr(constants, 'RESEARCH_SEED_BANK_ENABLED', False)):
+                env['STATION_LINEAGE'] = str(eval_entry.get('lineage', 'unknown')).lower()
+                env['STATION_ACCESS_PHASE'] = str(eval_entry.get('coder_access_phase', 'mature')).lower()
             
             # Force disable asyncio subprocess integration in the child process environment
             env['PYTHONASYNCIO'] = '0'
@@ -336,26 +544,20 @@ except Exception as e:
             needs_preexec_affinity = bool(cpu_ids) and not command_uses_taskset
             eval_id = str(eval_entry.get(constants.EVALUATION_ID_KEY, ""))
             affinity_mode = "taskset" if command_uses_taskset else ("preexec" if needs_preexec_affinity else "none")
+            memory_limit = constants.RESEARCH_EVAL_MEMORY_LIMIT
+            memory_limit_bytes = parse_memory_limit_bytes(memory_limit)
 
             def set_resource_limits_and_affinity():
                 """Set memory limits and fallback CPU affinity for the subprocess."""
-                if constants.RESEARCH_EVAL_MEMORY_LIMIT:
+                if memory_limit_bytes:
                     import resource
-                    # Parse memory limit (e.g., "64g" -> 64 * 1024^3 bytes)
-                    memory_str = str(constants.RESEARCH_EVAL_MEMORY_LIMIT).lower()
-                    if memory_str.endswith('g'):
-                        memory_gb = float(memory_str[:-1])
-                        memory_bytes = int(memory_gb * 1024 * 1024 * 1024)
-                    elif memory_str.endswith('m'):
-                        memory_mb = float(memory_str[:-1])
-                        memory_bytes = int(memory_mb * 1024 * 1024)
-                    else:
-                        # Assume bytes if no suffix
-                        memory_bytes = int(memory_str)
 
                     # Set virtual memory limit
-                    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-                    print(f"AutoResearchEvaluator: Set memory limit to {memory_str}")
+                    resource.setrlimit(resource.RLIMIT_AS, (memory_limit_bytes, memory_limit_bytes))
+                    print(
+                        "AutoResearchEvaluator: Set virtual memory limit to "
+                        f"{memory_limit} ({_format_bytes(memory_limit_bytes)})"
+                    )
 
                 if needs_preexec_affinity:
                     try:
@@ -363,7 +565,7 @@ except Exception as e:
                     except Exception as e:
                         print(f"AutoResearchEvaluator: Failed to set CPU affinity: {e}")
 
-            use_preexec = bool(constants.RESEARCH_EVAL_MEMORY_LIMIT or needs_preexec_affinity)
+            use_preexec = bool(memory_limit_bytes or needs_preexec_affinity)
             if use_preexec:
                 process = subprocess.Popen(
                     sandbox_cmd,
@@ -388,6 +590,17 @@ except Exception as e:
                     start_new_session=True
                 )
 
+            rss_stop_event = None
+            rss_thread = None
+            rss_state = None
+            if memory_limit_bytes:
+                rss_stop_event, rss_thread, rss_state = _start_rss_watchdog(
+                    process,
+                    memory_limit_bytes=memory_limit_bytes,
+                    eval_id=eval_id,
+                    live_stderr_path=live_stderr_path,
+                )
+
             stdout_chunks: list[str] = []
             stderr_chunks: list[str] = []
 
@@ -408,12 +621,30 @@ except Exception as e:
 
             process.wait(timeout=timeout)
             returncode = process.returncode
+            _stop_rss_watchdog(rss_stop_event, rss_thread)
             stdout_thread.join(timeout=5)
             stderr_thread.join(timeout=5)
             stdout_output = "".join(stdout_chunks)
             stderr_output = "".join(stderr_chunks)
 
         except subprocess.TimeoutExpired:
+            rss_state = locals().get("rss_state")
+            if rss_state and rss_state.get("triggered"):
+                stdout_chunks = locals().get("stdout_chunks", [])
+                stderr_chunks = locals().get("stderr_chunks", [])
+                stdout_thread = locals().get("stdout_thread")
+                stderr_thread = locals().get("stderr_thread")
+                rss_stop_event = locals().get("rss_stop_event")
+                rss_thread = locals().get("rss_thread")
+                _stop_rss_watchdog(rss_stop_event, rss_thread)
+                if stdout_thread is not None:
+                    stdout_thread.join(timeout=5)
+                if stderr_thread is not None:
+                    stderr_thread.join(timeout=5)
+                stdout_output = "".join(stdout_chunks)
+                stderr_output = "".join(stderr_chunks)
+                return _memory_limit_result(rss_state, stdout_output, stderr_output)
+
             print(f"AutoResearchEvaluator: Process timed out after {timeout} seconds. Terminating process group.")
             try:
                 # Use os.killpg with the process's session ID (which is its PID due to start_new_session=True)
@@ -439,6 +670,9 @@ except Exception as e:
                 stdout_thread.join(timeout=5)
             if stderr_thread is not None:
                 stderr_thread.join(timeout=5)
+            rss_stop_event = locals().get("rss_stop_event")
+            rss_thread = locals().get("rss_thread")
+            _stop_rss_watchdog(rss_stop_event, rss_thread)
             stdout_output = "".join(stdout_chunks)
             stderr_output = "".join(stderr_chunks)
             if not stderr_output:
@@ -452,6 +686,9 @@ except Exception as e:
         
         except Exception as e:
             return {"success": False, "error": f"Python sandbox execution error: {str(e)}", "logs": str(e), "stdout": "", "stderr": str(e)}
+
+        if rss_state and rss_state.get("triggered"):
+            return _memory_limit_result(rss_state, stdout_output, stderr_output)
 
         truncated_stderr = truncate_stderr(stderr_output)
         execution_logs = f"PYTHON SANDBOX EXECUTION:\nSTDOUT:\n{stdout_output}\n\nSTDERR:\n{truncated_stderr}"

@@ -14,6 +14,7 @@
 
 import os
 import random
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import tiktoken
@@ -26,6 +27,9 @@ from station import supervisor_utils
 
 PromptEntry = Tuple[str, Set[str]]
 AGENT_NAME_PLACEHOLDER = "__AGENT_NAME__"
+PROMPT_NUMERIC_CONDITION_PATTERN = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)$"
+)
 
 
 def _load_codex_text() -> str:
@@ -38,6 +42,11 @@ def _load_codex_text() -> str:
 
 def build_tenured_reached_message(constants_module: Any = constants) -> str:
     base_message = constants_module.TENURED_REACHED_MESSAGE.strip()
+    if getattr(constants_module, "EXTERNAL_COUNTER_ENABLED", False):
+        base_message = (
+            f"{base_message}\n\n"
+            f"{constants_module.TENURED_EXTERNAL_COUNTER_MESSAGE.strip()}"
+        )
 
     min_archives_required = getattr(constants_module, "MIN_ARCHIVE_BEFORE_LEAVE", 0)
     if min_archives_required is None or min_archives_required <= 0:
@@ -47,6 +56,48 @@ def build_tenured_reached_message(constants_module: Any = constants) -> str:
         f"{base_message} You may leave the Station once you have authored at least "
         f"{min_archives_required} qualifying archive capsule(s).\n"
     )
+
+
+def _build_supervisor_protocol_system_prompt(constants_module: Any = constants) -> str:
+    prompt = constants_module.SUPERVISOR_PROTOCOL_SYSTEM_PROMPT.strip()
+    if not getattr(constants_module, "EXTERNAL_COUNTER_ENABLED", False):
+        return prompt
+
+    capability = constants_module.SUPERVISOR_EXTERNAL_COUNTER_CAPABILITY.strip()
+    strategic_guidance = constants_module.SUPERVISOR_EXTERNAL_COUNTER_STRATEGIC_GUIDANCE.strip()
+    proposal_requirement = constants_module.SUPERVISOR_EXTERNAL_COUNTER_PROPOSAL_REQUIREMENT.strip()
+    lifecycle_anchor = "\n* **Lifecycle**"
+    meetings_anchor = "\n---\n\n## Structure of Each Regular Meeting"
+    related_work_anchor = "\n2. **Related Work:**"
+
+    if lifecycle_anchor in prompt:
+        prompt = prompt.replace(
+            lifecycle_anchor,
+            f"\n{capability}\n{lifecycle_anchor}",
+            1,
+        )
+    else:
+        prompt = f"{prompt}\n\n{capability}"
+
+    if meetings_anchor in prompt:
+        prompt = prompt.replace(
+            meetings_anchor,
+            f"\n{strategic_guidance}\n{meetings_anchor}",
+            1,
+        )
+    else:
+        prompt = f"{prompt}\n\n{strategic_guidance}"
+
+    if related_work_anchor in prompt:
+        prompt = prompt.replace(
+            related_work_anchor,
+            f"\n{proposal_requirement}{related_work_anchor}",
+            1,
+        )
+    else:
+        prompt = f"{prompt}\n\n{proposal_requirement}"
+
+    return prompt
 
 
 def build_station_level_system_prompt(agent_name: str, role_description: Optional[str]) -> Optional[str]:
@@ -74,7 +125,7 @@ def build_station_level_system_prompt(agent_name: str, role_description: Optiona
 
     override_role_text: Optional[str] = None
     if supervisor_utils.is_supervisor(agent_data, constants):
-        override_role_text = constants.SUPERVISOR_PROTOCOL_SYSTEM_PROMPT.strip()
+        override_role_text = _build_supervisor_protocol_system_prompt(constants)
     elif agent_data.get(constants.AGENT_ROLE_KEY) == constants.ROLE_THEORIST:
         theorist_clause = (
             "You have been assigned as a theorist, "
@@ -248,6 +299,34 @@ def is_prompt_condition_met(condition_key: str, constants_module: Any = constant
     if not key:
         return False
 
+    comparison_match = PROMPT_NUMERIC_CONDITION_PATTERN.match(key)
+    if comparison_match:
+        constant_key, operator, threshold_text = comparison_match.groups()
+        try:
+            value = float(getattr(constants_module, constant_key))
+            threshold = float(threshold_text)
+        except (TypeError, ValueError, AttributeError):
+            value = None
+
+        if value is None:
+            result = False
+        elif operator == ">=":
+            result = value >= threshold
+        elif operator == "<=":
+            result = value <= threshold
+        elif operator == ">":
+            result = value > threshold
+        elif operator == "<":
+            result = value < threshold
+        elif operator == "==":
+            result = value == threshold
+        elif operator == "!=":
+            result = value != threshold
+        else:
+            result = False
+
+        return not result if negate else result
+
     try:
         value = bool(getattr(constants_module, key))
     except Exception:
@@ -256,8 +335,14 @@ def is_prompt_condition_met(condition_key: str, constants_module: Any = constant
     return not value if negate else value
 
 
-def prompt_audience_matches(audience: Set[str], is_supervisor: bool) -> bool:
+def prompt_audience_matches(
+    audience: Set[str],
+    is_supervisor: bool,
+    is_tenured: bool = False,
+) -> bool:
     if "all" in audience:
+        return True
+    if is_tenured and "tenured" in audience:
         return True
     if is_supervisor and "supervisor" in audience:
         return True
@@ -324,19 +409,20 @@ def select_prompt_candidates_for_agent(
     unconditional_prompts: List[PromptEntry],
     agent_data: Dict[str, Any],
     constants_module: Any = constants,
+    is_tenured: bool = False,
 ) -> List[str]:
     is_supervisor = supervisor_utils.is_supervisor(agent_data, constants_module)
     role_candidates = [
         render_prompt_text(prompt_text, agent_data)
         for prompt_text, audience in eligible_prompts
-        if prompt_audience_matches(audience, is_supervisor)
+        if prompt_audience_matches(audience, is_supervisor, is_tenured)
     ]
 
     if not role_candidates:
         role_candidates = [
             render_prompt_text(prompt_text, agent_data)
             for prompt_text, audience in unconditional_prompts
-            if prompt_audience_matches(audience, is_supervisor)
+            if prompt_audience_matches(audience, is_supervisor, is_tenured)
         ]
 
     return role_candidates
@@ -424,6 +510,9 @@ def _sample_prompt_file_to_agents(
                 unconditional_prompts,
                 agent_data,
                 constants_module=constants,
+                is_tenured=(
+                    station._get_agent_age_status(agent_data, current_tick) == "tenured"
+                ),
             )
             if not role_candidates:
                 continue
@@ -742,91 +831,6 @@ def check_and_apply_supervisor_report_reminder(
     return agent_data
 
 
-def check_and_apply_token_warnings(station, agent_data: Dict[str, Any], effective_max_budget: Optional[int]) -> Dict[str, Any]:
-    """
-    Checks token budget warnings based on current usage in agent_data
-    and adds notifications to agent_data if necessary. Updates warning sent flags in agent_data.
-    Warning flags are reset when token usage drops below respective thresholds.
-    This method expects agent_data to have the latest AGENT_TOKEN_BUDGET_CURRENT_KEY.
-    Returns the (potentially modified) agent_data.
-    """
-    if not agent_data or effective_max_budget is None or effective_max_budget <= 0:  # station.py:1032
-        return agent_data
-
-    if agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY):
-        return agent_data
-
-    current_session_total_tokens_used = agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY, 0)  # station.py:1027
-    if current_session_total_tokens_used is None:
-        return agent_data
-    if not isinstance(current_session_total_tokens_used, (int, float)):
-        return agent_data
-    is_guest = agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST  # station.py:1023
-
-    pre_warning_ratio = constants.GUEST_PRE_WARNING_RATIO if is_guest else constants.RECURSIVE_PRE_WARNING_RATIO  # station.py:1035
-    warning_ratio = constants.GUEST_WARNING_RATIO if is_guest else constants.RECURSIVE_WARNING_RATIO  # station.py:1036
-
-    pre_warning_threshold = pre_warning_ratio * effective_max_budget  # station.py:1038
-    warning_threshold = warning_ratio * effective_max_budget  # station.py:1039
-
-    pre_warning_sent_key = constants.AGENT_TOKEN_BUDGET_PRE_WARNING_SENT_KEY  # station.py:1041
-    warning_sent_key = constants.AGENT_TOKEN_BUDGET_WARNING_SENT_KEY  # station.py:1042
-
-    # Reset warning flags if token usage has dropped below respective thresholds
-    if current_session_total_tokens_used < pre_warning_threshold:
-        # If usage is below pre-warning threshold, reset both flags
-        if agent_data.get(pre_warning_sent_key, False):
-            agent_data[pre_warning_sent_key] = False
-        if agent_data.get(warning_sent_key, False):
-            agent_data[warning_sent_key] = False
-    elif current_session_total_tokens_used < warning_threshold:
-        # If usage is below warning threshold but above pre-warning, reset only final warning flag
-        if agent_data.get(warning_sent_key, False):
-            agent_data[warning_sent_key] = False
-
-    # Check for Pre-Warning
-    if current_session_total_tokens_used >= pre_warning_threshold and \
-       current_session_total_tokens_used < warning_threshold and \
-       not agent_data.get(pre_warning_sent_key, False):  # station.py:1045
-
-        pre_warning_message_header = (  # station.py:1048
-            f"**NOTICE:** You have used {current_session_total_tokens_used:,} tokens, which is over {pre_warning_ratio * 100:.0f}% of your "  # station.py:1049
-            f"current budget limit of {effective_max_budget:,}.\n"  # station.py:1050
-        )
-        specific_guidance = ""  # station.py:1051
-        if is_guest:  # station.py:1052
-            specific_guidance = (  # station.py:1053
-                "Prioritize ascension now (`/execute_action{ascend_inherit}` or `/execute_action{ascend_new}`) so you can unlock the Token Management Room for pruning when needed."
-            )
-        else:  # Recursive Agent # station.py:1056
-            specific_guidance = constants.RECURSIVE_PRE_WARNING  # station.py:1057
-
-        station.agent_module.add_pending_notification(agent_data, pre_warning_message_header + specific_guidance)  # station.py:1059
-        agent_data[pre_warning_sent_key] = True  # station.py:1060
-
-    # Check for Final Warning
-    if current_session_total_tokens_used >= warning_threshold and \
-       current_session_total_tokens_used < effective_max_budget and \
-       not agent_data.get(warning_sent_key, False):  # station.py:1064
-
-        warning_message_header = (  # station.py:1067
-            f"**CRITICAL NOTICE:** You have used {current_session_total_tokens_used:,} tokens, which is over {warning_ratio * 100:.0f}% of your "  # station.py:1068
-            f"current budget limit of {effective_max_budget:,}.\n"  # station.py:1069
-        )
-        specific_guidance_final = ""  # station.py:1070
-        if is_guest:  # station.py:1071
-            specific_guidance_final = (  # station.py:1072
-                "Focus on completing ascension now (`/execute_action{ascend_inherit}` or `/execute_action{ascend_new}`) so you can manage context directly once promoted."
-            )
-        else:  # Recursive Agent # station.py:1075
-            specific_guidance_final = constants.RECURSIVE_WARNING  # station.py:1076
-
-        station.agent_module.add_pending_notification(agent_data, warning_message_header + specific_guidance_final)  # station.py:1078
-        agent_data[warning_sent_key] = True  # station.py:1079
-
-    return agent_data
-
-
 def check_and_notify_maturity(station, agent_name: str, agent_data: Dict[str, Any], current_tick: int) -> None:
     """
     Check if agent has just reached maturity and send congratulatory notification.
@@ -854,13 +858,14 @@ def check_and_notify_maturity(station, agent_name: str, agent_data: Dict[str, An
                     "The system will randomly select a meta reflection prompt for you to respond to. "
                     "Meta reflection is available on both normal work days and holidays."
                 )
-            if getattr(constants, "EXTERNAL_COUNTER_ENABLED", False):
-                insert_line = "\n- External Counter - Request external literature surveys"
-                if "**Maturity Guidance**" in maturity_message and "External Counter" not in maturity_message:
-                    maturity_message = maturity_message.replace("\n\n**Maturity Guidance**", f"{insert_line}\n\n**Maturity Guidance**")
-                elif "External Counter" not in maturity_message:
-                    maturity_message += insert_line
-            station.agent_module.add_pending_notification(agent_data, maturity_message)
+            station.agent_module.add_pending_notification(
+                agent_data,
+                maturity_message,
+                protected_context_kind=constants.PROTECTED_CONTEXT_KIND_ARCHITECT_MESSAGE,
+                protected_context_source="maturity_notification",
+                protected_context_title="Maturity Reached",
+                protected_context_tick=current_tick,
+            )
             if agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE:
                 supervisor_name = supervisor_utils.get_active_supervisor_name(station.agent_module, constants)
                 supervisor_message = supervisor_utils.build_supervisor_mentee_append(supervisor_name, constants)
@@ -876,6 +881,10 @@ def check_and_notify_maturity(station, agent_name: str, agent_data: Dict[str, An
             station.agent_module.add_pending_notification(
                 agent_data,
                 build_tenured_reached_message(constants),
+                protected_context_kind=constants.PROTECTED_CONTEXT_KIND_ARCHITECT_MESSAGE,
+                protected_context_source="tenure_notification",
+                protected_context_title="Tenure Reached",
+                protected_context_tick=current_tick,
             )
             agent_data[constants.AGENT_TENURE_NOTIFIED_KEY] = True
             updated = True

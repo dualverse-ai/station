@@ -106,7 +106,6 @@ class ResearchSubmissionService(FastLaneSubmissionService):
         instruction = str(yaml_data.get("instruction", "")).rstrip()
         tags_input = yaml_data.get(consts.YAML_CAPSULE_TAGS, "")
         abstract = str(yaml_data.get(consts.YAML_CAPSULE_ABSTRACT, "")).strip()
-        cpu_only = bool(yaml_data.get("cpu_only", False)) if consts.RESEARCH_EVAL_ALLOW_CPU_ONLY else False
 
         if not title or not instruction.strip() or not tags_input or not abstract:
             return ResearchSubmissionResult(
@@ -143,7 +142,6 @@ class ResearchSubmissionService(FastLaneSubmissionService):
             tick=request.current_tick,
             tags=parsed_tags,
             abstract=processed_abstract,
-            cpu_only=cpu_only,
             lineage=lineage,
             max_active_for_author=consts.RESEARCH_MAX_CONCURRENT_SUBMISSIONS,
             extra_metadata={
@@ -160,10 +158,7 @@ class ResearchSubmissionService(FastLaneSubmissionService):
         if eval_data is None:
             return ResearchSubmissionResult(
                 accepted=False,
-                messages=[
-                    f"Submission failed: you already have an active experiment ({', '.join(active_ids)}). "
-                    "Wait for it to finish before submitting another."
-                ],
+                messages=[ResearchCenter._format_active_limit_reached_message(active_ids, consts)],
                 error="active_limit",
             )
 

@@ -3,18 +3,22 @@ import tempfile
 import unittest
 import os
 import threading
+import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from unittest import mock
 
-from station import constants
+from station import backup_utils, constants, research_storage
 from station import agent as agent_module
 from station import file_io_utils
-from station.base_room import RoomContext
+from station.action_parser import ActionParser
+from station.base_room import BaseRoom, RoomContext
 from station.eval_research.evaluation_manager import EvaluationManager
 from station.eval_research.runtime_paths import ensure_runtime_layout
 from station.eval_research.submission_service import ResearchSubmissionService
 from station.llm_connectors.base import BaseLLMConnector, LLMContextOverflowError
 from station.station import Station
-from station.sync.parallel_runner import ParallelTickRunner, StagedLLMTurn
+from station.sync.parallel_runner import ParallelTickRunner, PreparedTurn, StagedLLMTurn
 from station.sync.parallel_state import ParallelTickState, build_parallel_action_op_id
 from station.sync.parallel_status import build_parallel_tick_status
 
@@ -24,20 +28,20 @@ class TempStationDataTestCase(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp(prefix="station_parallel_test_", dir="/tmp")
         self._saved_constants = {
             "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "BACKUP_BASE_DIR": constants.BACKUP_BASE_DIR,
             "RESEARCH_CENTER_ENABLED": constants.RESEARCH_CENTER_ENABLED,
-            "TOKEN_MANAGEMENT_ROOM_ENABLED": constants.TOKEN_MANAGEMENT_ROOM_ENABLED,
             "EXTERNAL_COUNTER_ENABLED": constants.EXTERNAL_COUNTER_ENABLED,
-            "THEORY_ROOM_ENABLED": constants.THEORY_ROOM_ENABLED,
             "MAZE_ENABLED": constants.MAZE_ENABLED,
             "AGENT_ISOLATION_TICKS": constants.AGENT_ISOLATION_TICKS,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
         }
         constants.BASE_STATION_DATA_PATH = self.tmpdir
+        constants.BACKUP_BASE_DIR = os.path.join(self.tmpdir, "_backup")
         constants.RESEARCH_CENTER_ENABLED = True
-        constants.TOKEN_MANAGEMENT_ROOM_ENABLED = False
         constants.EXTERNAL_COUNTER_ENABLED = False
-        constants.THEORY_ROOM_ENABLED = False
         constants.MAZE_ENABLED = False
         constants.AGENT_ISOLATION_TICKS = None
+        constants.RESEARCH_STORAGE_BASE_PATH = None
 
     def tearDown(self):
         for key, value in self._saved_constants.items():
@@ -67,6 +71,153 @@ class FakeStation:
 
 
 class ParallelResearchSyncTests(TempStationDataTestCase):
+    def test_environment_research_storage_base_overrides_constant_value(self):
+        constants.RESEARCH_STORAGE_BASE_PATH = str(os.path.join(self.tmpdir, "yaml_storage"))
+        env_storage = os.path.join(self.tmpdir, "env_storage")
+
+        with mock.patch.dict(
+            os.environ,
+            {research_storage.BASE_PATH_ENV: env_storage},
+        ):
+            paths = ensure_runtime_layout()
+
+        self.assertTrue(os.path.islink(paths.storage_root))
+        self.assertTrue(research_storage.path_is_within(Path(paths.storage_real_root), Path(env_storage)))
+        marker = research_storage.read_allocation_marker(Path(paths.storage_real_root))
+        self.assertEqual("live", marker["kind"])
+
+    def test_changing_research_storage_base_relocates_existing_managed_link(self):
+        first_base = os.path.join(self.tmpdir, "first_storage")
+        second_base = os.path.join(self.tmpdir, "second_storage")
+
+        with mock.patch.dict(os.environ, {research_storage.BASE_PATH_ENV: first_base}):
+            first = ensure_runtime_layout()
+        first_target = Path(first.storage_real_root)
+        (first_target / "artifact.txt").write_text("preserved", encoding="utf-8")
+
+        with mock.patch.dict(os.environ, {research_storage.BASE_PATH_ENV: second_base}):
+            second = ensure_runtime_layout()
+
+        second_target = Path(second.storage_real_root)
+        self.assertTrue(research_storage.path_is_within(second_target, Path(second_base)))
+        self.assertEqual("preserved", (second_target / "artifact.txt").read_text(encoding="utf-8"))
+        self.assertFalse(first_target.exists())
+        self.assertFalse(research_storage.allocation_marker_path(first_target).exists())
+        self.assertEqual("live", research_storage.read_allocation_marker(second_target)["kind"])
+
+    def _minimal_orchestrator_for_turn_order(self, station):
+        from station.station_runner import Orchestrator
+
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator.station = station
+        orchestrator.agent_turn_order = []
+        orchestrator.current_tick_processed_agents = set()
+        orchestrator.agent_llm_connectors = {}
+        orchestrator.is_prepared = False
+        orchestrator.is_paused = False
+        orchestrator.pause_condition_met = False
+        orchestrator.pause_reason_message = ""
+        orchestrator.current_agent_index_in_turn_order = 0
+        orchestrator.events = []
+        orchestrator._push_log_event = lambda event_type, payload: orchestrator.events.append((event_type, payload))
+        orchestrator.initialize_connector_for_agent = lambda *_args, **_kwargs: True
+        return orchestrator
+
+    def _minimal_station_for_turn_order(self, turn_order):
+        station = object.__new__(Station)
+        station.agent_module = agent_module
+        station.config = {
+            constants.STATION_CONFIG_CURRENT_TICK: 10,
+            constants.STATION_CONFIG_AGENT_TURN_ORDER: list(turn_order),
+        }
+        station._save_config = lambda: None
+        station.get_next_agent_index_from_config = lambda: 0
+        station.save_next_agent_index_to_config = lambda index: station.config.__setitem__(
+            constants.STATION_CONFIG_NEXT_AGENT_INDEX, index
+        )
+        station._get_current_tick = lambda: 10
+        return station
+
+    def test_restart_pruned_ended_agent_is_respawned(self):
+        original = agent_module.create_recursive_agent(
+            model_name="test-model",
+            lineage="Aletheia",
+            generation=1,
+            current_tick=1,
+            model_provider_class="OpenAI",
+        )
+        self.assertIsNotNone(original)
+        original[constants.AGENT_SESSION_ENDED_KEY] = True
+        agent_module.save_agent_data(original[constants.AGENT_NAME_KEY], original)
+
+        station = self._minimal_station_for_turn_order([original[constants.AGENT_NAME_KEY]])
+        station.get_agent_departure_reason = Station.get_agent_departure_reason.__get__(station, Station)
+        station.create_respawn_guest_agent = Station.create_respawn_guest_agent.__get__(station, Station)
+        orchestrator = self._minimal_orchestrator_for_turn_order(station)
+
+        self.assertFalse(orchestrator.agent_turn_order)
+        self.assertTrue(orchestrator._load_agent_turn_order())
+
+        self.assertEqual(1, len(orchestrator.agent_turn_order))
+        respawned_name = orchestrator.agent_turn_order[0]
+        self.assertNotEqual(original[constants.AGENT_NAME_KEY], respawned_name)
+        respawned = agent_module.load_agent_data(respawned_name)
+        self.assertIsNotNone(respawned)
+        self.assertEqual(constants.AGENT_STATUS_GUEST, respawned[constants.AGENT_STATUS_KEY])
+        handled_events = [payload for event_type, payload in orchestrator.events if payload.get("status") == "agent_departure_handled"]
+        self.assertTrue(handled_events)
+        self.assertEqual([original[constants.AGENT_NAME_KEY]], handled_events[-1]["config_pruned_agents"])
+
+    def test_restart_pruned_ascended_guest_is_not_respawned(self):
+        guest = agent_module.create_guest_agent(
+            model_name="test-model",
+            current_tick=1,
+            model_provider_class="OpenAI",
+        )
+        self.assertIsNotNone(guest)
+        guest[constants.AGENT_IS_ASCENDED_KEY] = True
+        guest[constants.AGENT_ASCENDED_TO_NAME_KEY] = "Aletheia I"
+        agent_module.save_agent_data(guest[constants.AGENT_NAME_KEY], guest)
+
+        station = self._minimal_station_for_turn_order([guest[constants.AGENT_NAME_KEY]])
+        station.get_agent_departure_reason = Station.get_agent_departure_reason.__get__(station, Station)
+        station.create_respawn_guest_agent = lambda _name: self.fail("ascended guest should not respawn")
+        orchestrator = self._minimal_orchestrator_for_turn_order(station)
+
+        self.assertFalse(orchestrator._load_agent_turn_order())
+        self.assertEqual([], station.config[constants.STATION_CONFIG_AGENT_TURN_ORDER])
+        handled_events = [payload for event_type, payload in orchestrator.events if payload.get("status") == "agent_departure_handled"]
+        self.assertTrue(handled_events)
+        self.assertEqual([guest[constants.AGENT_NAME_KEY]], handled_events[-1]["ascended_agents"])
+
+    def test_restart_pruned_ended_agent_pauses_when_auto_respawn_disabled(self):
+        original = agent_module.create_recursive_agent(
+            model_name="test-model",
+            lineage="Aletheia",
+            generation=1,
+            current_tick=1,
+            model_provider_class="OpenAI",
+        )
+        self.assertIsNotNone(original)
+        original[constants.AGENT_SESSION_ENDED_KEY] = True
+        agent_module.save_agent_data(original[constants.AGENT_NAME_KEY], original)
+
+        station = self._minimal_station_for_turn_order([original[constants.AGENT_NAME_KEY]])
+        station.get_agent_departure_reason = Station.get_agent_departure_reason.__get__(station, Station)
+        station.create_respawn_guest_agent = lambda _name: self.fail("AUTO_RESPAWN disabled")
+        orchestrator = self._minimal_orchestrator_for_turn_order(station)
+
+        old_auto_respawn = constants.AUTO_RESPAWN
+        constants.AUTO_RESPAWN = False
+        try:
+            self.assertFalse(orchestrator._load_agent_turn_order())
+        finally:
+            constants.AUTO_RESPAWN = old_auto_respawn
+
+        self.assertTrue(orchestrator.is_paused)
+        self.assertTrue(orchestrator.pause_condition_met)
+        self.assertIn("AUTO_RESPAWN disabled", orchestrator.pause_reason_message)
+
     def test_atomic_instruction_creation_allocates_unique_ids_under_threads(self):
         manager = self.new_eval_manager()
 
@@ -114,6 +265,38 @@ class ParallelResearchSyncTests(TempStationDataTestCase):
         self.assertIsNone(second)
         self.assertEqual([first["id"]], blocked_active_ids)
 
+    def test_atomic_instruction_creation_allows_configured_active_author_limit(self):
+        manager = self.new_eval_manager()
+
+        first, active_ids = manager.create_instruction_evaluation_atomic(
+            author="Agent A",
+            title="first",
+            content="instruction",
+            tick=1,
+            max_active_for_author=2,
+        )
+        second, second_active_ids = manager.create_instruction_evaluation_atomic(
+            author="Agent A",
+            title="second",
+            content="instruction",
+            tick=1,
+            max_active_for_author=2,
+        )
+        third, blocked_active_ids = manager.create_instruction_evaluation_atomic(
+            author="Agent A",
+            title="third",
+            content="instruction",
+            tick=1,
+            max_active_for_author=2,
+        )
+
+        self.assertIsNotNone(first)
+        self.assertEqual([], active_ids)
+        self.assertIsNotNone(second)
+        self.assertIsInstance(second_active_ids, list)
+        self.assertIsNone(third)
+        self.assertEqual([first["id"], second["id"]], blocked_active_ids)
+
     def test_fast_lane_submission_creates_provisional_eval_and_wakes_evaluator(self):
         manager = self.new_eval_manager()
         station = FakeStation(manager)
@@ -152,7 +335,142 @@ class ParallelResearchSyncTests(TempStationDataTestCase):
         self.assertEqual("run-1", eval_data["parallel_tick"]["run_id"])
         self.assertEqual("op-1", eval_data["parallel_tick"]["op_id"])
 
-    def test_parallel_recovery_deletes_only_provisional_fast_lane_evals(self):
+    def test_fast_lane_precommit_updates_simulated_cooldown_between_same_turn_submits(self):
+        manager = self.new_eval_manager()
+        station = FakeStation(manager)
+        station.action_parser = ActionParser()
+        service = ResearchSubmissionService(station)
+
+        class FakeOrchestrator:
+            def __init__(self):
+                self.station = station
+                self.research_submission_service = service
+                self.archive_survey_submission_service = None
+
+            def _push_log_event(self, _event_type, _payload):
+                pass
+
+        old_cooldown = constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS
+        old_limit = constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS
+        constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS = 10
+        constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS = 2
+        try:
+            service.start()
+            runner = ParallelTickRunner(FakeOrchestrator())
+            turn = PreparedTurn(
+                agent_name="Agent A",
+                observation="",
+                agent_data={
+                    constants.AGENT_NAME_KEY: "Agent A",
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_LINEAGE_KEY: "Lineage",
+                    constants.AGENT_CURRENT_LOCATION_KEY: constants.ROOM_RESEARCH_CENTER,
+                },
+            )
+            response_text = """/execute_action{submit}
+```yaml
+title: First
+tags: alpha
+abstract: First abstract.
+instruction: Run first.
+```
+
+/execute_action{submit}
+```yaml
+title: Second
+tags: beta
+abstract: Second abstract.
+instruction: Run second.
+```
+"""
+            precommitted = runner._precommit_fast_lane_actions(
+                current_tick=5,
+                turn=turn,
+                response_text=response_text,
+                state={"run_id": "run-1"},
+            )
+        finally:
+            service.stop()
+            constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS = old_cooldown
+            constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS = old_limit
+
+        first = precommitted["tick:5:agent:Agent A:action:1"]
+        second = precommitted["tick:5:agent:Agent A:action:2"]
+        self.assertTrue(first["accepted"])
+        self.assertEqual("1", first["eval_id"])
+        self.assertFalse(second["accepted"])
+        self.assertEqual("cooldown", second["error"])
+        self.assertIn("cooldown active", second["messages"][0])
+        self.assertEqual(["1"], manager.get_active_eval_ids_for_author("Agent A"))
+
+    def test_fast_lane_precommit_accepts_two_same_turn_submits_when_limit_allows(self):
+        manager = self.new_eval_manager()
+        station = FakeStation(manager)
+        station.action_parser = ActionParser()
+        service = ResearchSubmissionService(station)
+
+        class FakeOrchestrator:
+            def __init__(self):
+                self.station = station
+                self.research_submission_service = service
+                self.archive_survey_submission_service = None
+
+            def _push_log_event(self, _event_type, _payload):
+                pass
+
+        old_cooldown = constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS
+        old_limit = constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS
+        constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS = 0
+        constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS = 2
+        try:
+            service.start()
+            runner = ParallelTickRunner(FakeOrchestrator())
+            turn = PreparedTurn(
+                agent_name="Agent A",
+                observation="",
+                agent_data={
+                    constants.AGENT_NAME_KEY: "Agent A",
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_LINEAGE_KEY: "Lineage",
+                    constants.AGENT_CURRENT_LOCATION_KEY: constants.ROOM_RESEARCH_CENTER,
+                },
+            )
+            response_text = """/execute_action{submit}
+```yaml
+title: First
+tags: alpha
+abstract: First abstract.
+instruction: Run first.
+```
+
+/execute_action{submit}
+```yaml
+title: Second
+tags: beta
+abstract: Second abstract.
+instruction: Run second.
+```
+"""
+            precommitted = runner._precommit_fast_lane_actions(
+                current_tick=5,
+                turn=turn,
+                response_text=response_text,
+                state={"run_id": "run-1"},
+            )
+        finally:
+            service.stop()
+            constants.RESEARCH_SUBMISSION_COOLDOWN_TICKS = old_cooldown
+            constants.RESEARCH_MAX_CONCURRENT_SUBMISSIONS = old_limit
+
+        first = precommitted["tick:5:agent:Agent A:action:1"]
+        second = precommitted["tick:5:agent:Agent A:action:2"]
+        self.assertTrue(first["accepted"])
+        self.assertEqual("1", first["eval_id"])
+        self.assertTrue(second["accepted"])
+        self.assertEqual("2", second["eval_id"])
+        self.assertEqual(["1", "2"], manager.get_active_eval_ids_for_author("Agent A"))
+
+    def test_parallel_recovery_reserves_rolled_back_fast_lane_eval_ids(self):
         manager = self.new_eval_manager()
         state_store = ParallelTickState(self.tmpdir)
         state = state_store.begin_tick(3, ["Agent A"], manager)
@@ -189,8 +507,27 @@ class ParallelResearchSyncTests(TempStationDataTestCase):
         rolled_back = state_store.rollback_provisional_research(manager, state)
 
         self.assertEqual([provisional["id"]], rolled_back)
-        self.assertIsNone(manager.get_evaluation(provisional["id"]))
+        tombstone = manager.get_evaluation(provisional["id"])
+        self.assertEqual("rolled_back", tombstone["parallel_commit_status"])
+        self.assertEqual("blocked", tombstone["status"])
+        self.assertTrue(tombstone["notification"]["suppressed"])
         self.assertIsNotNone(manager.get_evaluation(committed["id"]))
+
+        replacement, _ = manager.create_instruction_evaluation_atomic(
+            author="Agent C",
+            title="replacement",
+            content="instruction",
+            tick=3,
+            max_active_for_author=10,
+        )
+        self.assertEqual("3", replacement["id"])
+
+        notifications = []
+        manager.set_notification_callback(lambda author, message: notifications.append((author, message)))
+        manager.finalize_evaluation(provisional["id"], "stale coder report", final_status="completed")
+        self.assertFalse(manager.send_notification_if_pending(provisional["id"]))
+        self.assertEqual([], notifications)
+        self.assertEqual("rolled_back", manager.get_evaluation(provisional["id"])["parallel_commit_status"])
 
     def test_parallel_tick_status_reports_waiting_and_pending_agents(self):
         status = build_parallel_tick_status({
@@ -284,6 +621,291 @@ class ParallelResearchSyncTests(TempStationDataTestCase):
         )
         self.assertEqual([6], [entry["tick"] for entry in agent_a_entries])
         self.assertEqual([6, 7, 7], [entry["tick"] for entry in agent_b_entries])
+
+    def test_parallel_snapshot_cleanup_removes_dirs_after_retention_window(self):
+        state_store = ParallelTickState(self.tmpdir)
+        state_store.ensure_layout()
+        old_dir = os.path.join(state_store.run_dir, "tick_10_oldrun")
+        keep_dir = os.path.join(state_store.run_dir, "tick_11_keeprun")
+        active_dir = os.path.join(state_store.run_dir, "tick_10_activerun")
+        invalid_dir = os.path.join(state_store.run_dir, "misc")
+        for path in [old_dir, keep_dir, active_dir, invalid_dir]:
+            file_io_utils.ensure_dir_exists(path)
+
+        removed = state_store.cleanup_completed_run_dirs(
+            20,
+            retention_ticks=10,
+            exclude_run_id="activerun",
+        )
+
+        self.assertEqual([old_dir], removed)
+        self.assertFalse(os.path.exists(old_dir))
+        self.assertTrue(os.path.isdir(keep_dir))
+        self.assertTrue(os.path.isdir(active_dir))
+        self.assertTrue(os.path.isdir(invalid_dir))
+
+    def test_backup_skips_parallel_sync_directory(self):
+        sync_dir = os.path.join(
+            constants.BASE_STATION_DATA_PATH,
+            constants.PARALLEL_TICK_STATE_DIR_NAME,
+        )
+        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
+
+        self.assertTrue(backup_utils._should_skip_backup_dir(sync_dir, constants.BACKUP_BASE_DIR))
+        self.assertFalse(backup_utils._should_skip_backup_dir(agents_dir, constants.BACKUP_BASE_DIR))
+
+    def test_backup_records_admin_symlink_without_following_branch_data(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        file_io_utils.save_text("live", os.path.join(constants.BASE_STATION_DATA_PATH, "live.txt"))
+        admin_dir = os.path.join(constants.BASE_STATION_DATA_PATH, "admin")
+        file_io_utils.ensure_dir_exists(admin_dir)
+
+        with tempfile.TemporaryDirectory(prefix="station_branch_target_", dir="/tmp") as branch_dir:
+            file_io_utils.save_text("branch", os.path.join(branch_dir, "branch_marker.txt"))
+            os.symlink(branch_dir, os.path.join(admin_dir, "station_data_s1"), target_is_directory=True)
+
+            manifest_path = backup_utils.create_backup(1, "test")
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        file_paths = {entry["path"] for entry in manifest["files"]}
+        symlinks = {entry["path"]: entry["target"] for entry in manifest.get("symlinks", [])}
+
+        self.assertIn("live.txt", file_paths)
+        self.assertNotIn("admin/station_data_s1/branch_marker.txt", file_paths)
+        self.assertEqual(branch_dir, symlinks.get("admin/station_data_s1"))
+
+        with tempfile.TemporaryDirectory(prefix="station_restore_target_", dir="/tmp") as restore_parent:
+            restore_dir = os.path.join(restore_parent, "station_data_restored")
+            self.assertTrue(backup_utils.restore_backup("station-id", 1, restore_dir))
+            restored_link = os.path.join(restore_dir, "admin", "station_data_s1")
+            self.assertTrue(os.path.islink(restored_link))
+            self.assertEqual(branch_dir, os.readlink(restored_link))
+            self.assertFalse(os.path.exists(os.path.join(restored_link, "branch_marker.txt")))
+
+    def test_restore_backup_subtree_restores_multistart_job_only(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        file_io_utils.save_text("live", os.path.join(constants.BASE_STATION_DATA_PATH, "live.txt"))
+        job_dir = os.path.join(constants.BASE_STATION_DATA_PATH, "multistart", "501_job")
+        file_io_utils.save_text("state", os.path.join(job_dir, "state.yaml"))
+        file_io_utils.save_text("seed", os.path.join(job_dir, "station_data_s1", "station_config.yaml"))
+        admin_dir = os.path.join(job_dir, "admin")
+        file_io_utils.ensure_dir_exists(admin_dir)
+        os.symlink(os.path.join("..", "station_data_s1"), os.path.join(admin_dir, "station_data_s1"), target_is_directory=True)
+
+        backup_utils.create_backup(1, "test")
+
+        with tempfile.TemporaryDirectory(prefix="station_restore_target_", dir="/tmp") as restore_parent:
+            restore_dir = os.path.join(restore_parent, "multistart_501_job")
+            self.assertTrue(backup_utils.restore_backup_subtree("station-id", 1, "multistart/501_job", restore_dir))
+            self.assertTrue(os.path.isfile(os.path.join(restore_dir, "state.yaml")))
+            restored_config = os.path.join(restore_dir, "station_data_s1", "station_config.yaml")
+            self.assertEqual("seed", file_io_utils.load_text(restored_config))
+            self.assertFalse(os.path.exists(os.path.join(restore_dir, "live.txt")))
+            restored_link = os.path.join(restore_dir, "admin", "station_data_s1")
+            self.assertTrue(os.path.islink(restored_link))
+            self.assertEqual(os.path.join("..", "station_data_s1"), os.readlink(restored_link))
+
+    def test_same_tick_normal_backup_moves_existing_snapshot_aside(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        file_io_utils.save_text("before", os.path.join(constants.BASE_STATION_DATA_PATH, "marker.txt"))
+
+        first_manifest_path = backup_utils.create_backup(1, "manual")
+        file_io_utils.save_text("after", os.path.join(constants.BASE_STATION_DATA_PATH, "marker.txt"))
+        second_manifest_path = backup_utils.create_backup(1, "automatic")
+
+        self.assertEqual(first_manifest_path, second_manifest_path)
+        self.assertEqual("tick_1.json", os.path.basename(first_manifest_path))
+        moved_manifests = [
+            name for name in os.listdir(os.path.dirname(first_manifest_path))
+            if name.startswith("tick_1_backup_") and name.endswith(".json")
+        ]
+        self.assertEqual(1, len(moved_manifests))
+
+        with open(os.path.join(os.path.dirname(first_manifest_path), moved_manifests[0]), "r", encoding="utf-8") as handle:
+            moved_manifest = json.load(handle)
+        with open(first_manifest_path, "r", encoding="utf-8") as handle:
+            second_manifest = json.load(handle)
+
+        def marker_hash(manifest):
+            for entry in manifest["files"]:
+                if entry["path"] == "marker.txt":
+                    return entry["hash"]
+            return None
+
+        self.assertIsNotNone(marker_hash(moved_manifest))
+        self.assertIsNotNone(marker_hash(second_manifest))
+        self.assertNotEqual(marker_hash(moved_manifest), marker_hash(second_manifest))
+
+        with tempfile.TemporaryDirectory(prefix="station_restore_target_", dir="/tmp") as restore_parent:
+            restore_dir = os.path.join(restore_parent, "station_data_restored")
+            self.assertTrue(backup_utils.restore_backup("station-id", 1, restore_dir))
+            self.assertEqual("after", file_io_utils.load_text(os.path.join(restore_dir, "marker.txt")))
+
+    def test_multistart_restore_prefers_named_snapshot_over_normal_tick_snapshot(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        job_dir = os.path.join(constants.BASE_STATION_DATA_PATH, "multistart", "501_job")
+        seed_config = os.path.join(job_dir, "station_data_s1", "station_config.yaml")
+        file_io_utils.save_text("full seed", seed_config)
+        named_manifest = backup_utils.create_backup(
+            1,
+            "multistart",
+            snapshot_suffix="multistart_501_job",
+        )
+        self.assertEqual("tick_1_multistart_501_job.json", os.path.basename(named_manifest))
+
+        shutil.rmtree(os.path.join(job_dir, "station_data_s1"))
+        file_io_utils.save_text("pruned", os.path.join(job_dir, "station_data_s1.pruned.yaml"))
+        backup_utils.create_backup(1, "automatic")
+
+        with tempfile.TemporaryDirectory(prefix="station_restore_target_", dir="/tmp") as restore_parent:
+            restore_dir = os.path.join(restore_parent, "multistart_501_job")
+            self.assertTrue(backup_utils.restore_backup_subtree("station-id", 1, "multistart/501_job", restore_dir))
+            self.assertEqual("full seed", file_io_utils.load_text(os.path.join(restore_dir, "station_data_s1", "station_config.yaml")))
+            self.assertFalse(os.path.exists(os.path.join(restore_dir, "station_data_s1.pruned.yaml")))
+
+    def test_full_restore_can_select_named_multistart_snapshot(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        marker_path = os.path.join(constants.BASE_STATION_DATA_PATH, "marker.txt")
+        file_io_utils.save_text("selected branch at tick 1", marker_path)
+        backup_utils.create_backup(
+            1,
+            "multistart",
+            snapshot_suffix="multistart_501_job",
+        )
+        file_io_utils.save_text("later automatic state", marker_path)
+        backup_utils.create_backup(1, "automatic")
+
+        with tempfile.TemporaryDirectory(prefix="station_restore_target_", dir="/tmp") as restore_parent:
+            restore_dir = os.path.join(restore_parent, "station_data_restored")
+            self.assertTrue(
+                backup_utils.restore_backup(
+                    "station-id",
+                    1,
+                    restore_dir,
+                    snapshot_suffix="multistart_501_job",
+                )
+            )
+            self.assertEqual(
+                "selected branch at tick 1",
+                file_io_utils.load_text(os.path.join(restore_dir, "marker.txt")),
+            )
+
+    def test_backup_follows_research_storage_root_symlink(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        research_dir = os.path.join(
+            constants.BASE_STATION_DATA_PATH,
+            constants.ROOMS_DIR_NAME,
+            constants.SHORT_ROOM_NAME_RESEARCH,
+        )
+        file_io_utils.ensure_dir_exists(research_dir)
+
+        with tempfile.TemporaryDirectory(prefix="station_shared_storage_", dir="/tmp") as storage_dir:
+            stored_file = os.path.join(storage_dir, "lineages", "alpha", "data", "result.txt")
+            file_io_utils.save_text("shared", stored_file)
+            os.symlink(storage_dir, os.path.join(storage_dir, "loop"), target_is_directory=True)
+            deceptive_research_dir = os.path.join(
+                storage_dir,
+                "nested",
+                "station_data_s9",
+                constants.ROOMS_DIR_NAME,
+                constants.SHORT_ROOM_NAME_RESEARCH,
+            )
+            file_io_utils.ensure_dir_exists(deceptive_research_dir)
+            os.symlink(
+                storage_dir,
+                os.path.join(deceptive_research_dir, constants.RESEARCH_STORAGE_DIR),
+                target_is_directory=True,
+            )
+            os.symlink(
+                storage_dir,
+                os.path.join(research_dir, constants.RESEARCH_STORAGE_DIR),
+                target_is_directory=True,
+            )
+
+            manifest_path = backup_utils.create_backup(1, "test")
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        file_paths = {entry["path"] for entry in manifest["files"]}
+        symlink_paths = {entry["path"] for entry in manifest.get("symlinks", [])}
+
+        storage_relative = "/".join([
+            constants.ROOMS_DIR_NAME,
+            constants.SHORT_ROOM_NAME_RESEARCH,
+            constants.RESEARCH_STORAGE_DIR,
+        ])
+        self.assertIn(f"{storage_relative}/lineages/alpha/data/result.txt", file_paths)
+        self.assertNotIn(storage_relative, symlink_paths)
+        self.assertIn(f"{storage_relative}/loop", symlink_paths)
+        self.assertIn(
+            f"{storage_relative}/nested/station_data_s9/{storage_relative}",
+            symlink_paths,
+        )
+
+    def test_backup_follows_archived_multistart_branch_research_storage_symlink(self):
+        file_io_utils.save_yaml(
+            {"station_id": "station-id", "current_tick": 1},
+            os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME),
+        )
+        branch_research = os.path.join(
+            constants.BASE_STATION_DATA_PATH,
+            "multistart",
+            "501_job",
+            "station_data_s1",
+            constants.ROOMS_DIR_NAME,
+            constants.SHORT_ROOM_NAME_RESEARCH,
+        )
+        file_io_utils.ensure_dir_exists(branch_research)
+        file_io_utils.save_yaml(
+            {"job_id": "job", "status": "finalizing"},
+            os.path.join(constants.BASE_STATION_DATA_PATH, "multistart", "501_job", "state.yaml"),
+        )
+
+        with tempfile.TemporaryDirectory(prefix="station_remote_seed_storage_", dir="/tmp") as storage_dir:
+            stored_file = os.path.join(storage_dir, "lineages", "alpha", "result.txt")
+            file_io_utils.save_text("remote branch", stored_file)
+            os.symlink(
+                storage_dir,
+                os.path.join(branch_research, constants.RESEARCH_STORAGE_DIR),
+                target_is_directory=True,
+            )
+
+            manifest_path = backup_utils.create_backup(
+                1,
+                "multistart",
+                snapshot_suffix="multistart_501_job",
+            )
+
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        expected = (
+            "multistart/501_job/station_data_s1/rooms/research/storage/"
+            "lineages/alpha/result.txt"
+        )
+        self.assertIn(expected, {entry["path"] for entry in manifest["files"]})
+        self.assertNotIn(
+            "multistart/501_job/station_data_s1/rooms/research/storage",
+            {entry["path"] for entry in manifest.get("symlinks", [])},
+        )
 
     def test_submit_response_consumes_precommitted_research_without_duplicate_eval(self):
         from station import agent as agent_module
@@ -515,6 +1137,55 @@ instruction: Run the experiment.
         )
         self.assertEqual("llm_context_overflow_manual_pause", station.dialogue_entries[0][1]["type"])
 
+    def test_unavailable_connector_pauses_parallel_send(self):
+        from station.station_runner import Orchestrator
+
+        class FakeStationForMissingConnector:
+            def __init__(self):
+                self.dialogue_entries = []
+
+            def _log_dialogue_entry(self, agent_name, entry):
+                self.dialogue_entries.append((agent_name, entry))
+
+        class FakeOrchestratorForMissingConnector:
+            _pause_for_unavailable_connector = Orchestrator._pause_for_unavailable_connector
+
+            def __init__(self, station):
+                self.station = station
+                self.pause_calls = []
+
+            def _get_current_connector_for_agent(self, agent_name):
+                return None
+
+            def _push_log_event(self, event_type, payload):
+                pass
+
+            def _trigger_pause_due_to_llm_error(self, agent_name, error, error_type):
+                self.pause_calls.append((agent_name, str(error), error_type))
+
+        station = FakeStationForMissingConnector()
+        orchestrator = FakeOrchestratorForMissingConnector(station)
+
+        parallel_result = ParallelTickRunner(orchestrator)._send_llm_staged(
+            agent_name="Agent A",
+            prompt="observation",
+            current_tick=7,
+            prompt_type="observation",
+            internal_loop_step=None,
+        )
+
+        self.assertEqual((None, False, None, None), parallel_result)
+        self.assertEqual(
+            [
+                ("Agent A", "SYSTEM_ERROR: No LLM connector for Agent A.", "LLM_CONNECTOR_UNAVAILABLE"),
+            ],
+            orchestrator.pause_calls,
+        )
+        self.assertEqual(
+            ["llm_connector_error"],
+            [entry[1]["type"] for entry in station.dialogue_entries],
+        )
+
     def _minimal_station_for_request_status(self, agent_data):
         agent_module.save_agent_data(agent_data[constants.AGENT_NAME_KEY], agent_data)
 
@@ -575,13 +1246,109 @@ instruction: Run the experiment.
             **base_agent,
             constants.AGENT_TOKEN_BUDGET_CURRENT_KEY: 95,
             constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY: True,
-            constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY: constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE,
+            constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY: constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_CONTEXT_FILTER,
         })
         stale_observation, stale_error = stale_station.request_status("Agent A")
         self.assertIsNone(stale_error)
         self.assertNotIn("Agent Token Budget", stale_observation)
         saved = agent_module.load_agent_data("Agent A")
         self.assertEqual([], saved.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, []))
+
+    def test_request_status_reuses_pending_observation_until_response_commit(self):
+        agent_name = "Agent A"
+        agent_module.save_agent_data(
+            agent_name,
+            {
+                constants.AGENT_NAME_KEY: agent_name,
+                constants.AGENT_DESCRIPTION_KEY: "desc",
+                constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                constants.AGENT_TOKEN_BUDGET_CURRENT_KEY: 10,
+                constants.AGENT_TOKEN_BUDGET_MAX_KEY: 100,
+                constants.AGENT_CURRENT_LOCATION_KEY: constants.ROOM_LOBBY,
+                constants.AGENT_ROOM_OUTPUT_HISTORY_KEY: [],
+                constants.AGENT_NOTIFICATIONS_PENDING_KEY: [],
+                constants.AGENT_SHOWN_NOTIFICATIONS_KEY: [],
+                constants.AGENT_SESSION_ENDED_KEY: False,
+                constants.AGENT_IS_ASCENDED_KEY: False,
+            },
+        )
+
+        class RetryHelpRoom(BaseRoom):
+            def __init__(self):
+                super().__init__(constants.ROOM_LOBBY)
+
+            def build_ascension_system_message(self, _agent_data, _room_context):
+                return None
+
+            def _get_specific_room_content(self, _agent_data, _room_context, _current_tick):
+                return "Lobby body after help."
+
+            def handle_action(self, *_args, **_kwargs):
+                return [], None
+
+            def get_help_message(self, _agent_data, _room_context):
+                return "Retry-visible lobby help."
+
+        class NoActionParser:
+            def parse(self, _response_text):
+                return []
+
+        station = object.__new__(Station)
+        station.agent_module = agent_module
+        station.capsule_module = None
+        station.config = {
+            constants.STATION_CONFIG_CURRENT_TICK: 10,
+            constants.STATION_CONFIG_STATION_STATUS: "Testing",
+        }
+        room = RetryHelpRoom()
+        station.rooms = {constants.ROOM_LOBBY: room}
+        station.room_context = RoomContext(
+            agent_manager=agent_module,
+            capsule_manager=None,
+            notification_manager=None,
+            constants_module=constants,
+            station_instance=station,
+        )
+        station.action_parser = NoActionParser()
+        station._get_current_tick = lambda: 10
+        station.is_holiday_tick = lambda _tick: False
+        station._check_and_apply_inactivity_warning = lambda data, _tick: data
+        station._check_and_apply_meta_reflection_warning = lambda data, _tick: data
+        station._check_and_apply_life_warnings = lambda data, _tick: data
+        station._check_and_apply_supervisor_report_reminder = lambda data, _tick: data
+        station._get_agent_age_status = lambda _data, _tick: None
+        station._is_agent_inactive = lambda _data: False
+        station._update_meta_reflection_tick_count = lambda data, _tick: data
+        station._log_dialogue_entry = lambda _agent_name, _entry: None
+
+        first_observation, first_error = station.request_status(agent_name)
+        self.assertIsNone(first_error)
+        self.assertIn("Retry-visible lobby help.", first_observation)
+
+        saved_after_first_render = agent_module.load_agent_data(agent_name)
+        self.assertTrue(
+            saved_after_first_render[constants.SHORT_ROOM_NAME_LOBBY][
+                constants.AGENT_ROOM_STATE_FIRST_VISIT_HELP_SHOWN_KEY
+            ]
+        )
+        self.assertEqual(
+            10,
+            saved_after_first_render[constants.AGENT_PENDING_OBSERVATION_TICK_KEY],
+        )
+
+        second_observation, second_error = station.request_status(agent_name)
+        self.assertIsNone(second_error)
+        self.assertEqual(first_observation, second_observation)
+        self.assertIn("Retry-visible lobby help.", second_observation)
+
+        station.submit_response(agent_name, "No action this turn.", 10)
+        saved_after_commit = agent_module.load_agent_data(agent_name)
+        self.assertNotIn(constants.AGENT_PENDING_OBSERVATION_TICK_KEY, saved_after_commit)
+        self.assertNotIn(constants.AGENT_PENDING_OBSERVATION_TEXT_KEY, saved_after_commit)
+
+        third_observation, third_error = station.request_status(agent_name)
+        self.assertIsNone(third_error)
+        self.assertNotIn("Retry-visible lobby help.", third_observation)
 
     def test_fresh_token_update_clears_stale_budget_flags(self):
         agent_module.save_agent_data(
@@ -592,8 +1359,7 @@ instruction: Run the experiment.
                 constants.AGENT_TOKEN_BUDGET_CURRENT_KEY: 95,
                 constants.AGENT_TOKEN_BUDGET_MAX_KEY: 100,
                 constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY: True,
-                constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY: constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE,
-                constants.AGENT_LAST_PRUNE_ACTION_TICK_KEY: 9,
+                constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY: constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_CONTEXT_FILTER,
             },
         )
         station = object.__new__(Station)
@@ -607,7 +1373,7 @@ instruction: Run the experiment.
         self.assertNotIn(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY, updated)
         self.assertNotIn(constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY, updated)
 
-    def test_parallel_prepare_marks_unavailable_post_prune_count_stale(self):
+    def test_parallel_prepare_marks_unavailable_service_filter_count_stale(self):
         agent_name = "Agent A"
         agent_module.save_agent_data(
             agent_name,
@@ -627,7 +1393,6 @@ instruction: Run the experiment.
                         constants.PRUNE_PRUNED_AT_TICK_KEY: 9,
                     }
                 ],
-                constants.AGENT_LAST_PRUNE_ACTION_TICK_KEY: 9,
                 constants.AGENT_SESSION_ENDED_KEY: False,
                 constants.AGENT_IS_ASCENDED_KEY: False,
             },
@@ -692,7 +1457,7 @@ instruction: Run the experiment.
         updated_agent = agent_module.load_agent_data(agent_name)
         self.assertTrue(updated_agent[constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY])
         self.assertEqual(
-            constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE,
+            constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_CONTEXT_FILTER,
             updated_agent[constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY],
         )
         self.assertEqual(265477, updated_agent[constants.AGENT_TOKEN_BUDGET_CURRENT_KEY])

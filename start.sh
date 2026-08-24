@@ -8,7 +8,9 @@ STATION_NAME_OVERRIDE=""
 AUTO_START_STATION=false
 FORCE_STOP=false
 REBUILD_DB=false
-RUN_MIGRATIONS=false
+TEST_MODE=false
+NO_MULTISTART=false
+REQUEUE_FAILED_EXTERNAL_REPORTS=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --name)
@@ -27,19 +29,27 @@ while [ $# -gt 0 ]; do
         --rebuild-db|--rebuild_db)
             REBUILD_DB=true
             ;;
-        --migrate)
-            RUN_MIGRATIONS=true
+        --test)
+            TEST_MODE=true
+            ;;
+        --no-multistart|--no_multistart)
+            NO_MULTISTART=true
+            ;;
+        --requeue-failed-external-reports)
+            REQUEUE_FAILED_EXTERNAL_REPORTS=true
             ;;
         -h|--help)
-            echo "Usage: ./start.sh [--name station_name] [--start|-s] [--force] [--rebuild-db] [--migrate]"
+            echo "Usage: ./start.sh [--name station_name] [--start|-s] [--force] [--rebuild-db] [--test|--no-multistart] [--requeue-failed-external-reports]"
             echo "  --force: pass --force to stop.sh before starting."
             echo "  --rebuild-db: rebuild derived SQLite station indexes from YAML before starting."
-            echo "  --migrate: check and run station data migration scripts before starting."
+            echo "  --test: apply quick-test overrides before starting."
+            echo "  --no-multistart: write runtime overrides disabling init and stagnation multistart."
+            echo "  --requeue-failed-external-reports: one-time recovery of failed or failure-requeued External Counter reports whose authors are still active."
             exit 0
             ;;
         *)
             echo "ERROR: Unknown argument '$1'"
-            echo "Usage: ./start.sh [--name station_name] [--start|-s] [--force] [--rebuild-db] [--migrate]"
+            echo "Usage: ./start.sh [--name station_name] [--start|-s] [--force] [--rebuild-db] [--test|--no-multistart] [--requeue-failed-external-reports]"
             exit 1
             ;;
     esac
@@ -113,11 +123,151 @@ fi
 FLASK_PORT=${FLASK_PORT:-5000}
 NGINX_HTTP_PORT=${NGINX_HTTP_PORT:-80}
 NGINX_HTTPS_PORT=${NGINX_HTTPS_PORT:-8443}
+GUNICORN_THREADS=${GUNICORN_THREADS:-8}
 
 # Always bypass proxies for local loopback API calls.
 api_curl() {
     env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
         curl --noproxy '*' "$@"
+}
+
+resume_multistart_branches_if_autostart() {
+    if [ "$AUTO_START_STATION" != true ]; then
+        return 0
+    fi
+    python - <<'PY'
+import sys
+import time
+from pathlib import Path
+from station.multistart import ipc, state
+from station.multistart.controller import find_running_controller_pid
+
+repo = Path.cwd()
+deadline = time.monotonic() + 30.0
+last_error = "controller did not respond"
+
+def resume_completed_server_side():
+    current = state.load_current_job(repo)
+    job_path = Path(str(current.get("job_dir") or ""))
+    if not job_path.is_dir():
+        return False
+    payload = state.load_job_state(job_path)
+    return (
+        state.job_control(payload) == state.CONTROL_RUNNING
+        and find_running_controller_pid(repo) is not None
+    )
+
+while time.monotonic() < deadline:
+    try:
+        response = ipc.request_resume_branches(repo=repo, timeout=30.0)
+    except Exception as exc:
+        if resume_completed_server_side():
+            print("✓ Auto-start requested; multistart branch rolling resumed (confirmed after IPC timeout).")
+            sys.exit(0)
+        last_error = str(exc)
+        time.sleep(1.0)
+        continue
+    if response.get("success") is True:
+        print("✓ Auto-start requested; multistart branch rolling resumed.")
+        sys.exit(0)
+    if resume_completed_server_side():
+        print("✓ Auto-start requested; multistart branch rolling resumed (confirmed from job state).")
+        sys.exit(0)
+    last_error = str(response.get("error") or "unknown error")
+    time.sleep(1.0)
+
+print(f"ERROR: Auto-start requested, but multistart resume failed: {last_error}")
+sys.exit(1)
+PY
+}
+
+# TEMPORARY: Remove after External Counter failures from the API 5 tool-capability
+# incident have been recovered on all affected stations.
+requeue_failed_external_reports_once() {
+    python - "$STATION_DATA_DIR" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from station import agent as agent_module
+from station import constants, file_io_utils
+from station.eval_external import pending_queue
+from station.multistart import state, waiting
+
+repo = Path.cwd().resolve()
+data_roots = []
+
+def add_root(path):
+    path = Path(path).resolve()
+    if path.is_dir() and path not in data_roots:
+        data_roots.append(path)
+
+add_root(sys.argv[1])
+active_job = waiting.active_job(repo)
+if active_job:
+    job_dir = Path(str(active_job.get("job_dir") or ""))
+    if job_dir.is_dir():
+        add_root(job_dir / state.ORIGIN_DIR_NAME)
+        for branch_root in sorted(job_dir.glob("station_data_s*")):
+            add_root(branch_root)
+
+total_requeued = 0
+for station_data in data_roots:
+    constants.BASE_STATION_DATA_PATH = str(station_data)
+    active_agents = set(agent_module.get_all_active_agent_names())
+    reports_dir = station_data / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_EXTERNAL / constants.EXTERNAL_REPORTS_SUBDIR_NAME
+    pending_path = station_data / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_EXTERNAL / constants.PENDING_EXTERNAL_REPORTS_FILENAME
+    requeued = []
+    skipped = []
+
+    for filename in file_io_utils.list_files(str(reports_dir), constants.YAML_EXTENSION):
+        if not filename.startswith("report_"):
+            continue
+        report_path = reports_dir / filename
+        report = file_io_utils.load_yaml(str(report_path))
+        if not isinstance(report, dict):
+            continue
+        status = report.get(constants.EXTERNAL_REPORT_STATUS_KEY)
+        try:
+            requeue_count = int(report.get(constants.EXTERNAL_REPORT_REQUEUE_COUNT_KEY) or 0)
+        except (TypeError, ValueError):
+            requeue_count = 0
+        failed_retry = (
+            status in (
+                constants.EXTERNAL_REPORT_STATUS_PENDING,
+                constants.EXTERNAL_REPORT_STATUS_RUNNING,
+            )
+            and requeue_count > 0
+        )
+        if status != constants.EXTERNAL_REPORT_STATUS_FAILED and not failed_retry:
+            continue
+
+        report_id = str(report.get(constants.EXTERNAL_REPORT_ID_KEY) or "").strip()
+        author = str(report.get(constants.EXTERNAL_REPORT_AUTHOR_KEY) or "").strip()
+        if not report_id or author not in active_agents:
+            skipped.append(report_id or filename)
+            continue
+
+        report[constants.EXTERNAL_REPORT_STATUS_KEY] = constants.EXTERNAL_REPORT_STATUS_PENDING
+        report.pop(constants.EXTERNAL_REPORT_START_TICK_KEY, None)
+        report.pop(constants.EXTERNAL_REPORT_COMPLETED_TICK_KEY, None)
+        report.pop(constants.EXTERNAL_REPORT_NEXT_RETRY_AT_KEY, None)
+        report.pop(constants.EXTERNAL_REPORT_REQUEUE_COUNT_KEY, None)
+        report.pop(constants.EXTERNAL_REPORT_ERROR_KEY, None)
+        file_io_utils.save_yaml(report, str(report_path))
+        pending_queue.remove(str(pending_path), report_id, constants.EXTERNAL_REPORT_ID_KEY)
+        pending_queue.append(str(pending_path), report, constants.EXTERNAL_REPORT_ID_KEY)
+        requeued.append(report_id)
+
+    total_requeued += len(requeued)
+    if requeued:
+        print(f"{station_data}: requeued External Counter report(s): {', '.join(requeued)}")
+    if skipped:
+        print(f"{station_data}: skipped inactive-author report(s): {', '.join(skipped)}")
+
+if total_requeued == 0:
+    print("No eligible failed or failure-requeued External Counter reports found.")
+PY
 }
 
 start_loopback_gunicorn() {
@@ -138,8 +288,7 @@ start_loopback_gunicorn() {
         --timeout 600 \
         --workers 1 \
         --worker-class gthread \
-        --threads 4 \
-        --access-logfile "$ACCESS_LOG" \
+        --threads "$GUNICORN_THREADS" \
         --error-logfile "$ERROR_LOG" \
         --capture-output \
         --daemon \
@@ -192,8 +341,7 @@ start_tls_gunicorn() {
         --timeout 600 \
         --workers 1 \
         --worker-class gthread \
-        --threads 4 \
-        --access-logfile "$ACCESS_LOG" \
+        --threads "$GUNICORN_THREADS" \
         --error-logfile "$ERROR_LOG" \
         --capture-output \
         --daemon \
@@ -243,92 +391,6 @@ PY
     echo "✓ Station name updated via API."
 }
 
-migrate_research_eval_artifacts_if_needed() {
-    local needs_migration
-    local needs_migration_output
-    if ! needs_migration_output=$(python scripts/migrate/migrate_research_eval_artifacts.py --check 2>&1); then
-        printf '%s\n' "$needs_migration_output"
-        echo "ERROR: Could not inspect Research eval metadata schema."
-        return 1
-    fi
-    printf '%s\n' "$needs_migration_output" | sed '$d'
-    needs_migration="${needs_migration_output##*$'\n'}"
-
-    if [ "$needs_migration" = "yes" ]; then
-        echo "Research eval metadata is legacy; migrating inline blobs to artifacts..."
-        if ! python scripts/migrate/migrate_research_eval_artifacts.py; then
-            echo "ERROR: Research eval artifact migration failed. Station startup aborted."
-            return 1
-        fi
-        echo "✓ Research eval artifact migration complete."
-    elif [ "$needs_migration" = "no" ]; then
-        echo "✓ Research eval metadata is artifact-backed."
-    else
-        echo "ERROR: Unexpected Research eval migration check result: $needs_migration"
-        return 1
-    fi
-}
-
-migrate_protected_dialogue_ticks_if_needed() {
-    local needs_migration
-    if ! needs_migration=$(python scripts/migrate/migrate_protected_dialogue_ticks.py --check); then
-        echo "ERROR: Could not inspect agent dialogue protection schema."
-        return 1
-    fi
-
-    if [ "$needs_migration" = "yes" ]; then
-        echo "Agent dialogue protection schema is legacy; migrating protected ticks into agent YAML..."
-        if ! python scripts/migrate/migrate_protected_dialogue_ticks.py; then
-            echo "ERROR: Protected dialogue tick migration failed. Station startup aborted."
-            return 1
-        fi
-        echo "✓ Protected dialogue tick migration complete."
-    else
-        echo "✓ Agent dialogue protection schema is current."
-    fi
-}
-
-migrate_lobby_codex_help_if_needed() {
-    local needs_migration
-    if ! needs_migration=$(python scripts/migrate/migrate_lobby_codex_help.py --check); then
-        echo "ERROR: Could not inspect first-turn Lobby Codex help history."
-        return 1
-    fi
-
-    if [ "$needs_migration" = "yes" ]; then
-        echo "First-turn Lobby help is missing Codex text for active agents; migrating dialogue history..."
-        if ! python scripts/migrate/migrate_lobby_codex_help.py; then
-            echo "ERROR: Lobby Codex help migration failed. Station startup aborted."
-            return 1
-        fi
-        echo "✓ Lobby Codex help migration complete."
-    else
-        echo "✓ First-turn Lobby Codex help history is current."
-    fi
-}
-
-index_schema_version_bump_requires_migration() {
-    local result
-    if ! result=$(python scripts/migrate/check_index_schema_migration.py); then
-        printf '%s\n' "$result"
-        echo "ERROR: Could not inspect SQLite index schema versions."
-        return 2
-    fi
-
-    case "$result" in
-        yes)
-            return 0
-            ;;
-        no)
-            return 1
-            ;;
-        *)
-            echo "ERROR: Unexpected SQLite index schema check result: $result"
-            return 2
-            ;;
-    esac
-}
-
 # --- Conda Environment Setup ---
 CONDA_ENV_NAME=${CONDA_ENV_NAME:-station} # Default to 'station' if not set
 
@@ -361,56 +423,19 @@ else
     echo "WARNING: conda.sh not found at '$CONDA_SH_PATH'. Ensure conda environment is activated manually if needed."
 fi
 
-# --- Theory Room cache refresh (guarded) ---
-# If Theory Room is enabled, wipe only this repo's theory cache and rebuild.
-THEORY_CACHE_DIR=$(python3 - <<'PY'
-from pathlib import Path
-import hashlib
-import sys
-import contextlib
-import os
-
-try:
-    # Suppress noisy prints (e.g., proxy overrides) when importing constants
-    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-        from station import constants
-except Exception:
-    print("")
-    sys.exit(0)
-
-enabled = getattr(constants, "THEORY_ROOM_ENABLED", False)
-if enabled:
-    repo_root = Path.cwd()
-    repo_hash = hashlib.md5(str(repo_root).encode()).hexdigest()[:8]
-    cache_dir = Path.home() / f".cache/station_theory_{repo_hash}"
-    print(cache_dir)
-else:
-    print("")
-PY
-)
-
-if [ -n "$THEORY_CACHE_DIR" ]; then
-    if [ -d "$THEORY_CACHE_DIR" ]; then
-        echo "Theory Room enabled; cache exists at $THEORY_CACHE_DIR (no wipe)"
-        echo "Rebuilding Theory Room cache via scripts/setup_theory.sh..."
-        if ! REBUILD_ONLY=true /bin/bash scripts/setup_theory.sh; then
-            echo "✗ Theory Room cache rebuild failed. Check permissions or rerun scripts/setup_theory.sh manually."
-            exit 1
-        fi
-        echo "✓ Theory Room cache rebuild complete for $THEORY_CACHE_DIR"
-    else
-        echo "Theory Room enabled; cache missing, creating fresh at $THEORY_CACHE_DIR"
-        echo "Building Theory Room cache via scripts/setup_theory.sh..."
-        if ! /bin/bash scripts/setup_theory.sh; then
-            echo "✗ Theory Room cache build failed. Check permissions or rerun scripts/setup_theory.sh manually."
-            exit 1
-        fi
-        echo "✓ Theory Room cache build complete for $THEORY_CACHE_DIR"
+if [ "$TEST_MODE" = true ]; then
+    echo "Applying quick-test startup overrides in $STATION_DATA_DIR..."
+    if ! python -m station.startup_overrides --station-data "$STATION_DATA_DIR" --test; then
+        exit 1
     fi
-else
-    echo "Theory Room disabled; skipping theory cache refresh."
+    echo "✓ Quick-test startup overrides applied."
+elif [ "$NO_MULTISTART" = true ]; then
+    echo "Disabling init and stagnation multistart in $STATION_DATA_DIR/constant_config.yaml..."
+    if ! python -m station.startup_overrides --station-data "$STATION_DATA_DIR" --no-multistart; then
+        exit 1
+    fi
+    echo "✓ Multistart disabled for this station."
 fi
-
 
 # --- Pre-flight Checks ---
 if [ ! -f "$DEPLOYMENT_DIR/cert.pem" ]; then
@@ -424,47 +449,62 @@ if ! python -c "import gevent" &>/dev/null; then
 fi
 
 # --- Stop Existing Services ---
+MULTISTART_WAITING_PAGE=false
+MULTISTART_BOOTSTRAP_PENDING=false
 echo "Ensuring all services are stopped before starting..."
+
 STOP_ARGS=()
 if [ "$FORCE_STOP" = true ]; then
     STOP_ARGS=(--force)
 fi
-if ! ./stop.sh "${STOP_ARGS[@]}"; then
+STOP_ENV=()
+if [ "${STATION_MULTISTART_SKIP_CONTROLLER_START:-}" = "1" ] || [ "${STATION_MULTISTART_WAIT_ONLY:-}" = "1" ]; then
+    STOP_ENV=(STATION_MULTISTART_SKIP_CONTROLLER_STOP=1)
+fi
+if ! env "${STOP_ENV[@]}" ./stop.sh "${STOP_ARGS[@]}"; then
     echo "ERROR: Could not stop existing services safely. Use ./start.sh -s --force to bypass pause/drain checks."
     exit 1
 fi
 echo ""
 
-# --- Optional station data migrations ---
-if [ "$RUN_MIGRATIONS" != true ]; then
-    index_schema_version_bump_requires_migration
-    INDEX_SCHEMA_CHECK_STATUS=$?
-    if [ $INDEX_SCHEMA_CHECK_STATUS -eq 0 ]; then
-        echo "SQLite index schema version changed; running station data migrations before startup."
-        RUN_MIGRATIONS=true
-    elif [ $INDEX_SCHEMA_CHECK_STATUS -eq 2 ]; then
+if [ "$REQUEUE_FAILED_EXTERNAL_REPORTS" = true ]; then
+    echo "Running one-time External Counter failure recovery..."
+    if ! requeue_failed_external_reports_once; then
+        echo "ERROR: Legacy External Counter report recovery failed."
+        exit 1
+    fi
+    echo "✓ Legacy External Counter report recovery complete."
+    echo ""
+fi
+
+# --- Multistart hook ---
+if [ "${STATION_MULTISTART_SKIP_HOOK:-}" != "1" ]; then
+    MULTISTART_HOOK_OUTPUT=""
+    MULTISTART_HOOK_STATUS=0
+    MULTISTART_HOOK_OUTPUT=$(python -m station.multistart.start_hook --repo "$(pwd)" 2>&1) || MULTISTART_HOOK_STATUS=$?
+    if [ "$MULTISTART_HOOK_STATUS" -eq 20 ]; then
+        MULTISTART_WAITING_PAGE=true
+        echo "Multistart job active; starting static waiting page."
+        if [ -n "$MULTISTART_HOOK_OUTPUT" ]; then
+            echo "$MULTISTART_HOOK_OUTPUT"
+        fi
+    elif [ "$MULTISTART_HOOK_STATUS" -eq 21 ]; then
+        MULTISTART_BOOTSTRAP_PENDING=true
+        AUTO_START_STATION=false
+        echo "Pending stagnation multistart detected; starting the live API only so the controller can resume it."
+        if [ -n "$MULTISTART_HOOK_OUTPUT" ]; then
+            echo "$MULTISTART_HOOK_OUTPUT"
+        fi
+    elif [ "$MULTISTART_HOOK_STATUS" -ne 0 ]; then
+        echo "$MULTISTART_HOOK_OUTPUT"
+        echo "ERROR: multistart startup hook failed."
         exit 1
     fi
 fi
 
-if [ "$RUN_MIGRATIONS" = true ]; then
-    # --- Research Center artifact migration ---
-    if ! migrate_research_eval_artifacts_if_needed; then
-        exit 1
-    fi
-    echo ""
-
-    # --- Dialogue prune protection migration ---
-    if ! migrate_protected_dialogue_ticks_if_needed; then
-        exit 1
-    fi
-    echo ""
-
-    # --- First-turn Lobby Codex help migration ---
-    if ! migrate_lobby_codex_help_if_needed; then
-        exit 1
-    fi
-    echo ""
+if [ "$MULTISTART_WAITING_PAGE" = true ]; then
+    resume_multistart_branches_if_autostart || exit 1
+    AUTO_START_STATION=false
 fi
 
 # --- Start Nginx ---
@@ -482,8 +522,14 @@ events {
 http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 5;
+    gzip_types application/json text/plain text/css application/javascript;
     
-    access_log $(pwd)/$DEPLOYMENT_DIR/nginx_access.log;
+    access_log off;
 
     # Redirect HTTP to HTTPS
     server {
@@ -548,16 +594,18 @@ EOF
 touch "$DEPLOYMENT_DIR/nginx_error.log" "$DEPLOYMENT_DIR/nginx_access.log"
 chmod 666 "$DEPLOYMENT_DIR/nginx_error.log" "$DEPLOYMENT_DIR/nginx_access.log" 2>/dev/null || true
 
-# Check for port conflicts (best-effort; don't attempt to kill processes automatically)
+# Check for port conflicts after stop.sh has cleaned this station's processes.
 if command -v lsof >/dev/null 2>&1; then
-    PORT_PID=$(lsof -t -iTCP:"$NGINX_HTTP_PORT" -sTCP:LISTEN 2>/dev/null | head -n 1)
-    if [ -n "$PORT_PID" ]; then
-        echo "✗ Port $NGINX_HTTP_PORT is already in use by PID $PORT_PID."
-        echo "  Choose a different port via NGINX_HTTP_PORT in .env, or stop the conflicting process."
-        echo "  Stopping Gunicorn to prevent orphaned processes..."
-        ./stop.sh --force
-        exit 1
-    fi
+    for checked_port in "$NGINX_HTTP_PORT" "$NGINX_HTTPS_PORT"; do
+        PORT_PID=$(lsof -t -iTCP:"$checked_port" -sTCP:LISTEN 2>/dev/null | head -n 1)
+        if [ -n "$PORT_PID" ]; then
+            echo "✗ Port $checked_port is already in use by PID $PORT_PID."
+            echo "  Choose a different port in .env, or stop the conflicting process."
+            echo "  Stopping Gunicorn to prevent orphaned processes..."
+            ./stop.sh --force
+            exit 1
+        fi
+    done
 fi
 
 NGINX_ERROR_LOG_PATH="$(pwd)/$DEPLOYMENT_DIR/nginx_error.log"
@@ -656,9 +704,50 @@ echo "🔑 Password: [hidden]"
 echo ""
 echo "Logs:"
 echo "  Application: $ERROR_LOG"
-echo "  HTTP Access: $ACCESS_LOG"
+echo "  HTTP Access: disabled"
 echo ""
 echo "To stop services, run: ./stop.sh"
+
+if [ "$MULTISTART_WAITING_PAGE" = true ]; then
+    echo "Multistart is running; normal Station controls are disabled until selection completes."
+    exit 0
+fi
+
+if [ "$MULTISTART_BOOTSTRAP_PENDING" = true ]; then
+    echo "Verifying pending stagnation multistart recovery..."
+    if ! python - <<'PY'
+from pathlib import Path
+import sys
+
+from station.multistart import paths, waiting
+from station.multistart.controller import find_running_controller_pid
+
+repo = Path.cwd().resolve()
+pid = find_running_controller_pid(repo)
+active = waiting.active_job(repo)
+pending = paths.pending_stagnation_path(repo).is_file()
+
+if pid is None:
+    print("ERROR: Pending stagnation multistart was not resumed because its controller is not running.")
+    sys.exit(1)
+if active:
+    print(f"✓ Stagnation multistart controller is running (PID {pid}); active job: {active.get('job_id') or 'preparing'}.")
+    sys.exit(0)
+if pending:
+    print(f"✓ Stagnation multistart controller is running (PID {pid}) and is actively processing the pending request.")
+    sys.exit(0)
+
+print("ERROR: The pending stagnation request disappeared without an active multistart job.")
+sys.exit(1)
+PY
+    then
+        echo "ERROR: Refusing to leave the ordinary station running after multistart recovery failed."
+        STATION_MULTISTART_SKIP_CONTROLLER_START=1 ./stop.sh --force
+        exit 1
+    fi
+    echo "Normal orchestrator auto-start is suppressed until the pending multistart request is converted into a branch job."
+    exit 0
+fi
 
 if ! set_station_name_via_api "$API_BASE_URL" "${API_CURL_EXTRA[@]}"; then
     exit 1

@@ -1,0 +1,13 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Simple k=4 double-root seed
+tags: ['baseline', 'uncertainty', 'laguerre']
+abstract: Simple valid-format Laguerre double-root seed. It is intentionally rough and is not expected to meet the target.
+content: |
+  def construct_uncertainty_bound() -> str:
+      return """{
+        "mode": "laguerre-double-root",
+        "k": 4,
+        "roots": [4.0, 6.0, 10.0, 14.0]
+      }"""

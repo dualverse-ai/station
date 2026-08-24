@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +16,12 @@ from station import file_io_utils
 
 INDEX_DB_PATH_ENV = "STATION_INDEX_DB_PATH"
 INDEX_DB_DIR_ENV = "STATION_INDEX_DB_DIR"
+_STATION_INDEX_WRITE_LOCK = threading.RLock()
+
+
+def get_station_index_write_lock() -> threading.RLock:
+    """Return the process-wide writer lock for the shared station index DB."""
+    return _STATION_INDEX_WRITE_LOCK
 
 
 def get_station_index_database_path(base_path: Optional[str] = None) -> str:

@@ -14,7 +14,7 @@
 
 # station/rooms/capsule_room_base.py
 """
-Abstract base class for rooms that handle capsules using a shared protocol
+Abstract base class for rooms that handle capsule-style records
 (e.g., Private Memory, Public Memory, Archive, Mail Room).
 Includes unread message count display and @mention notification processing.
 """
@@ -30,7 +30,7 @@ from station import agent as agent_manager
 
 class CapsuleHandlerBaseRoom(BaseRoom):
     """
-    Base class for rooms implementing the Capsule Protocol.
+    Base class for rooms implementing shared capsule actions.
     Handles common actions like create, reply, read, delete, pin, etc.
     """
 
@@ -244,57 +244,6 @@ class CapsuleHandlerBaseRoom(BaseRoom):
         
         full_row_content = "|".join(base_row_parts + mail_specific_cols + end_row_parts)
         return f"|{full_row_content}|"
-
-    def get_room_output(self,
-                        agent_data: Dict[str, Any],
-                        room_context: RoomContext,
-                        current_tick: int) -> str:
-        """
-        Generates the complete textual output for the room, including room-specific help
-        and potentially the global Capsule Protocol help.
-        Modifies agent_data in-memory to mark help as shown.
-        """
-        # Determine if room-specific help *will be* shown by the super() call.
-        # This check needs to happen BEFORE super().get_room_output() modifies the flag.
-        room_data_key_for_specific_help = self._get_agent_room_data_key(room_context)
-        will_show_room_specific_help = not room_context.agent_manager.get_agent_room_state(
-            agent_data,
-            room_data_key_for_specific_help,
-            room_context.constants_module.AGENT_ROOM_STATE_FIRST_VISIT_HELP_SHOWN_KEY,
-            default=False
-        )
-
-        # Call super to get base output, which includes room-specific help if it's a first visit to *this* room.
-        # This call will also update the AGENT_ROOM_STATE_FIRST_VISIT_HELP_SHOWN_KEY for this specific room.
-        base_output_str = super().get_room_output(agent_data, room_context, current_tick)
-
-        # Now, manage and append Capsule Protocol help based on global flag and context.
-        additional_help_parts = []
-        capsule_protocol_help_globally_shown = room_context.agent_manager.get_agent_room_state(
-            agent_data,
-            room_context.constants_module.AGENT_STATE_DATA_KEY, # Use the global state key
-            room_context.constants_module.AGENT_STATE_CAPSULE_PROTOCOL_HELP_SHOWN_KEY,
-            default=False
-        )
-
-        if not capsule_protocol_help_globally_shown:
-            additional_help_parts.append("\n\n---\n\n" + room_context.constants_module.TEXT_CAPSULE_PROTOCOL_HELP + "\n\n---")
-            room_context.agent_manager.set_agent_room_state(
-                agent_data,
-                room_context.constants_module.AGENT_STATE_DATA_KEY, # Use the global state key
-                room_context.constants_module.AGENT_STATE_CAPSULE_PROTOCOL_HELP_SHOWN_KEY,
-                True
-            )
-        # If global help was already shown, but this specific room's help was just displayed, add a reminder.
-        elif will_show_room_specific_help:
-            additional_help_parts.append(
-                f"\n\n---\n\nNote: For detailed capsule commands, use `/execute_action{{help {room_context.constants_module.SHORT_ROOM_NAME_CAPSULE_PROTOCOL}}}`.\n\n---"
-            )
-        
-        if additional_help_parts:
-            return base_output_str + "".join(additional_help_parts)
-        
-        return base_output_str
 
     def _get_specific_room_content(self,
                                    agent_data: Dict[str, Any],

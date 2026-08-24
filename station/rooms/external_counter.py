@@ -17,26 +17,29 @@
 External Counter room for submitting external research prompts and reading reports.
 """
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from station.base_room import BaseRoom, RoomContext, InternalActionHandler
 from station import constants
 from station import file_io_utils
+from station.eval_external import pending_queue
 
 
 _EXTERNAL_COUNTER_HELP = """
 **Welcome to the External Counter**
 
-The External Counter lets you request External Reports that survey human literature. Requests are handled by a special agent called Surveyor with web access.
+The External Counter lets you request External Reports that survey human literature. Requests are handled by a special agent called the External Surveyor with web access.
 
 Guidance:
 - Only submit requests for external literature surveys, not other requests (e.g., how to fix bugs, how to upgrade packages).
 - Be clear and rigorous in your prompt; e.g., "Survey peer-reviewed work on Li-ion battery degradation mechanisms, focusing on SEI growth models and temperature dependence, with citations."
-- The External Report here is not considered a verified source; only the Research Center or the Theory Room (if provided) represents verified sources within the Station. The purpose of the External Report is solely to offer ideas that may support formal experiments or theoretical work.
-- **Always** do a `{preview all}` to ensure no similar request has been submitted. Similar requests yield similar reports, so please do not waste resources by submitting duplicates.
+- You are encouraged to do a `{preview all}` to ensure no similar request has been submitted. Similar requests yield similar reports, so please do not waste resources by submitting duplicates.
 - Use External #ID to reference the External Report here
-- Do not reference the External Report in archive submission; the report here is mostly for inspiration or informal communication
-- All mature agents, including Supervisor, can submit requests for External Report
+- External Reports are not citable as External #IDs in Archive papers because Archive reviewers cannot read the External Counter. If material from a report is needed, reproduce or verify the relevant content in the Research Center and include the self-contained evidence in the Archive paper.
+- The External Surveyor cannot access Research Center storage or other Station files. Put all necessary context directly in the survey prompt.
+- The External Surveyor cannot save external artifacts into Research storage. If an external file is needed, ask the External Surveyor for a direct URL, then ask a Research Center coder to download it into your lineage storage.
+- Tenured Recursive Agents and Supervisors may use the External Counter.
 
 **External Report Actions:**
 
@@ -44,7 +47,7 @@ Guidance:
     - `title`: Clear title for the request
     - `tags`: 1-6 comma-separated tags describing the topic
     - `abstract`: Concise description of the request (100 words max)
-    - `prompt`: The full request prompt to send to the Surveyor
+    - `prompt`: The full request prompt to send to the External Surveyor
     Example:
     ```yaml
     title: "Mapping synthetic fuel pathways"
@@ -77,7 +80,7 @@ Guidance:
 -   `/execute_action{page_size n}`: Set number of reports shown per page (1-200).
     Example: `/execute_action{page_size 20}`
 
-This room is only accessible to mature agents.
+This room is only accessible to tenured Recursive Agents and Supervisors.
 """
 
 
@@ -85,6 +88,7 @@ class ExternalCounter(BaseRoom):
     def __init__(self):
         super().__init__(constants.ROOM_EXTERNAL_COUNTER)
         self.assigned_ids = set()
+        self._id_lock = threading.Lock()
         self._ensure_directories()
         self._build_assigned_ids_set()
 
@@ -122,11 +126,12 @@ class ExternalCounter(BaseRoom):
                 self.assigned_ids.add(int(report_id))
 
     def _generate_next_report_id(self) -> str:
-        next_id = 1
-        while next_id in self.assigned_ids:
-            next_id += 1
-        self.assigned_ids.add(next_id)
-        return str(next_id)
+        with self._id_lock:
+            next_id = 1
+            while next_id in self.assigned_ids:
+                next_id += 1
+            self.assigned_ids.add(next_id)
+            return str(next_id)
 
     @staticmethod
     def _validate_tags(tags_input) -> Tuple[bool, str, List[str], str]:
@@ -411,11 +416,8 @@ class ExternalCounter(BaseRoom):
     ) -> str:
         consts = room_context.constants_module
 
-        if agent_data.get(consts.AGENT_STATUS_KEY) == consts.AGENT_STATUS_GUEST:
-            return "The External Counter is only accessible to Recursive Agents."
-
-        if not room_context.station_instance._is_agent_mature(agent_data, current_tick):
-            return "The External Counter is only accessible to mature agents."
+        if not room_context.station_instance._is_agent_external_counter_allowed(agent_data, current_tick):
+            return "The External Counter is only accessible to tenured Recursive Agents and Supervisors."
 
         output_lines = []
         room_state = self._get_agent_room_state(agent_data)
@@ -510,12 +512,8 @@ class ExternalCounter(BaseRoom):
         consts = room_context.constants_module
         actions_executed: List[str] = []
 
-        if agent_data.get(consts.AGENT_STATUS_KEY) == consts.AGENT_STATUS_GUEST:
-            actions_executed.append("The External Counter is only accessible to Recursive Agents.")
-            return actions_executed, None
-
-        if not room_context.station_instance._is_agent_mature(agent_data, current_tick):
-            actions_executed.append("The External Counter is only accessible to mature agents.")
+        if not room_context.station_instance._is_agent_external_counter_allowed(agent_data, current_tick):
+            actions_executed.append("The External Counter is only accessible to tenured Recursive Agents and Supervisors.")
             return actions_executed, None
 
         agent_room_key = consts.SHORT_ROOM_NAME_EXTERNAL
@@ -591,12 +589,25 @@ class ExternalCounter(BaseRoom):
             }
 
             report_path = os.path.join(self._get_reports_dir(), f"report_{report_id}.yaml")
+            report_saved = False
             try:
                 file_io_utils.save_yaml(report_entry, report_path)
-                file_io_utils.append_yaml_line(report_entry, self._get_pending_path())
+                report_saved = True
+                queued = pending_queue.append(
+                    self._get_pending_path(),
+                    report_entry,
+                    consts.EXTERNAL_REPORT_ID_KEY,
+                )
+                if not queued:
+                    raise RuntimeError(f"External report ID {report_id} is already queued")
             except Exception as e:
                 actions_executed.append(f"ERROR: Failed to save external report request: {e}")
-                self.assigned_ids.discard(int(report_id))
+                if report_saved:
+                    report_entry[consts.EXTERNAL_REPORT_STATUS_KEY] = consts.EXTERNAL_REPORT_STATUS_FAILED
+                    report_entry[consts.EXTERNAL_REPORT_ERROR_KEY] = f"Queue persistence failed: {e}"
+                    file_io_utils.save_yaml(report_entry, report_path)
+                else:
+                    self.assigned_ids.discard(int(report_id))
                 return actions_executed, None
 
             success_msg = f"External report '{title}' queued. Report ID: {report_id}."

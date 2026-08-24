@@ -21,6 +21,8 @@ from station.eval_archive.surveyor import (
     ActiveSurveySession,
     ArchiveSurveySubmissionService,
     AutoArchiveSurveyor,
+    SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_KEY,
+    _load_request,
     ensure_archive_surveyor_layout,
     mark_archive_survey_committed,
     queue_archive_survey_request,
@@ -34,6 +36,7 @@ class _AgentModuleStub:
     def __init__(self):
         self.messages = []
         self.agents = {}
+        self.update_calls = 0
 
     def load_agent_data(self, author):
         return self.agents.setdefault(author, {constants.AGENT_NAME_KEY: author})
@@ -50,8 +53,7 @@ class _AgentModuleStub:
         self,
         author,
         message,
-        protection_reason=None,
-        protection_source="",
+        **_kwargs,
     ):
         def update_func(agent_data):
             agent_data.setdefault(constants.AGENT_NOTIFICATIONS_PENDING_KEY, []).append(message)
@@ -59,6 +61,7 @@ class _AgentModuleStub:
         return self.update_agent_with_function(author, update_func)
 
     def update_agent_with_function(self, author, update_func):
+        self.update_calls += 1
         agent_data = self.agents.setdefault(author, {constants.AGENT_NAME_KEY: author})
         before = list(agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, []))
         update_func(agent_data)
@@ -178,6 +181,240 @@ class ArchiveSurveyorTest(unittest.TestCase):
             sort_keys=False,
         )
 
+    def test_surveyor_resume_backoff_matches_coder_schedule(self):
+        original = constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS
+        try:
+            constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS = [10, 20, 40]
+            self.assertEqual(AutoArchiveSurveyor.get_resume_backoff_delay_seconds(0), 10)
+            self.assertEqual(AutoArchiveSurveyor.get_resume_backoff_delay_seconds(1), 20)
+            self.assertEqual(AutoArchiveSurveyor.get_resume_backoff_delay_seconds(99), 40)
+        finally:
+            constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS = original
+
+    def test_exhausted_survey_recovery_blocks_and_pauses_without_agent_failure_notice(self):
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=10,
+        )
+        pause = mock.Mock()
+        station = types.SimpleNamespace(
+            agent_module=_AgentModuleStub(),
+            orchestrator=types.SimpleNamespace(pause_due_to_research_issue=pause),
+            _get_current_tick=lambda: 11,
+        )
+        surveyor = AutoArchiveSurveyor(station, enabled=False)
+        surveyor._mark_blocked(str(request["id"]), "no final report")
+        pause.assert_called_once()
+        self.assertIn("Archive Surveyor request #1 exhausted automatic recovery", pause.call_args.args[0])
+        record = _load_request(surveyor.paths, str(request["id"]))
+        self.assertEqual(record["status"], "blocked")
+        self.assertFalse(record["notification"]["sent"])
+
+    def test_any_no_report_exit_with_codex_token_schedules_same_session_resume(self):
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=10,
+        )
+        survey_id = str(request["id"])
+        station = types.SimpleNamespace(
+            agent_module=_AgentModuleStub(),
+            _get_current_tick=lambda: 11,
+        )
+        surveyor = AutoArchiveSurveyor(station, enabled=False)
+        surveyor._claim_launch(survey_id, "codex_1_spawn_1_deadbeef", "codex", None)
+        run_dir = os.path.join(surveyor.paths.sessions_dir, "codex_1_spawn_1_deadbeef")
+        file_io_utils.ensure_dir_exists(run_dir)
+        transcript_path = os.path.join(run_dir, "transcript.jsonl")
+        stderr_path = os.path.join(run_dir, "stderr.txt")
+        file_io_utils.save_text(
+            '{"type":"thread.started","thread_id":"thread-resume-1"}\n'
+            '{"type":"error","message":"model not provided"}\n',
+            transcript_path,
+        )
+        file_io_utils.save_text("", stderr_path)
+
+        class DummyProcess:
+            pid = 5432
+
+            def poll(self):
+                return 1
+
+        class DummyHandle:
+            def close(self):
+                pass
+
+        surveyor.active_sessions[survey_id] = ActiveSurveySession(
+            survey_id=survey_id,
+            session_id="codex_1_spawn_1_deadbeef",
+            run_dir=run_dir,
+            backend="codex",
+            transcript_format="jsonl",
+            process=DummyProcess(),
+            transcript_handle=DummyHandle(),
+            stderr_handle=DummyHandle(),
+            prompt_path=os.path.join(run_dir, "prompt.txt"),
+            command=["codex", "exec"],
+            transcript_path=transcript_path,
+            stderr_path=stderr_path,
+            last_message_path=os.path.join(run_dir, "last_message.txt"),
+            report_path=surveyor._report_path(survey_id),
+            draft_path=surveyor._draft_path(survey_id),
+        )
+
+        surveyor.poll_cli_jobs()
+        record = _load_request(surveyor.paths, survey_id)
+        self.assertEqual(record["status"], "running")
+        self.assertEqual(record["session"]["status"], "pending_resume")
+        self.assertEqual(record["session"]["resume_token"], "thread-resume-1")
+        self.assertEqual(record["session"]["spawn_count"], 1)
+        self.assertEqual(record["session"]["resume_count"], 0)
+
+    def test_pending_resume_launch_uses_resume_token_without_new_spawn(self):
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=10,
+        )
+        survey_id = str(request["id"])
+        request_path = os.path.join(surveyor_paths := ensure_archive_surveyor_layout().requests_dir, f"survey_{survey_id}.yaml")
+        record = file_io_utils.load_yaml(request_path)
+        record["status"] = "running"
+        record["session"].update(
+            {
+                "status": "pending_resume",
+                "spawn_count": 1,
+                "resume_token": "thread-resume-2",
+                "resume_count": 0,
+                "next_resume_timestamp": 0,
+            }
+        )
+        file_io_utils.save_yaml(record, request_path, sort_keys=False)
+        station = types.SimpleNamespace(
+            agent_module=_AgentModuleStub(),
+            _get_current_tick=lambda: 11,
+        )
+        surveyor = AutoArchiveSurveyor(station, enabled=False)
+        popen_instances = []
+
+        class DummyPopen:
+            def __init__(self, command, **kwargs):
+                self.command = command
+                self.kwargs = kwargs
+                self.pid = 9876
+                self.stdin = mock.Mock()
+                popen_instances.append(self)
+
+            def poll(self):
+                return None
+
+        with mock.patch.object(surveyor, "_build_prompt", return_value="resume prompt"), \
+             mock.patch("station.eval_archive.surveyor.detect_cli_worker_executable", return_value="/usr/bin/codex"), \
+             mock.patch("station.eval_archive.surveyor.subprocess.Popen", DummyPopen):
+            self.assertTrue(surveyor._launch_survey(survey_id))
+
+        self.assertIn("resume", popen_instances[0].command)
+        self.assertIn("thread-resume-2", popen_instances[0].command)
+        updated = _load_request(surveyor.paths, survey_id)
+        self.assertEqual(updated["session"]["spawn_count"], 1)
+        self.assertEqual(updated["session"]["resume_count"], 1)
+        self.assertEqual(updated["session"]["status"], "resuming")
+        active = surveyor.active_sessions.pop(survey_id)
+        active.transcript_handle.close()
+        active.stderr_handle.close()
+
+    def test_restart_recovery_discards_resume_state_and_requeues_fresh(self):
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=10,
+        )
+        survey_id = str(request["id"])
+        paths = ensure_archive_surveyor_layout()
+        request_path = os.path.join(paths.requests_dir, f"survey_{survey_id}.yaml")
+        record = file_io_utils.load_yaml(request_path)
+        record["status"] = "running"
+        record["session"].update(
+            {
+                "active": False,
+                "active_pid": None,
+                "status": "pending_resume",
+                "spawn_count": 2,
+                "resume_count": 4,
+                "resume_token": "thread-restart",
+                "next_resume_timestamp": time.time() + 600,
+            }
+        )
+        record["notification"].update({"sent": True, "message": "legacy failure notice"})
+        file_io_utils.save_yaml(record, request_path, sort_keys=False)
+        surveyor = AutoArchiveSurveyor(
+            types.SimpleNamespace(agent_module=_AgentModuleStub(), _get_current_tick=lambda: 11),
+            enabled=False,
+        )
+        surveyor._recover_stale_requests(restart_recovery=True)
+        recovered = _load_request(surveyor.paths, survey_id)
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["session"]["spawn_count"], 0)
+        self.assertEqual(recovered["session"]["resume_count"], 0)
+        self.assertIsNone(recovered["session"]["resume_token"])
+        self.assertFalse(recovered["notification"]["sent"])
+        self.assertIsNone(recovered["notification"]["message"])
+
+    def test_restart_does_not_reopen_legacy_failed_survey(self):
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=10,
+        )
+        survey_id = str(request["id"])
+        paths = ensure_archive_surveyor_layout()
+        request_path = os.path.join(paths.requests_dir, f"survey_{survey_id}.yaml")
+        record = file_io_utils.load_yaml(request_path)
+        record["status"] = "failed"
+        record["session"]["status"] = "failed"
+        record["session"]["spawn_count"] = 3
+        record["error"] = "legacy failure"
+        file_io_utils.save_yaml(record, request_path, sort_keys=False)
+        surveyor = AutoArchiveSurveyor(
+            types.SimpleNamespace(agent_module=_AgentModuleStub(), _get_current_tick=lambda: 11),
+            enabled=False,
+        )
+        surveyor._recover_stale_requests(restart_recovery=True)
+        recovered = _load_request(surveyor.paths, survey_id)
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["session"]["spawn_count"], 3)
+        self.assertEqual(recovered["error"], "legacy failure")
+
+    def _write_question_problem(self, question_id: int = 1, deleted: bool = False):
+        question_dir = os.path.join(
+            constants.BASE_STATION_DATA_PATH,
+            constants.CAPSULES_DIR_NAME,
+            constants.QUESTION_CAPSULES_SUBDIR_NAME,
+        )
+        file_io_utils.ensure_dir_exists(question_dir)
+        file_io_utils.save_yaml(
+            {
+                constants.CAPSULE_ID_KEY: f"question_{question_id}",
+                constants.CAPSULE_TYPE_KEY: constants.CAPSULE_TYPE_QUESTION,
+                constants.CAPSULE_TITLE_KEY: "Question Room Problem",
+                constants.CAPSULE_AUTHOR_NAME_KEY: "Noether I",
+                constants.CAPSULE_CREATED_AT_TICK_KEY: 2,
+                constants.CAPSULE_ABSTRACT_KEY: "A Question Room problem for survey tests.",
+                constants.CAPSULE_IS_DELETED_KEY: deleted,
+                constants.QUESTION_STATUS_KEY: constants.QUESTION_STATUS_OPEN,
+                constants.QUESTION_NET_UPVOTE_KEY: 4,
+                constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY: "question_1-3",
+            },
+            os.path.join(question_dir, f"question_{question_id}.yaml"),
+            sort_keys=False,
+        )
+
     def test_feature_flag_controls_yaml_parser_registration(self):
         constants.ARCHIVE_SURVEY_ENABLED = False
         constants._refresh_dynamic_action_sets()
@@ -219,11 +456,56 @@ class ArchiveSurveyorTest(unittest.TestCase):
         paths = ensure_archive_surveyor_layout()
         request = file_io_utils.load_yaml(os.path.join(paths.requests_dir, "survey_1.yaml"))
         self.assertEqual(request["author"], "Axiom I")
+        self.assertFalse(request["question_room_access"])
         self.assertEqual(request["prompt"], "What has been tried?")
         pending = file_io_utils.load_yaml_lines(paths.pending_file)
         self.assertEqual(str(pending[0]["id"]), "1")
 
-    def test_archive_room_rejects_survey_when_archive_is_empty(self):
+    def test_archive_room_records_question_room_access_for_tenured_or_supervisor_requester(self):
+        self._write_archive_paper()
+        room = ArchiveRoom()
+        tenured_agent = {
+            constants.AGENT_NAME_KEY: "Tenured I",
+            constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+            constants.AGENT_LINEAGE_KEY: "tenured",
+            constants.AGENT_TICK_BIRTH_KEY: -100,
+        }
+        supervisor_agent = {
+            constants.AGENT_NAME_KEY: "Supervisor I",
+            constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+            constants.AGENT_LINEAGE_KEY: "supervisor",
+            constants.AGENT_TICK_BIRTH_KEY: 10,
+            constants.AGENT_ROLE_KEY: constants.ROLE_SUPERVISOR,
+        }
+
+        actions, _handler = room.handle_action(
+            tenured_agent,
+            constants.ACTION_ARCHIVE_SURVEY,
+            None,
+            {constants.YAML_ARCHIVE_SURVEY_PROMPT: "Summarize questions."},
+            self._room_context(),
+            42,
+        )
+        self.assertIn("Archive survey request queued", actions[0])
+        paths = ensure_archive_surveyor_layout()
+        request = file_io_utils.load_yaml(os.path.join(paths.requests_dir, "survey_1.yaml"))
+        self.assertTrue(request["question_room_access"])
+
+        actions, _handler = room.handle_action(
+            supervisor_agent,
+            constants.ACTION_ARCHIVE_SURVEY,
+            None,
+            {constants.YAML_ARCHIVE_SURVEY_PROMPT: "Summarize questions."},
+            self._room_context(),
+            42,
+        )
+        self.assertIn("Archive survey request queued", actions[0])
+        request = file_io_utils.load_yaml(os.path.join(paths.requests_dir, "survey_2.yaml"))
+        self.assertTrue(request["question_room_access"])
+        pending = file_io_utils.load_yaml_lines(paths.pending_file)
+        self.assertEqual([str(entry["id"]) for entry in pending], ["1", "2"])
+
+    def test_archive_room_queues_survey_when_archive_is_empty(self):
         room = ArchiveRoom()
         agent_data = {
             constants.AGENT_NAME_KEY: "Axiom I",
@@ -241,9 +523,12 @@ class ArchiveSurveyorTest(unittest.TestCase):
         )
 
         self.assertIsNone(handler)
-        self.assertIn("Archive survey failed: no archive papers found, so no survey is needed.", actions[0])
+        self.assertIn("Archive survey request queued", actions[0])
         paths = ensure_archive_surveyor_layout()
-        self.assertFalse(file_io_utils.list_files(paths.requests_dir, constants.YAML_EXTENSION))
+        request = file_io_utils.load_yaml(os.path.join(paths.requests_dir, "survey_1.yaml"))
+        self.assertEqual(request["prompt"], "What has been tried?")
+        pending = file_io_utils.load_yaml_lines(paths.pending_file)
+        self.assertEqual(str(pending[0]["id"]), "1")
 
     def test_layout_writes_local_agents_md_for_surveyor_sessions(self):
         paths = ensure_archive_surveyor_layout()
@@ -255,6 +540,23 @@ class ArchiveSurveyorTest(unittest.TestCase):
             "development, and you do not need to access its source code or developer docs to perform your "
             "surveyor function.\n",
         )
+
+    def test_layout_replaces_stale_source_directories_with_symlinks(self):
+        paths = ensure_archive_surveyor_layout()
+        archive_link = paths.archive_link
+        if os.path.islink(archive_link):
+            os.unlink(archive_link)
+        file_io_utils.ensure_dir_exists(archive_link)
+        file_io_utils.save_text("stale", os.path.join(archive_link, "archive_1.yaml"))
+
+        refreshed_paths = ensure_archive_surveyor_layout()
+
+        self.assertTrue(os.path.islink(refreshed_paths.archive_link))
+        self.assertEqual(
+            os.path.realpath(refreshed_paths.archive_link),
+            os.path.realpath(refreshed_paths.archive_target),
+        )
+        self.assertFalse(os.path.exists(os.path.join(refreshed_paths.archive_link, "archive_1.yaml")))
 
     def test_disabled_survey_does_not_change_archive_help_or_queue(self):
         constants.ARCHIVE_SURVEY_ENABLED = False
@@ -332,8 +634,58 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertIn("even when they were not cited by any archive paper", prompt)
         self.assertIn("For a general request such as a broad Station landscape survey", prompt)
         self.assertIn("bash research_center/eval_tool.sh preview {ID}", prompt)
+        self.assertIn("showing the newest 30 matches by default", prompt)
+        self.assertIn("without coder prompts, raw code, or logs", prompt)
+        self.assertIn("reading stdout is not recommended unless needed", prompt)
         self.assertIn("mv reports/1.draft.md reports/1.md", prompt)
         self.assertIn("1000 to 5000 words", prompt)
+        self.assertIn("Do not inspect `question_room/`", prompt)
+
+    def test_prompt_includes_question_room_for_authorized_request(self):
+        paths = ensure_archive_surveyor_layout()
+        self._write_question_problem()
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize Question Room problems.",
+            tick=1,
+            question_room_access=True,
+        )
+        self.assertTrue(request["question_room_access"])
+        saved_request = file_io_utils.load_yaml(os.path.join(paths.requests_dir, "survey_1.yaml"))
+        self.assertTrue(saved_request["question_room_access"])
+
+        surveyor = AutoArchiveSurveyor(
+            types.SimpleNamespace(agent_module=_AgentModuleStub(), _get_current_tick=lambda: 2),
+            enabled=False,
+        )
+        prompt = surveyor._build_prompt(request)
+
+        self.assertIn("question_room/", prompt)
+        self.assertIn("=== QUESTION ROOM PREVIEW ===", prompt)
+        self.assertIn("Question #1: Question Room Problem", prompt)
+        self.assertIn("cat question_room/question_15.yaml", prompt)
+        self.assertIn("Question #ID", prompt)
+        self.assertNotIn("Do not inspect `question_room/`", prompt)
+
+    def test_prompt_omits_question_room_preview_for_unauthorized_request(self):
+        self._write_question_problem()
+        request = queue_archive_survey_request(
+            author="Axiom I",
+            lineage="axiom",
+            prompt="Summarize archive.",
+            tick=1,
+            question_room_access=False,
+        )
+        surveyor = AutoArchiveSurveyor(
+            types.SimpleNamespace(agent_module=_AgentModuleStub(), _get_current_tick=lambda: 2),
+            enabled=False,
+        )
+        prompt = surveyor._build_prompt(request)
+
+        self.assertIn("Do not inspect `question_room/`", prompt)
+        self.assertNotIn("=== QUESTION ROOM PREVIEW ===", prompt)
+        self.assertNotIn("Question #1: Question Room Problem", prompt)
         self.assertIn("Guidelines:", prompt)
         self.assertIn("help the agent understand the accumulated knowledge", prompt)
         self.assertIn("synthesize strategic and technical context", prompt)
@@ -353,7 +705,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertNotIn("## Relevant Archive Papers", prompt)
         self.assertNotIn("Good survey reports should", prompt)
 
-    def test_eval_tool_previews_instruction_prompt_and_report_without_raw_code(self):
+    def test_eval_tool_previews_metadata_instruction_and_report_without_prompt_or_logs(self):
         paths = ensure_runtime_layout()
         eval_id = "7"
         session_id = "codex_7_spawn_1_deadbeef"
@@ -401,6 +753,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("# Research Evaluation Preview #7", result.stdout)
+        self.assertIn("This preview intentionally includes evaluation metadata, abstract, the agent instruction, and Coder Report", result.stdout)
         self.assertIn("- Title: Previewable Evaluation", result.stdout)
         self.assertIn("- Author: Axiom I", result.stdout)
         self.assertIn("- Tags: data, conjecture", result.stdout)
@@ -408,10 +761,14 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertIn("- Completed tick: 4", result.stdout)
         self.assertIn("- Final score: 0.42", result.stdout)
         self.assertIn("- Secondary metrics: secondary_metric=17", result.stdout)
+        self.assertIn("- Agent instruction: shown below", result.stdout)
         self.assertIn("A data-driven conjecture search abstract.", result.stdout)
         self.assertIn("Use a data-driven conjecture search.", result.stdout)
-        self.assertIn("Exact coder prompt.", result.stdout)
         self.assertIn("Final Coder Report body.", result.stdout)
+        self.assertIn("Stdout log: `storage/stdout/7.log`", result.stdout)
+        self.assertIn("Reading stdout is not recommended unless the preview is insufficient", result.stdout)
+        self.assertNotIn("Exact coder prompt.", result.stdout)
+        self.assertNotIn("Coder Prompt", result.stdout)
         self.assertNotIn("RAW CODE SHOULD NOT PRINT", result.stdout)
         self.assertNotIn("STDOUT SHOULD NOT PRINT", result.stdout)
 
@@ -462,6 +819,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("# Research Evaluation Abstract Search", result.stdout)
         self.assertIn("Scope: evaluation abstracts only", result.stdout)
+        self.assertIn("Showing: first 2 of 2 newest matches", result.stdout)
         self.assertIn("## Eval #7: Graph Neural Ramsey Search", result.stdout)
         self.assertIn("## Eval #9: Spectral Certificate", result.stdout)
         self.assertNotIn("## Eval #8: Instruction Only Match", result.stdout)
@@ -479,6 +837,59 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertEqual(and_result.returncode, 0, and_result.stderr)
         self.assertIn("## Eval #7: Graph Neural Ramsey Search", and_result.stdout)
         self.assertNotIn("## Eval #9: Spectral Certificate", and_result.stdout)
+
+    def test_eval_tool_search_defaults_to_30_and_caps_limit_at_100(self):
+        paths = ensure_runtime_layout()
+        for eval_num in range(1, 36):
+            file_io_utils.save_yaml(
+                {
+                    "id": str(eval_num),
+                    "title": f"Needle Eval {eval_num}",
+                    "author": "Axiom I",
+                    "abstract": f"Needle abstract {eval_num}.",
+                    "instruction": "No hidden keyword here.",
+                },
+                os.path.join(paths.evaluations_dir, f"{eval_num}{constants.RESEARCH_EVALUATION_FILE_EXTENSION}"),
+                sort_keys=False,
+            )
+
+        default_result = subprocess.run(
+            ["bash", paths.eval_tool_script_path, "search", "needle"],
+            cwd=paths.research_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(default_result.returncode, 0, default_result.stderr)
+        self.assertIn("Matches: 35", default_result.stdout)
+        self.assertIn("Showing: first 30 of 35 newest matches", default_result.stdout)
+        self.assertIn("Use a narrower search term if needed", default_result.stdout)
+        self.assertIn("## Eval #35: Needle Eval 35", default_result.stdout)
+        self.assertIn("## Eval #6: Needle Eval 6", default_result.stdout)
+        self.assertNotIn("## Eval #5: Needle Eval 5", default_result.stdout)
+
+        limit_result = subprocess.run(
+            ["bash", paths.eval_tool_script_path, "search", "--limit", "33", "needle"],
+            cwd=paths.research_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(limit_result.returncode, 0, limit_result.stderr)
+        self.assertIn("Showing: first 33 of 35 newest matches", limit_result.stdout)
+        self.assertIn("## Eval #3: Needle Eval 3", limit_result.stdout)
+        self.assertNotIn("## Eval #2: Needle Eval 2", limit_result.stdout)
+
+        capped_result = subprocess.run(
+            ["bash", paths.eval_tool_script_path, "search", "--limit", "1000", "needle"],
+            cwd=paths.research_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(capped_result.returncode, 0, capped_result.stderr)
+        self.assertIn("Requested limit 1000 exceeds the maximum; showing at most 100.", capped_result.stdout)
+        self.assertIn("Showing: first 35 of 35 newest matches", capped_result.stdout)
 
     def test_eval_tool_search_uses_checkout_imports_from_surveyor_workspace(self):
         paths = ensure_runtime_layout()
@@ -545,6 +956,12 @@ class ArchiveSurveyorTest(unittest.TestCase):
         ]
         self.assertTrue(read_status["mail_1"])
         self.assertTrue(read_status["mail_1-1"])
+        record = _load_request(surveyor.paths, survey_id)
+        self.assertTrue(record["notification"][SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_KEY])
+        update_calls_after_delivery = agent_module.update_calls
+
+        surveyor._repair_pending_notifications()
+        self.assertEqual(agent_module.update_calls, update_calls_after_delivery)
         mail_files = file_io_utils.list_files(
             os.path.join(constants.BASE_STATION_DATA_PATH, constants.CAPSULES_DIR_NAME, constants.MAIL_CAPSULES_SUBDIR_NAME),
             constants.YAML_EXTENSION,
@@ -557,7 +974,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertIn(report_text, mail_content)
         self.assertLess(mail_content.index("Survey Report Notice"), mail_content.index("# Archive Survey Report #1"))
 
-    def test_repair_sent_survey_notification_marks_mail_read(self):
+    def test_sent_survey_notification_is_not_repaired_in_background_loop(self):
         agent_module = _AgentModuleStub()
         station = self._surveyor_station(agent_module)
         surveyor = AutoArchiveSurveyor(station, enabled=False)
@@ -582,11 +999,9 @@ class ArchiveSurveyorTest(unittest.TestCase):
 
         surveyor._repair_pending_notifications()
 
-        read_status = agent_module.agents["Axiom I"][constants.SHORT_ROOM_NAME_MAIL][
-            constants.AGENT_ROOM_STATE_READ_STATUS_KEY
-        ]
-        self.assertTrue(read_status["mail_1"])
-        self.assertTrue(read_status["mail_1-1"])
+        record = _load_request(surveyor.paths, survey_id)
+        self.assertNotIn(SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_KEY, record["notification"])
+        self.assertEqual(agent_module.update_calls, 0)
 
     def test_mail_room_delivery_uses_atomic_update_for_recipient_state(self):
         agent_data = {
@@ -733,7 +1148,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         surveyor.active_sessions[survey_id] = session
 
         with mock.patch("station.eval_archive.surveyor.os.killpg") as killpg:
-            surveyor._check_codex_transcript_idle_timeouts()
+            surveyor._check_cli_job_transcript_idle_timeouts()
 
         killpg.assert_called_once_with(DummyProcess.pid, signal.SIGTERM)
         self.assertTrue(session.transcript_idle_timeout_triggered)
@@ -743,7 +1158,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         self.assertIn("did not grow", record["session"]["last_error"])
 
         process.returncode = -15
-        surveyor._poll_sessions()
+        surveyor.poll_cli_jobs()
         record = file_io_utils.load_yaml(request_path)
         self.assertEqual(record["status"], "queued")
         self.assertIn("did not grow", record["session"]["last_error"])
@@ -798,7 +1213,7 @@ class ArchiveSurveyorTest(unittest.TestCase):
         )
         surveyor.active_sessions[survey_id] = session
 
-        surveyor._poll_sessions()
+        surveyor.poll_cli_jobs()
 
         request_path = os.path.join(surveyor.paths.requests_dir, f"survey_{survey_id}.yaml")
         record = file_io_utils.load_yaml(request_path)
@@ -925,9 +1340,25 @@ class ArchiveSurveyorTest(unittest.TestCase):
             def poll(self):
                 return None
 
-        with mock.patch.dict(os.environ, {"CODEX_API_KEY": "survey-key", "CODEX_BASE_URL": "https://codex.test"}, clear=False), \
-             mock.patch("station.eval_archive.surveyor.detect_cli_worker_executable", return_value="/usr/bin/codex"), \
-             mock.patch("station.eval_archive.surveyor.subprocess.Popen", DummyPopen):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CODEX_API_KEY": "survey-key",
+                    "CODEX_BASE_URL": "https://codex.test/v1",
+                    "CODEX_ACCESS_TOKEN": "stored-access-token",
+                    "CODEX_AUTH": "stored-auth",
+                    "OPENAI_API_KEY": "openai-key",
+                    "OPENAI_BASE_URL": "https://openai.test/v1",
+                },
+                clear=False,
+            ),
+            mock.patch(
+                "station.eval_archive.surveyor.detect_cli_worker_executable",
+                return_value="/usr/bin/codex",
+            ),
+            mock.patch("station.eval_archive.surveyor.subprocess.Popen", DummyPopen),
+        ):
             self.assertTrue(surveyor._launch_survey(survey_id))
 
         session = surveyor.active_sessions[survey_id]
@@ -939,8 +1370,29 @@ class ArchiveSurveyorTest(unittest.TestCase):
             self.assertIn(os.path.realpath(index_dir), popen_instances[0].command)
             self.assertNotIn(os.path.realpath(surveyor.paths.archive_target), popen_instances[0].command)
             self.assertNotIn(os.path.realpath(surveyor.paths.research_target), popen_instances[0].command)
-            self.assertEqual(popen_instances[0].kwargs["env"].get("OPENAI_API_KEY"), "survey-key")
-            self.assertEqual(popen_instances[0].kwargs["env"].get("OPENAI_BASE_URL"), "https://codex.test")
+            self.assertIn('web_search="disabled"', popen_instances[0].command)
+            self.assertIn("sandbox_workspace_write.network_access=true", popen_instances[0].command)
+            self.assertIn("features.network_proxy.enabled=true", popen_instances[0].command)
+            self.assertTrue(any(
+                value.startswith("features.network_proxy.domains=")
+                and '"api.openai.com" = "allow"' in value
+                and '"codex.test" = "allow"' in value
+                for value in popen_instances[0].command
+            ))
+            self.assertIn('model_provider="alt"', popen_instances[0].command)
+            self.assertTrue(any(
+                value.startswith("model_providers.alt=")
+                and 'base_url="https://codex.test/v1"' in value
+                and 'env_key="CODEX_API_KEY"' in value
+                and 'wire_api="responses"' in value
+                for value in popen_instances[0].command
+            ))
+            self.assertEqual(popen_instances[0].kwargs["env"].get("CODEX_API_KEY"), "survey-key")
+            self.assertEqual(popen_instances[0].kwargs["env"].get("CODEX_BASE_URL"), "https://codex.test/v1")
+            self.assertNotIn("OPENAI_API_KEY", popen_instances[0].kwargs["env"])
+            self.assertNotIn("OPENAI_BASE_URL", popen_instances[0].kwargs["env"])
+            self.assertNotIn("CODEX_ACCESS_TOKEN", popen_instances[0].kwargs["env"])
+            self.assertNotIn("CODEX_AUTH", popen_instances[0].kwargs["env"])
             prompt_text = file_io_utils.load_text(session.prompt_path)
             self.assertIn("Normal work cycle:", prompt_text)
             self.assertIn("1000 to 5000 words", prompt_text)

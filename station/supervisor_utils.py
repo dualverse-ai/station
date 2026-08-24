@@ -6,10 +6,10 @@ import random
 import re
 
 from station import capsule as capsule_module
+from station.station_config import top_submission_from_config
 from station.eval_research import (
     extract_secondary_metrics_for_display_info,
     format_score_for_display,
-    get_evaluation_display_info,
 )
 
 
@@ -236,18 +236,13 @@ def build_supervisor_dashboard_lines(
         )
 
     if consts.RESEARCH_CENTER_ENABLED and not consts.RESEARCH_NO_SCORE:
-        eval_manager = None
-        if hasattr(station_instance, 'auto_research_evaluator') and station_instance.auto_research_evaluator:
-            eval_manager = getattr(station_instance.auto_research_evaluator, 'eval_manager', None)
-        top_submission = eval_manager.get_top_submission() if eval_manager else None
+        top_submission = top_submission_from_config(station_instance.config)
         lines.append("")
         lines.append("### Current Station SOTA")
-        eval_id = top_submission.get("evaluation_id") if top_submission else None
-        display_info = get_evaluation_display_info(str(eval_id)) if eval_id is not None else None
         lines.extend(
             build_current_station_sota_lines(
                 top_submission,
-                display_info,
+                None,
                 consts,
                 current_tick
             )
@@ -311,16 +306,23 @@ def _get_supervisor_candidates(agent_manager, room_context, current_tick: int) -
     min_age = consts.SUPERVISOR_MIN_AGE_TICKS
 
     candidates: List[str] = []
-    def _model_matches(required: Optional[str], actual: Optional[str]) -> bool:
+    def _model_matches(required: Any, actual: Optional[str]) -> bool:
         if required is None:
             return True
-        if not required:
+        patterns = required if isinstance(required, (list, tuple, set)) else [required]
+        if not patterns:
             return False
         if actual is None:
             return False
-        if any(ch in required for ch in "*?[]"):
-            return fnmatch.fnmatchcase(actual, required)
-        return actual == required
+        for pattern in patterns:
+            if not pattern:
+                continue
+            if any(ch in pattern for ch in "*?[]"):
+                if fnmatch.fnmatchcase(actual, pattern):
+                    return True
+            elif actual == pattern:
+                return True
+        return False
 
     for agent_name in agent_manager.get_all_active_agent_names():
         agent_data = agent_manager.load_agent_data(agent_name)
@@ -379,7 +381,14 @@ def _assign_supervisor(agent_manager, room_context, agent_name: str, current_tic
     agent_data[consts.AGENT_MAX_AGE_KEY] = max_age
 
     supervisor_message = consts.SUPERVISOR_PROMOTION_MESSAGE
-    agent_manager.add_pending_notification(agent_data, supervisor_message)
+    agent_manager.add_pending_notification(
+        agent_data,
+        supervisor_message,
+        protected_context_kind=consts.PROTECTED_CONTEXT_KIND_ARCHITECT_MESSAGE,
+        protected_context_source="supervisor_assignment",
+        protected_context_title="Supervisor Promotion",
+        protected_context_tick=current_tick,
+    )
     agent_manager.save_agent_data(agent_name, agent_data)
 
     broadcast_message = consts.SUPERVISOR_ASSIGNMENT_BROADCAST.format(

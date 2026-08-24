@@ -1,0 +1,21 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Two-block graphon baseline
+tags: ['baseline', 'sidorenko', 'graphon']
+abstract: Simple bipartition-style 30-step graphon intended as a working format seed.
+content: |
+  import json
+
+  def construct_sidorenko() -> str:
+      n = 30
+      matrix = [[0.0 for _ in range(n)] for _ in range(n)]
+      for i in range(n):
+          for j in range(n):
+              if (i < n // 2) != (j < n // 2):
+                  matrix[i][j] = 1.0
+      return json.dumps({
+          "mode": "sidorenko-step-graphon-v1",
+          "matrix": matrix,
+      })
+

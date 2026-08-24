@@ -54,7 +54,8 @@ class GPUCoordinator:
 
     def __init__(self, coord_file_path: Optional[str] = None,
                  available_gpus: Optional[List[int]] = None,
-                 station_id: Optional[str] = None):
+                 station_id: Optional[str] = None,
+                 expiry_seconds: Optional[float] = None):
         """
         Initialize GPU coordinator.
 
@@ -62,10 +63,12 @@ class GPUCoordinator:
             coord_file_path: Path to coordination file, None for in-memory mode
             available_gpus: List of GPU IDs available for allocation
             station_id: Unique station identifier
+            expiry_seconds: Seconds after allocation when another station may reclaim the slot
         """
         self.coord_file = coord_file_path
         self.total_gpus = available_gpus or []
         self.station_id = station_id or "unknown"
+        self.expiry_seconds = expiry_seconds
         self.lock_timeout = 5.0  # Hardcoded timeout for file lock acquisition
 
         if coord_file_path:
@@ -214,6 +217,8 @@ class GPUCoordinator:
                     if allocation_key in data.get("allocations", {}):
                         return data["allocations"][allocation_key].get("gpus", [])
 
+                    self._drop_expired_allocations_locked(data, time.time())
+
                     # Calculate available GPUs
                     used_gpus = set()
                     for info in data.get("allocations", {}).values():
@@ -232,8 +237,14 @@ class GPUCoordinator:
                             "station_id": self.station_id,
                             "eval_id": eval_id,
                             "start_time": current_time,
-                            "start_time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            "start_time_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         }
+                        if self.expiry_seconds is not None:
+                            data["allocations"][allocation_key]["timeout_seconds"] = self.expiry_seconds / 2
+                            data["allocations"][allocation_key]["expires_at"] = current_time + self.expiry_seconds
+                            data["allocations"][allocation_key]["expires_at_str"] = datetime.fromtimestamp(
+                                current_time + self.expiry_seconds
+                            ).strftime("%Y-%m-%d %H:%M:%S")
                         data["last_updated"] = current_time
                         data["last_updated_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -367,9 +378,9 @@ class GPUCoordinator:
                     removed_count = 0
 
                     for key, info in data.get("allocations", {}).items():
-                        age = current_time - info.get("start_time", current_time)
-                        if age > stale_run_seconds:
+                        if self._allocation_is_expired(info, current_time, stale_run_seconds):
                             removed_count += 1
+                            age = current_time - info.get("start_time", current_time)
                             print(f"GPUCoordinator: Removing stale allocation {key} "
                                   f"(age: {age:.1f}s, GPUs: {info.get('gpus')})")
                         else:
@@ -391,3 +402,34 @@ class GPUCoordinator:
 
         except Exception as e:
             print(f"GPUCoordinator: Error cleaning stale allocations: {e}")
+
+    @staticmethod
+    def _allocation_is_expired(info: Dict, current_time: float, fallback_stale_seconds: float) -> bool:
+        expires_at = info.get("expires_at")
+        if expires_at is not None:
+            try:
+                return current_time > float(expires_at)
+            except (TypeError, ValueError):
+                pass
+        start_time = info.get("start_time", current_time)
+        try:
+            return (current_time - float(start_time)) > fallback_stale_seconds
+        except (TypeError, ValueError):
+            return False
+
+    def _drop_expired_allocations_locked(self, data: Dict, current_time: float):
+        fallback_stale_seconds = self.expiry_seconds or 3600
+        allocations = data.get("allocations", {})
+        cleaned_allocations = {}
+        removed_count = 0
+        for key, info in allocations.items():
+            if self._allocation_is_expired(info, current_time, fallback_stale_seconds):
+                removed_count += 1
+                print(f"GPUCoordinator: Removing expired allocation {key} "
+                      f"(GPUs: {info.get('gpus')})")
+            else:
+                cleaned_allocations[key] = info
+        if removed_count:
+            data["allocations"] = cleaned_allocations
+            data["last_updated"] = current_time
+            data["last_updated_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

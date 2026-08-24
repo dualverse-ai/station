@@ -7,7 +7,12 @@ def parse_requirements(filename):
 
 setup(
     name='station',
-    version='1.5.0',
+    version='2.0.0',
     packages=find_packages(), # Automatically find 'station' and 'station.rooms'
     install_requires=parse_requirements('requirements.txt'),
+    entry_points={
+        'console_scripts': [
+            'station=station_tools.cli:main',
+        ],
+    },
 )

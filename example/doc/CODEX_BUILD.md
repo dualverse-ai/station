@@ -9,8 +9,8 @@ Goal:
 - Add a `ccodex` command that points at the standalone configurable binary.
 - Patch Codex so both timeout caps are configurable from `~/.codex/config.toml`.
 - Set both timeout overrides to `1 hour` in the standard config file.
-- Publish the verified binary to a shared binary directory for other station checkouts/machines.
-- Point every station `.env` at the published `ccodex` binary through `CODEX_BIN_PATH`.
+- Publish the verified binary to a shared binary directory for distribution to other station checkouts/machines.
+- Run Codex from the local standalone binary on each machine, and point every station `.env` at that local binary through `CODEX_BIN_PATH`.
 - Produce a binary that you can manually copy or invoke by full path.
 
 This guide assumes Linux on `x86_64`, ideally Ubuntu/Debian. If the remote machine is different, the dependency package names may differ slightly.
@@ -94,13 +94,19 @@ PUBLISHED_CODEX_BIN="$PUBLISH_DIR/ccodex.bin"
 
 If the dated directory already exists, create a unique suffix such as `${STAMP}_ccodex_1`, `${STAMP}_ccodex_2`, and so on. The final file name inside the directory should stay `ccodex.bin`.
 
-When updating station `.env` files, set this exact key to the published binary path:
+The shared binary is a distribution artifact, not the preferred runtime path. After either update or refresh, copy or install that binary into the local standalone path and make `ccodex` point there:
 
 ```bash
-CODEX_BIN_PATH=/mnt/stephen/template/2026_04_25_ccodex/ccodex.bin
+LOCAL_CODEX_BIN="$HOME/codex-standalone/bin/codex-configurable"
 ```
 
-Do not print `.env` contents while doing this. Report only file paths updated and counts.
+When updating station `.env` files, set this exact key to the local standalone binary path for that machine:
+
+```bash
+CODEX_BIN_PATH=/home/ubuntu/codex-standalone/bin/codex-configurable
+```
+
+Do not point station `.env` files at `/mnt/...` unless the user explicitly wants to run directly from the shared drive. Do not print `.env` contents while doing this. Report only file paths updated and counts.
 
 ### Update Command
 
@@ -140,11 +146,12 @@ cargo build --release -p codex-cli
 
 ```bash
 mkdir -p "$PUBLISH_DIR"
-install -m 755 "$HOME/codex-standalone/bin/codex-configurable" "$PUBLISHED_CODEX_BIN"
+LOCAL_CODEX_BIN="$HOME/codex-standalone/bin/codex-configurable"
+install -m 755 "$LOCAL_CODEX_BIN" "$PUBLISHED_CODEX_BIN"
 "$PUBLISHED_CODEX_BIN" --version
 ```
 
-9. Scan all station checkouts, including `~/station*`, and update every existing `.env` to contain the new `CODEX_BIN_PATH=$PUBLISHED_CODEX_BIN`.
+9. Scan all station checkouts, including `~/station*`, and update every existing `.env` to contain the local runtime path, `CODEX_BIN_PATH=$LOCAL_CODEX_BIN`.
 
 ### Refresh Command
 
@@ -172,6 +179,7 @@ test -n "$PUBLISHED_CODEX_BIN"
 
 ```bash
 mkdir -p "$HOME/codex-standalone/bin"
+LOCAL_CODEX_BIN="$HOME/codex-standalone/bin/codex-configurable"
 install -m 755 "$PUBLISHED_CODEX_BIN" "$HOME/codex-standalone/bin/codex-configurable_tmp"
 "$HOME/codex-standalone/bin/codex-configurable_tmp" --version
 ```
@@ -181,17 +189,20 @@ install -m 755 "$PUBLISHED_CODEX_BIN" "$HOME/codex-standalone/bin/codex-configur
    - move `codex-configurable_tmp` to `codex-configurable`
    - recreate `ccodex` to point at `codex-configurable`
 4. Ensure `~/.codex/config.toml` contains the 1-hour foreground/background timeout overrides from Step 7.
-5. Scan all station checkouts, including `~/station*`, and update every existing `.env` to contain the new `CODEX_BIN_PATH=$PUBLISHED_CODEX_BIN`.
+5. Scan all station checkouts, including `~/station*`, and update every existing `.env` to contain the local runtime path, `CODEX_BIN_PATH=$LOCAL_CODEX_BIN`.
 
 ### Station `.env` Update Helper
 
 Use this helper after either `update` or `refresh`. It updates only `CODEX_BIN_PATH` and does not print secret values:
 
 ```bash
+LOCAL_CODEX_BIN="${LOCAL_CODEX_BIN:-$HOME/codex-standalone/bin/codex-configurable}"
+test -x "$LOCAL_CODEX_BIN"
+
 find "$HOME" -maxdepth 2 -type f -path "$HOME/station*/.env" -print0 |
 while IFS= read -r -d '' env_file; do
   sed -i '/^[[:space:]]*CODEX_BIN_PATH[[:space:]]*=/d' "$env_file"
-  printf '\nCODEX_BIN_PATH=%s\n' "$PUBLISHED_CODEX_BIN" >> "$env_file"
+  printf '\nCODEX_BIN_PATH=%s\n' "$LOCAL_CODEX_BIN" >> "$env_file"
   printf 'updated %s\n' "$env_file"
 done
 ```

@@ -22,7 +22,11 @@
     <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/lib/marked.umd.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension@5.1.5/lib/index.umd.js" crossorigin="anonymous"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <script src="{{ url_for('static', filename='js/theme.js') }}"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
@@ -72,6 +76,27 @@
         .chat-bubble {
              word-break: break-word; /* Or break-all if necessary */
         }
+        .multistart-preview-banner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 0.7rem 1rem;
+            border-bottom: 1px solid #d97706;
+            background: #78350f;
+            color: #fef3c7;
+            font-size: 0.9rem;
+        }
+        .multistart-preview-banner a {
+            flex: 0 0 auto;
+            border: 1px solid #f59e0b;
+            border-radius: 0.375rem;
+            padding: 0.35rem 0.7rem;
+            color: #fff7ed;
+            font-weight: 600;
+            text-decoration: none;
+        }
+        .multistart-preview-banner a:hover { background: #92400e; }
     </style>
 </head>
 <body class="bg-gray-900 text-slate-300 flex flex-col h-screen" data-operation-mode="{{ operation_mode }}">
@@ -95,16 +120,13 @@
                     <span>Station Tick:</span>
                     <span id="station-tick-dashboard" class="font-semibold">N/A</span>
                     <span class="text-slate-500">|</span>
-                    <span>Sync:</span>
-                    <span id="station-sync-mode-dashboard" class="font-semibold">Sequential</span>
-                    <span class="text-slate-500">|</span>
                     <span>Status:</span>
                     <span id="station-status-dashboard" class="font-semibold">Unknown</span>
                 </div>
                 <label class="theme-selector-shell" for="dashboard-theme-selector">
                     <span>Theme</span>
                     <select id="dashboard-theme-selector" aria-label="Dashboard theme">
-                        <option value="light">White</option>
+                        <option value="light">Light</option>
                         <option value="dark">Dark</option>
                         <option value="sci-fi">Sci-Fi</option>
                     </select>
@@ -113,6 +135,21 @@
             </div>
         </div>
     </header>
+
+    {% if operation_mode == 'multistart_preview' %}
+    <div id="multistart-preview-banner" class="multistart-preview-banner" role="status" aria-live="polite">
+        <div>
+            <strong>Multistart is running — read-only Seed 1 preview.</strong>
+            <span id="multistart-preview-detail">
+                Seed 1 {{ multistart_preview.branch.status or 'pending' }},
+                tick {{ multistart_preview.branch.current_tick if multistart_preview.branch.current_tick is not none else '-' }}
+                of {{ multistart_preview.branch.target_tick if multistart_preview.branch.target_tick is not none else '-' }}.
+                This branch may not be selected.
+            </span>
+        </div>
+        <a href="{{ url_for('multistart_page') }}">View all branches</a>
+    </div>
+    {% endif %}
 
     <div class="dashboard-shell flex-1 overflow-hidden">
         <aside class="dashboard-sidebar glass-surface shadow-2xl flex flex-col">
@@ -193,18 +230,33 @@
             <div class="sidebar-section sidebar-tools-section">
                 <h2 class="text-lg font-semibold mb-3 text-sky-400">Station Tools</h2>
                 <div class="sidebar-primary-tools">
-                    <button id="create-api-agent-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Agent</button>
                     <button id="open-archive-papers-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Archive Papers</button>
+                    <button id="open-question-room-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Question Room</button>
                     <button id="open-temporal-chat-modal-button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Incognito Chat</button>
                     <div class="more-tools-container">
                         <button id="more-tools-button" type="button" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" aria-expanded="false" aria-controls="more-tools-popover">More Tools</button>
                         <div id="more-tools-popover" class="more-tools-popover" role="menu" aria-label="More station tools">
-                            <button id="open-send-system-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Send System Message</button>
-                            <button id="open-speak-common-room-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Speak in Common Room</button>
-                            <button id="update-station-config-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Update Station Config</button>
-                            <button id="open-api-runtime-config-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Set API Keys</button>
-                            <button id="create-backup-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Backup</button>
-                            <button id="open-direct-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Intervene</button>
+                            <div class="more-tools-group" role="group" aria-labelledby="more-tools-agents-label">
+                                <div id="more-tools-agents-label" class="more-tools-group-label">Agent Controls</div>
+                                <button id="create-api-agent-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Agent</button>
+                            </div>
+                            <div class="more-tools-group" role="group" aria-labelledby="more-tools-research-label">
+                                <div id="more-tools-research-label" class="more-tools-group-label">Research</div>
+                                <button id="open-web-archive-surveys-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Surveyor</button>
+                                <button id="open-research-task-spec-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Research Task Spec</button>
+                            </div>
+                            <div class="more-tools-group" role="group" aria-labelledby="more-tools-communication-label">
+                                <div id="more-tools-communication-label" class="more-tools-group-label">Communication</div>
+                                <button id="open-speak-common-room-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Speak in Common Room</button>
+                                <button id="open-send-system-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Send System Message</button>
+                                <button id="open-direct-message-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md" disabled>Intervene</button>
+                            </div>
+                            <div class="more-tools-group" role="group" aria-labelledby="more-tools-admin-label">
+                                <div id="more-tools-admin-label" class="more-tools-group-label">Administration</div>
+                                <button id="update-station-config-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Update Station Config</button>
+                                <button id="open-api-runtime-config-modal-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Set API Keys</button>
+                                <button id="create-backup-button" type="button" role="menuitem" class="disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md shadow-md">Create Backup</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -337,7 +389,7 @@
                      <p class="text-sm text-indigo-300 mb-3">Station Metadata (Optional):</p>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-4">
                         <div>
-                            <label for="api-initial-tokens-max" class="block text-sm font-medium text-slate-400 mb-1">Initial Tokens Max (Budget):</label>
+                            <label for="api-initial-tokens-max" class="block text-sm font-medium text-slate-400 mb-1">Initial Context Budget:</label>
                             <input type="number" id="api-initial-tokens-max" name="initial_tokens_max" class="w-full p-2.5 bg-slate-700 border border-slate-600 rounded-md shadow-sm focus:ring-sky-500 focus:border-sky-500 text-slate-200 mb-3" placeholder="e.g., 100000">
                         </div>
                         <div>
@@ -524,7 +576,7 @@
                 <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4 pr-12">
                     <div>
                         <h3 class="text-xl font-semibold text-sky-400">Archive Papers</h3>
-                        <p class="text-xs text-slate-500 mt-1">Scrollable table. Click any row to open the paper in rendered markdown.</p>
+                        <p class="text-xs text-slate-500 mt-1">Select a paper to read the full publication.</p>
                     </div>
                     <div class="flex gap-3">
                         <button type="button" id="copy-all-archive-abstracts-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Copy All Abstracts</button>
@@ -549,20 +601,185 @@
                         </tbody>
                     </table>
                 </div>
+                <div class="table-footer-bar">
+                    <div class="table-pagination-controls">
+                        <button type="button" id="archive-previous-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Previous</button>
+                        <span id="archive-page-summary" class="text-xs text-slate-400">Page 1 of 1</span>
+                        <button type="button" id="archive-next-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Next</button>
+                    </div>
+                    <label class="table-row-count-control" for="archive-row-count-select">
+                        Rows
+                        <select id="archive-row-count-select" class="table-row-count-select">
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </label>
+                </div>
             </div>
 
             <div id="archive-paper-detail-view" class="archive-papers-pane hidden">
-                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
-                    <div>
+                <div class="archive-detail-header flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
+                    <div class="archive-detail-heading">
                         <h3 id="archive-paper-detail-title" class="text-xl font-semibold text-sky-400">Archive Paper</h3>
                         <p id="archive-paper-detail-meta" class="text-xs text-slate-500 mt-1"></p>
                     </div>
-                    <div class="flex gap-3">
+                    <div class="archive-detail-actions flex gap-3">
                         <button type="button" id="back-to-archive-papers-list-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Back to List</button>
                         <button type="button" id="copy-archive-paper-markdown-button" class="bg-teal-600 hover:bg-teal-500 text-white font-semibold py-2 px-4 rounded-md">Copy Markdown</button>
                     </div>
                 </div>
                 <div id="archive-paper-markdown-container" class="archive-paper-markdown markdown-content-host"></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="web-archive-surveys-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 archive-papers-modal-content">
+            <span class="close-button" id="close-web-archive-surveys-modal-button">&times;</span>
+            <div id="web-archive-surveys-list-view" class="archive-papers-pane">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4 pr-12">
+                    <div>
+                        <h3 class="text-xl font-semibold text-sky-400">Surveyor</h3>
+                        <p class="text-xs text-slate-500 mt-1">Use the Surveyor to summarize Archive papers and submitted Research Center evaluations without interrupting the Station. It can also draw on relevant Question Room discussions.</p>
+                    </div>
+                    <div class="archive-surveyor-header-actions">
+                        <button type="button" id="refresh-web-archive-surveys-button" class="archive-survey-action-button archive-surveyor-header-button bg-slate-600 hover:bg-slate-500 text-white">Refresh</button>
+                        <button type="button" id="open-web-archive-survey-request-button" class="archive-survey-action-button archive-surveyor-header-button bg-teal-600 hover:bg-teal-500 text-white">New Request</button>
+                    </div>
+                </div>
+
+                <div class="archive-table-shell">
+                    <table class="archive-papers-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Status</th>
+                                <th>Request</th>
+                                <th>Submitted Tick</th>
+                                <th>Submitted Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="web-archive-surveys-table-body">
+                            <tr><td colspan="5" class="archive-empty-state">Loading survey reports...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="table-footer-bar">
+                    <div class="table-pagination-controls">
+                        <button type="button" id="web-archive-survey-previous-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Previous</button>
+                        <span id="web-archive-survey-page-summary" class="text-xs text-slate-400">Page 1 of 1</span>
+                        <button type="button" id="web-archive-survey-next-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Next</button>
+                    </div>
+                    <label class="table-row-count-control" for="web-archive-survey-row-count-select">
+                        Rows
+                        <select id="web-archive-survey-row-count-select" class="table-row-count-select">
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+
+            <section id="web-archive-survey-report-shell" class="archive-papers-pane archive-survey-report-shell hidden" aria-live="polite">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
+                    <div>
+                        <h3 id="web-archive-survey-report-title" class="text-xl font-semibold text-sky-400">Survey report</h3>
+                        <p id="web-archive-survey-report-meta" class="text-xs text-slate-500 mt-1"></p>
+                    </div>
+                    <div class="archive-survey-report-actions">
+                        <button type="button" id="remove-web-archive-survey-button" class="archive-survey-action-button archive-survey-remove-button">Remove</button>
+                        <button type="button" id="copy-web-archive-survey-markdown-button" class="archive-survey-action-button bg-teal-600 hover:bg-teal-500 text-white">Copy Markdown</button>
+                        <button type="button" id="close-web-archive-survey-report-button" class="archive-survey-action-button bg-slate-600 hover:bg-slate-500 text-white">Back to Surveys</button>
+                    </div>
+                </div>
+                <div id="web-archive-survey-report" class="archive-paper-markdown markdown-content-host"></div>
+            </section>
+        </div>
+    </div>
+
+    <div id="web-archive-survey-request-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 archive-survey-request-modal-content">
+            <span class="close-button" id="close-web-archive-survey-request-modal-button">&times;</span>
+            <section class="archive-surveyor-compose" aria-labelledby="archive-surveyor-compose-title">
+                <div>
+                    <h3 id="archive-surveyor-compose-title" class="text-xl font-semibold text-sky-400">New Survey Request</h3>
+                    <p class="archive-surveyor-help">Choose a template or write your own request. The Surveyor automatically searches all Archive papers, Research Center evaluations, and Question Room threads.</p>
+                </div>
+                <div id="web-archive-survey-template-buttons" class="archive-survey-template-grid"></div>
+                <label for="web-archive-survey-prompt" class="archive-surveyor-field-label">Request</label>
+                <textarea id="web-archive-survey-prompt" rows="12" class="archive-surveyor-prompt" placeholder="Ask for a landscape review, comparison, technical explanation, evidence audit, or new research ideas grounded in Station records..."></textarea>
+                <div class="archive-surveyor-compose-actions">
+                    <button type="button" id="clear-web-archive-survey-prompt-button" class="archive-survey-action-button bg-slate-600 hover:bg-slate-500 text-white">Clear</button>
+                    <button type="button" id="cancel-web-archive-survey-request-button" class="archive-survey-action-button bg-slate-600 hover:bg-slate-500 text-white">Cancel</button>
+                    <button type="button" id="submit-web-archive-survey-button" class="archive-survey-action-button bg-teal-600 hover:bg-teal-500 text-white">Submit Survey</button>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <div id="question-room-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 archive-papers-modal-content question-room-modal-content">
+            <span class="close-button" id="close-question-room-modal-button">&times;</span>
+            <div id="question-room-list-view" class="archive-papers-pane">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4 pr-12">
+                    <div>
+                        <h3 class="text-xl font-semibold text-sky-400">Question Room</h3>
+                        <p class="text-xs text-slate-500 mt-1">Select a question to read the agent discussion.</p>
+                    </div>
+                </div>
+                <div class="archive-table-shell">
+                    <table class="archive-papers-table question-room-table">
+                        <thead>
+                            <tr>
+                                <th><button type="button" class="question-sort-button" data-sort-key="numeric_id">ID</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="title">Title</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="author">Author</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="authored_tick">Authored Tick</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="status">Status</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="net_upvote">Net Upvote</button></th>
+                                <th><button type="button" class="question-sort-button" data-sort-key="message_count">Replies</button></th>
+                            </tr>
+                        </thead>
+                        <tbody id="question-room-table-body">
+                            <tr>
+                                <td colspan="7" class="archive-empty-state">Loading questions...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="table-footer-bar">
+                    <div class="table-pagination-controls">
+                        <button type="button" id="question-previous-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Previous</button>
+                        <span id="question-page-summary" class="text-xs text-slate-400">Page 1 of 1</span>
+                        <button type="button" id="question-next-page-button" class="bg-slate-600 hover:bg-slate-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md">Next</button>
+                    </div>
+                    <label class="table-row-count-control" for="question-page-size-select">
+                        Rows
+                        <select id="question-page-size-select" class="table-row-count-select">
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="100" selected>100</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+
+            <div id="question-room-detail-view" class="archive-papers-pane hidden">
+                <div class="flex flex-col md:flex-row md:items-start md:justify-between gap-3 mb-4">
+                    <div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <h3 id="question-room-detail-title" class="text-xl font-semibold text-sky-400">Question</h3>
+                            <span id="question-room-detail-status" class="question-status-badge"></span>
+                        </div>
+                        <p id="question-room-detail-meta" class="text-xs text-slate-500 mt-1"></p>
+                    </div>
+                    <button type="button" id="back-to-question-room-list-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Back to List</button>
+                </div>
+                <div id="question-room-thread" class="question-room-thread" aria-live="polite"></div>
             </div>
         </div>
     </div>
@@ -597,11 +814,6 @@
                 <div class="mb-4">
                     <label for="update-station-id" class="block text-sm font-medium text-slate-400 mb-1">Station ID (read-only):</label>
                     <input type="text" id="update-station-id" readonly class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm text-slate-300 cursor-not-allowed opacity-75" placeholder="Loading...">
-                </div>
-
-                <div class="mb-4">
-                    <label for="update-station-sync-mode" class="block text-sm font-medium text-slate-400 mb-1">Sync Mode (read-only):</label>
-                    <input type="text" id="update-station-sync-mode" readonly class="w-full p-2.5 bg-slate-800 border border-slate-600 rounded-md shadow-sm text-slate-300 cursor-not-allowed opacity-75" placeholder="Loading...">
                 </div>
 
                 <div class="mb-4">
@@ -649,11 +861,51 @@
         </div>
     </div>
 
+    <div id="research-task-spec-modal" class="modal">
+        <div class="modal-content glass-elevated text-slate-300 task-spec-modal-content">
+            <span class="close-button" id="close-research-task-spec-modal-button">&times;</span>
+            <div class="task-spec-header">
+                <div>
+                    <h3 class="text-xl font-semibold text-sky-400">Research Task Specification</h3>
+                    <p class="text-xs text-slate-500 mt-1">
+                        Preview renders Markdown and LaTeX. Edit exposes the complete raw source, including coder-only sections.
+                    </p>
+                </div>
+                <div class="task-spec-tabs" role="tablist" aria-label="Research Task specification view">
+                    <button type="button" id="task-spec-preview-tab" class="task-spec-tab is-active" role="tab" aria-selected="true">Preview</button>
+                    <button type="button" id="task-spec-edit-tab" class="task-spec-tab" role="tab" aria-selected="false">Edit Raw</button>
+                </div>
+            </div>
+
+            <div class="task-spec-meta">
+                <span id="task-spec-path">Path: loading...</span>
+                <span id="task-spec-revision">Revision: loading...</span>
+                <span id="task-spec-dirty-indicator" class="hidden">Unsaved changes</span>
+            </div>
+
+            <div id="task-spec-preview-pane" class="task-spec-pane markdown-content-host" role="tabpanel"></div>
+            <div id="task-spec-edit-pane" class="task-spec-pane hidden" role="tabpanel">
+                <textarea id="task-spec-raw-editor" spellcheck="false" aria-label="Raw Research Task Markdown"></textarea>
+            </div>
+
+            <div class="task-spec-footer">
+                <p class="task-spec-warning">
+                    Saving immediately changes the active task used by agents, reviewers, surveyors, and newly launched coders.
+                </p>
+                <div class="task-spec-actions">
+                    <button type="button" id="reload-task-spec-button" class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2 px-4 rounded-md">Reload</button>
+                    <button type="button" id="save-task-spec-button" class="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-md" disabled>Save Changes</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
         // Configuration for API base path (empty for standard deployment)
         window.STATION_CONFIG = {
             apiBasePath: "",
-            modelPresets: {{ model_presets|tojson }}
+            modelPresets: {{ model_presets|tojson }},
+            multistartPreview: {{ (multistart_preview or none)|tojson }}
         };
     </script>
     <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>

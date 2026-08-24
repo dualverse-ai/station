@@ -23,12 +23,14 @@ import uuid
 import time
 import json
 import hashlib
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
 from station import constants
 from station import file_io_utils
+from station import research_storage
 
 
 @dataclass
@@ -37,6 +39,15 @@ class FileSnapshot:
     path: str
     hash: str
     size: int
+    mode: int
+    mtime: float
+
+
+@dataclass
+class SymlinkSnapshot:
+    """Represents a symbolic link in the backup system."""
+    path: str
+    target: str
     mode: int
     mtime: float
 
@@ -105,9 +116,47 @@ def _store_file_object(file_path: str, file_hash: str, objects_dir: str) -> bool
     return True
 
 
+def _safe_snapshot_suffix(suffix: str) -> str:
+    suffix = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in str(suffix or "")
+    ).strip("_")
+    return suffix
+
+
+def _snapshot_manifest_path(snapshots_dir: str, current_tick: int, snapshot_suffix: Optional[str] = None) -> str:
+    suffix = _safe_snapshot_suffix(snapshot_suffix or "")
+    filename = f"tick_{current_tick}_{suffix}.json" if suffix else f"tick_{current_tick}.json"
+    return os.path.join(snapshots_dir, filename)
+
+
+def _move_existing_snapshot_aside(manifest_path: str) -> Optional[str]:
+    if not os.path.exists(manifest_path):
+        return None
+
+    directory = os.path.dirname(manifest_path)
+    stem, ext = os.path.splitext(os.path.basename(manifest_path))
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    unique = uuid.uuid4().hex[:12]
+    for attempt in range(1000):
+        attempt_suffix = "" if attempt == 0 else f"_{attempt}"
+        candidate = os.path.join(directory, f"{stem}_backup_{timestamp}_{unique}{attempt_suffix}{ext}")
+        if not os.path.exists(candidate):
+            shutil.move(manifest_path, candidate)
+            return candidate
+    raise RuntimeError(f"Could not move existing backup manifest aside: {manifest_path}")
+
+
 def _should_skip_backup_dir(path: str, backup_base: str) -> bool:
     """Return True when a directory should be excluded from backup traversal."""
-    normalized = path.replace("\\", "/")
+    normalized = os.path.normpath(path).replace("\\", "/")
+    sync_dir = os.path.normpath(os.path.join(
+        constants.BASE_STATION_DATA_PATH,
+        constants.PARALLEL_TICK_STATE_DIR_NAME,
+    )).replace("\\", "/")
+    if normalized == sync_dir or normalized.startswith(f"{sync_dir}/"):
+        return True
+
     skip_markers = (
         backup_base.replace("\\", "/"),
         "claude_workspaces",
@@ -117,7 +166,27 @@ def _should_skip_backup_dir(path: str, backup_base: str) -> bool:
     return any(marker in normalized for marker in skip_markers)
 
 
-def create_backup(current_tick: int, backup_type: str = "automatic", station_instance=None) -> Optional[str]:
+def _research_storage_root_path() -> str:
+    return os.path.normpath(os.path.join(
+        constants.BASE_STATION_DATA_PATH,
+        constants.ROOMS_DIR_NAME,
+        constants.SHORT_ROOM_NAME_RESEARCH,
+        constants.RESEARCH_STORAGE_DIR,
+    )).replace("\\", "/")
+
+
+def _should_follow_backup_symlink_dir(path: str) -> bool:
+    """Return True for symlink directories whose contents are station state."""
+    live_storage_root = Path(_research_storage_root_path())
+    return research_storage.should_follow_research_storage_symlink(Path(path), live_storage_root)
+
+
+def create_backup(
+    current_tick: int,
+    backup_type: str = "automatic",
+    station_instance=None,
+    snapshot_suffix: Optional[str] = None,
+) -> Optional[str]:
     """
     Create an incremental backup of the station_data directory.
     
@@ -158,6 +227,7 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
         
         # Scan all files in source directory
         file_snapshots = []
+        symlink_snapshots = []
         total_size = 0
         new_objects = 0
         reused_objects = 0
@@ -166,23 +236,33 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
         files_processed = 0
         errors = []
         
-        visited_real_dirs = set()
-
         for root, dirs, files in os.walk(constants.BASE_STATION_DATA_PATH, followlinks=True):
-            root_real = os.path.realpath(root)
-
-            # Guard against symlink cycles such as research shared/tmp workspaces
-            # pointing back into shared storage.
-            if root_real in visited_real_dirs:
-                dirs[:] = []
-                continue
-            visited_real_dirs.add(root_real)
-
             # Prune skipped subdirectories before os.walk descends into them.
-            dirs[:] = [
-                d for d in dirs
-                if not _should_skip_backup_dir(os.path.join(root, d), backup_base)
-            ]
+            kept_dirs = []
+            for dirname in dirs:
+                dir_path = os.path.join(root, dirname)
+                if _should_skip_backup_dir(dir_path, backup_base):
+                    continue
+                follow_storage_link = os.path.islink(dir_path) and _should_follow_backup_symlink_dir(dir_path)
+                if follow_storage_link:
+                    target_real = Path(os.path.realpath(dir_path))
+                    root_real = Path(os.path.realpath(root))
+                    if research_storage.path_is_within(root_real, target_real):
+                        follow_storage_link = False
+                if os.path.islink(dir_path) and not follow_storage_link:
+                    try:
+                        stat = os.lstat(dir_path)
+                        symlink_snapshots.append(SymlinkSnapshot(
+                            path=os.path.relpath(dir_path, constants.BASE_STATION_DATA_PATH),
+                            target=os.readlink(dir_path),
+                            mode=stat.st_mode,
+                            mtime=stat.st_mtime,
+                        ))
+                    except Exception as e:
+                        errors.append(f"{os.path.relpath(dir_path, constants.BASE_STATION_DATA_PATH)}: {str(e)}")
+                    continue
+                kept_dirs.append(dirname)
+            dirs[:] = kept_dirs
 
             if _should_skip_backup_dir(root, backup_base):
                 dirs[:] = []
@@ -193,6 +273,16 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
                 relative_path = os.path.relpath(file_path, constants.BASE_STATION_DATA_PATH)
                 
                 try:
+                    if os.path.islink(file_path):
+                        stat = os.lstat(file_path)
+                        symlink_snapshots.append(SymlinkSnapshot(
+                            path=relative_path,
+                            target=os.readlink(file_path),
+                            mode=stat.st_mode,
+                            mtime=stat.st_mtime,
+                        ))
+                        continue
+
                     # Get file stats
                     stat = os.stat(file_path)
                     file_size = stat.st_size
@@ -247,11 +337,18 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
             "total_size": total_size,
             "new_objects": new_objects,
             "reused_objects": reused_objects,
-            "files": [asdict(fs) for fs in file_snapshots]
+            "files": [asdict(fs) for fs in file_snapshots],
+            "symlinks": [asdict(link) for link in symlink_snapshots],
         }
         
         # Save manifest
-        manifest_path = os.path.join(snapshots_dir, f"tick_{current_tick}.json")
+        manifest_path = _snapshot_manifest_path(snapshots_dir, current_tick, snapshot_suffix)
+        moved_manifest = _move_existing_snapshot_aside(manifest_path)
+        if moved_manifest:
+            print(
+                f"  Existing snapshot manifest moved aside before {backup_type} backup: "
+                f"{moved_manifest}"
+            )
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
         
@@ -273,6 +370,7 @@ def create_backup(current_tick: int, backup_type: str = "automatic", station_ins
         
         print(f"Backup completed in {duration:.2f}s:")
         print(f"  - Total files: {len(file_snapshots)}")
+        print(f"  - Symlinks: {len(symlink_snapshots)}")
         print(f"  - Total size: {total_size / (1024**3):.2f} GB")
         print(f"  - New objects stored: {new_objects}")
         print(f"  - Objects reused: {reused_objects}")
@@ -297,6 +395,9 @@ def should_create_automatic_backup(current_tick: int) -> bool:
     Returns:
         bool: True if backup should be created
     """
+    if os.environ.get("STATION_DISABLE_BACKUPS") == "1" or os.environ.get("STATION_MULTISTART_BRANCH") == "1":
+        return False
+
     # Check if automatic backups are enabled
     if constants.BACKUP_FREQUENCY_TICKS <= 0:
         return False
@@ -305,24 +406,82 @@ def should_create_automatic_backup(current_tick: int) -> bool:
     return current_tick > 0 and current_tick % constants.BACKUP_FREQUENCY_TICKS == 0
 
 
-def restore_backup(station_id: str, tick: int, target_dir: str) -> bool:
-    """
-    Restore a backup to target directory.
-    
-    Args:
-        station_id: Station ID of the backup to restore
-        tick: Tick number of the backup to restore
-        target_dir: Target directory to restore files to
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
+def _restore_target_relative_path(relative_path: str, source_prefix: Optional[str]) -> Optional[str]:
+    normalized_path = relative_path.replace("\\", "/").strip("/")
+    if not source_prefix:
+        return normalized_path
+
+    normalized_prefix = source_prefix.replace("\\", "/").strip("/")
+    if normalized_path == normalized_prefix:
+        return os.path.basename(normalized_path)
+    if normalized_path.startswith(f"{normalized_prefix}/"):
+        return normalized_path[len(normalized_prefix) + 1:]
+    return None
+
+
+def _should_skip_restore_relative_path(relative_path: str) -> bool:
+    normalized = relative_path.replace("\\", "/")
+    if normalized.startswith(f"{constants.PARALLEL_TICK_STATE_DIR_NAME}/"):
+        return True
+    if "rooms/research/storage/tmp" in normalized:
+        return True
+    if "rooms/research/storage/shared/tmp" in normalized:
+        return True
+    return False
+
+
+def _safe_restore_path(target_dir: str, relative_path: str) -> Optional[str]:
+    target_root = os.path.abspath(target_dir)
+    target_path = os.path.abspath(os.path.join(target_root, relative_path))
+    if target_path != target_root and not target_path.startswith(target_root + os.sep):
+        return None
+    return target_path
+
+
+def _multistart_snapshot_suffix_from_source_prefix(source_prefix: Optional[str]) -> Optional[str]:
+    if not source_prefix:
+        return None
+    normalized_prefix = source_prefix.replace("\\", "/").strip("/")
+    parts = normalized_prefix.split("/")
+    if len(parts) >= 2 and parts[0] == "multistart" and parts[1]:
+        return f"multistart_{parts[1]}"
+    return None
+
+
+def _resolve_restore_manifest_path(
+    station_backup_dir: str,
+    tick: int,
+    source_prefix: Optional[str] = None,
+    snapshot_suffix: Optional[str] = None,
+) -> str:
+    snapshots_dir = os.path.join(station_backup_dir, "snapshots")
+    if snapshot_suffix:
+        return _snapshot_manifest_path(snapshots_dir, tick, snapshot_suffix)
+    multistart_suffix = _multistart_snapshot_suffix_from_source_prefix(source_prefix)
+    if multistart_suffix:
+        multistart_manifest = _snapshot_manifest_path(snapshots_dir, tick, multistart_suffix)
+        if os.path.exists(multistart_manifest):
+            return multistart_manifest
+    return _snapshot_manifest_path(snapshots_dir, tick)
+
+
+def _restore_backup_contents(
+    station_id: str,
+    tick: int,
+    target_dir: str,
+    source_prefix: Optional[str] = None,
+    snapshot_suffix: Optional[str] = None,
+) -> bool:
     try:
         # Get paths
         station_backup_dir = os.path.join(constants.BACKUP_BASE_DIR, station_id)
         objects_dir = os.path.join(station_backup_dir, "objects")
-        snapshots_dir = os.path.join(station_backup_dir, "snapshots")
-        manifest_path = os.path.join(snapshots_dir, f"tick_{tick}.json")
+        manifest_path = _resolve_restore_manifest_path(
+            station_backup_dir,
+            tick,
+            source_prefix,
+            snapshot_suffix,
+        )
         
         if not os.path.exists(manifest_path):
             print(f"Backup not found: {manifest_path}")
@@ -342,18 +501,20 @@ def restore_backup(station_id: str, tick: int, target_dir: str) -> bool:
         
         # Restore files
         restored_count = 0
+        restored_symlinks = 0
+        matched_entries = 0
         missing_objects = []
         
         for i, file_info in enumerate(manifest['files']):
             relative_path = file_info['path']
             file_hash = file_info['hash']
 
-            # Skip research storage tmp directory during restore
-            if "rooms/research/storage/tmp" in relative_path:
+            target_relative_path = _restore_target_relative_path(relative_path, source_prefix)
+            if target_relative_path is None:
                 continue
+            matched_entries += 1
 
-            # Skip research storage shared tmp directory during restore
-            if "rooms/research/storage/shared/tmp" in relative_path:
+            if _should_skip_restore_relative_path(relative_path):
                 continue
 
             # Get object path
@@ -364,7 +525,10 @@ def restore_backup(station_id: str, tick: int, target_dir: str) -> bool:
                 continue
             
             # Create target file path
-            target_path = os.path.join(target_dir, relative_path)
+            target_path = _safe_restore_path(target_dir, target_relative_path)
+            if target_path is None:
+                missing_objects.append(f"{relative_path} (unsafe target path)")
+                continue
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             
             # Copy file from objects
@@ -378,9 +542,42 @@ def restore_backup(station_id: str, tick: int, target_dir: str) -> bool:
             # Print progress every 100 files
             if restored_count % 100 == 0:
                 print(f"  Progress: {restored_count} files restored...")
+
+        for link_info in manifest.get('symlinks', []):
+            relative_path = str(link_info.get('path') or '')
+            link_target = str(link_info.get('target') or '')
+            if not relative_path or not link_target:
+                continue
+
+            target_relative_path = _restore_target_relative_path(relative_path, source_prefix)
+            if target_relative_path is None:
+                continue
+            matched_entries += 1
+
+            if _should_skip_restore_relative_path(relative_path):
+                continue
+
+            target_path = _safe_restore_path(target_dir, target_relative_path)
+            if target_path is None:
+                missing_objects.append(f"{relative_path} (unsafe symlink target path)")
+                continue
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            try:
+                os.symlink(link_target, target_path)
+                restored_symlinks += 1
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                missing_objects.append(f"{relative_path} (symlink restore failed: {exc})")
         
         # Print summary
+        if source_prefix and matched_entries == 0:
+            print(f"No entries found under '{source_prefix}' in backup tick {tick}")
+            return False
+
         print(f"Restored {restored_count}/{len(manifest['files'])} files from tick {tick}")
+        if manifest.get('symlinks'):
+            print(f"Restored {restored_symlinks}/{len(manifest.get('symlinks', []))} symlinks from tick {tick}")
         
         # Print missing objects summary if any
         if missing_objects:
@@ -396,6 +593,43 @@ def restore_backup(station_id: str, tick: int, target_dir: str) -> bool:
         import traceback
         traceback.print_exc()
         return False
+
+
+def restore_backup(
+    station_id: str,
+    tick: int,
+    target_dir: str,
+    snapshot_suffix: Optional[str] = None,
+) -> bool:
+    """
+    Restore a backup to target directory.
+
+    Args:
+        station_id: Station ID of the backup to restore
+        tick: Tick number of the backup to restore
+        target_dir: Target directory to restore files to
+        snapshot_suffix: Optional named manifest suffix, such as
+            ``multistart_501_job``. The ordinary tick manifest is used when omitted.
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    return _restore_backup_contents(
+        station_id,
+        tick,
+        target_dir,
+        snapshot_suffix=snapshot_suffix,
+    )
+
+
+def restore_backup_subtree(station_id: str, tick: int, source_prefix: str, target_dir: str) -> bool:
+    """
+    Restore one subtree from a backup snapshot into target_dir.
+
+    source_prefix is relative to station_data, for example
+    "multistart/501_abcd1234".
+    """
+    return _restore_backup_contents(station_id, tick, target_dir, source_prefix=source_prefix)
 
 
 def get_station_id() -> Optional[str]:

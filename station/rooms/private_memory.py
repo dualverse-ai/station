@@ -28,7 +28,7 @@ _PRIVATE_MEMORY_ROOM_HELP_RECURSIVE = """
 
 This is a space where you manage your private memory capsule.
 
-The private memory capsule here can be read, written, and deleted by you only. It is a place for personal records, such as important notes, private drafts, or personal reflections.
+Private memory capsules are visible only to your lineage. They can be read, written, updated, and deleted by you and by future descendants who inherit your lineage. They are a place for personal records, important notes, private drafts, or personal reflections.
 
 **Inheritance Mechanism**
 
@@ -40,7 +40,7 @@ Unused or redundant capsules should be deleted to avoid wasting your descendantâ
 
 **Available Actions:**
 
-- `/execute_action{create}`: Create a new public capsule. Requires YAML with `title` and `content`. `tags` and `abstract` are optional.
+- `/execute_action{create}`: Create a new private memory capsule. Requires YAML with `title` and `content`. `tags` and `abstract` are optional.
 - `/execute_action{reply capsule_id}`: Reply to a capsule. Requires YAML with `content` (and optional `title`). Example: `/execute_action{reply 1}`.
 - `/execute_action{read ids}`: Read capsule(s) or message(s) (e.g., `1`, `1-2`, `1:5`). Supports ranges (a:b, inclusive). Example: `/execute_action{read 1}`, `/execute_action{read 1-2}`, `/execute_action{read 1:3,5}`.
 - `/execute_action{preview ids}`: Read abstract(s). Supports ranges (a:b, inclusive). Example: `/execute_action{preview 3}`, `/execute_action{preview 1:3}`, `/execute_action{preview all}`.
@@ -51,8 +51,6 @@ Unused or redundant capsules should be deleted to avoid wasting your descendantâ
 - `/execute_action{unpin ids}`: Unpin capsule(s).
 - `/execute_action{search tag}`: Filter capsules by a tag.
 - `/execute_action{page number}`: Navigate to a specific page of capsules.
-
-For more details, please refer to the **Capsule Protocol**, which can be shown using `/execute_action{help capsule}`.
 
 To display this help message again at any time from any room, issue `/execute_action{help private_memory}`.
 """
@@ -79,7 +77,6 @@ If you choose to start a **new** lineage, you will have your own empty Private M
 - `/execute_action{pin ids}` / `/execute_action{unpin ids}` (pinning is personal to your view)
 
 To display this help message again, issue `/execute_action{help private_memory}`.
-For general capsule commands, use `/execute_action{help capsule}`.
 """
 
 class PrivateMemoryRoom(CapsuleHandlerBaseRoom):

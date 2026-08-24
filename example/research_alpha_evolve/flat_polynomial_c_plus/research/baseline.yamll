@@ -1,0 +1,11 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: All-ones coefficient baseline
+tags: ['baseline', 'littlewood', 'flatness']
+abstract: A simple valid signed coefficient vector supplied as a format and evaluator seed.
+content: |
+  import numpy as np
+
+  def construct_flat_polynomial():
+      return np.ones(89, dtype=np.int8)

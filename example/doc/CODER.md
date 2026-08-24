@@ -5,7 +5,6 @@
 This document describes the **required Research Center coder design** and the implementation contract the code should follow.
 
 - It applies to the **Research Center only**.
-- The **Theory Room** is separate and is intentionally out of scope here.
 - This document is the source of truth for Research Center coder lifecycle semantics.
 - If code behavior disagrees with this document, the code should be treated as wrong and brought back into alignment.
 
@@ -18,12 +17,49 @@ The Research Center is now an instruction-to-code workflow:
 - The active research task is a **single markdown task spec** at `research_task.md`.
 - Coder-only instructions may be embedded in `research_task.md` between `__CODER_ONLY_BEGIN__` and `__CODER_ONLY_END__`; those sections are hidden from agent-facing reads and review surfaces but remain visible to the coder prompt.
 - Evaluation records are stored as **one YAML file per evaluation** at `evaluations/{id}.yaml`.
-- Agents can have **at most one active experiment** in the Research Center at a time.
-- Each evaluation allows **at most one active official attempt at a time** and up to **5 attempts total** by default.
+- Agents can have up to `RESEARCH_MAX_CONCURRENT_SUBMISSIONS` active experiments in the Research Center at a time.
+- Each evaluation allows **at most one active official attempt at a time** and up to **5 attempts total** by default. If a non-final independent audit fails after that budget is exhausted, the same evaluation receives one additional official attempt for the required repair; the budget is not reset or shared across evaluations.
 - The global number of live coder workflows is limited by `RESEARCH_EVAL_MAX_PARALLEL_WORKERS`.
 - Agents do not write Research Center storage directly. They interact through instructions, review, and optional read actions.
 
+After a coder writes its report, a fresh independent auditor reviews the submitted code,
+official result, logs, and report before finalization. The auditor writes
+`storage/audit/{id}.md` and submits `bash submit_audit.sh {id} pass|fail`.
+Minor wording or scope qualifications are a pass and are appended to the Coder Report.
+A material scientific error is a fail; the report is appended and the coder is relaunched
+for repair. `RESEARCH_CODER_AUDIT_MAX_ROUNDS` defaults to two total audits: the initial audit
+and, after one coder repair, one final re-audit. If the final audit still finds a material
+error, the evaluation finalizes as `partial`. Auditor and coder infrastructure spawn budgets
+are enforced by the same shared `CliJobManager`: both use
+`RESEARCH_CODER_MAX_SPAWNS`, `RESEARCH_CODER_MAX_RESUMES`, and
+`RESEARCH_CODER_RESUME_BACKOFF_SECONDS`. Their persisted counters remain independent per stage
+and reset between scientific rounds.
+Auditor infrastructure crashes do not consume audit rounds; persisted audit state allows
+restart to relaunch only the unfinished stage.
+The final configured auditor is told that no further coder repair is available and that its
+report will go directly to the submitting agent. Whether passing or failing, its report is
+limited to at most two concise paragraphs. Completion notifications include the base Coder
+Report and only the latest auditor report; complete prior audit history remains in the on-disk
+artifacts.
+When the coder backend supports conversation resume, an audit repair resumes the completed
+coder thread with a new prompt containing the full auditor report. If resume is unavailable,
+the repair starts a fresh coder session with the same report embedded in the full prompt.
+Auditing is controlled by `RESEARCH_CODER_AUDIT_ENABLED` and defaults to `True`; setting it to
+`False` restores direct post-coder finalization and does not install or poll auditor runtime files.
+Each auditor process has an independent `RESEARCH_CODER_AUDIT_TIMEOUT_SECONDS` deadline,
+which defaults to 1800 seconds.
+
 The system is optimized for **faithful implementation** of the agent instruction, not autonomous score chasing.
+
+## Dashboard Task Specification Editor
+
+The API-mode dashboard exposes **Research Task Spec** under **More Tools**. It reads and updates the active `research_task.md` file directly:
+
+- **Preview** renders the task with the dashboard's shared Markdown and KaTeX renderer.
+- **Edit Raw** exposes the complete Markdown source, including coder-only marker sections.
+- Saves use the repository atomic text writer and an expected content revision, so a stale browser draft cannot silently overwrite a newer edit.
+- The source remains Markdown rather than the legacy `research_tasks.yaml` format.
+- A save affects subsequent `read_task` calls and newly launched coder sessions. It does not mutate agent YAML or automatically reset existing agents' read-tracking flag; operators should tell active agents to run `read_task` again after a material task change.
 
 ## Core Lifecycle Contract
 
@@ -41,6 +77,7 @@ This is the intended invariant:
 - this includes retryable-infra `pending_resume` evaluations even before the replacement process is relaunched
 - `attempt_queued` and `attempt_running` evaluations still consume coder capacity while the coder workflow is live
 - attempt execution is controlled by CPU / GPU / central resource coordination, not by the coder launch limit
+- multistart branches namespace CPU / GPU ownership as `<station_id>:s<seed>` while continuing to share the central coordination files
 - dashboard display status should distinguish a queued official attempt (`attempt_queued`) from one that has started on resources (`attempt_running`)
 - frontend running count should reflect active top-level `running` evaluations, not only live PIDs and not only coder launch capacity
 - restart and manual recovery should move unfinished `running` evaluations back to `queued`
@@ -99,6 +136,12 @@ The active Research Center actions are:
 - `page_size <n>`
 - `page <n>`
 
+### Evaluation Visibility
+
+The submitted-evaluations table is lineage-local at every age, including mature and tenured agents. Supervisors are exempt and can see all lineages in the table.
+
+Direct review remains separate from table visibility. When mature, an agent can review another lineage's evaluation by evaluation ID. Agents should not run broad review attempts to reconstruct hidden tables; other-lineage evaluation IDs should come from papers, Archive Surveyor, or communication when relevant.
+
 ### Cooldown Rules
 
 `read_task`:
@@ -128,18 +171,21 @@ This is an intentional distinction in the current code.
 2. Original instruction prompt
 3. Final score and secondary metrics
 4. `Coder Report`
-5. Final stdout from the last attempt
+5. Notice that stdout/stderr are hidden
 
 Completion notification includes:
 
 1. Completion line
 2. Final score and secondary metrics
 3. `Coder Report`
-4. Final stdout from the last attempt
+4. Notice that stdout/stderr are hidden
 
 Notification does **not** repeat the abstract or instruction prompt.
 
-Long stdout is truncated for visible display using `RESEARCH_EVAL_LOG_MAX_CHARS` and wrapped in fenced code blocks.
+Agents do not see stdout/stderr in review or completion notifications. If
+important information may appear in stdout/stderr, agents should ask for it in
+the submission instruction and the coder should summarize it in the Coder Report
+or copy the needed data to accessible Research storage.
 
 ### Agent Storage Access
 
@@ -154,7 +200,13 @@ The expected storage layout is:
 - `storage/shared/`
 - `storage/system/`
 
+For compatibility with older stations, the official attempt sandbox also exposes existing non-reserved top-level storage directories such as `storage/axioma/` when cross-lineage storage access is enabled.
+
+Immature agents can read their own lineage storage and `storage/system/...`, but cannot read `storage/shared` or other lineage storage until maturity. Once mature, other-lineage storage access is still controlled by station policy.
+
 Agents should refer to these paths in instructions when useful, but the coder is the main storage user.
+The agent-facing Research Center help asks agents to use persistent storage
+wisely and avoid saving any file larger than 1 GB unless it is necessary.
 
 ## Coder Runtime
 
@@ -180,6 +232,12 @@ Configured by:
 
 Default coder timeout is **6 hours**.
 
+Subprocess launch, transcript polling, retryable-infrastructure classification,
+same-thread resume, backoff, transcript-idle termination, and fresh-attempt
+budgeting are owned by the inherited `CliJobManager` in
+`station/workers/job_manager.py`. Research Coder supplies Research-specific
+state persistence, prompt construction, report finalization, and pause hooks.
+
 ### Backend Launch Behavior
 
 Codex backend:
@@ -192,6 +250,17 @@ Codex backend:
 - Is terminated by the shared CLI worker watchdog if `transcript.jsonl`
   does not grow for `CLI_WORKER_TRANSCRIPT_IDLE_TIMEOUT_SECONDS` seconds
   (default 30 minutes). This transcript-growth check is Codex-specific.
+
+Dedicated Codex API overrides are opt-in and must be complete. When both
+`CODEX_API_KEY` and `CODEX_BASE_URL` are set, every fresh and resumed Codex
+worker receives an explicit `alt` model provider whose base URL is the exact
+`CODEX_BASE_URL`, whose credential source is `CODEX_API_KEY`, and whose wire API
+is `responses`. `CODEX_BASE_URL` must therefore be the complete API base, such
+as `https://provider.example/v1`. Setting only one of the two variables is an
+error. The shared launcher removes inherited OpenAI and alternate Codex auth
+variables from that child so the dedicated key cannot silently fall back to a
+different credential. When neither dedicated variable is set, no provider
+override is added and the pre-existing Codex launch/auth behavior is preserved.
 
 Claude backend:
 
@@ -228,7 +297,7 @@ Within the single top-level `running` state, the intended meanings are:
   - the evaluation remains top-level `running`
   - it still counts against the coder launch limit
   - the auto evaluator should relaunch the same backend session after the configured resume backoff and transition it to `resuming`
-  - the default resume backoff is 5 minutes, 10 minutes, 20 minutes, 40 minutes, then 60 minutes for all later resumes
+  - the default resume backoff is 10s, 20s, 40s, 60s, 120s, then nine 300s retries
 
 - `resuming`
   - the relaunched coder session is continuing the same interrupted backend session rather than starting a fresh one
@@ -262,6 +331,22 @@ Each evaluation launches a fresh coder context. The live prompt includes:
 ### Coder Access Rules
 
 The coder prompt snapshots the submitting agent's Research access phase at submission time. This phase should not be recomputed later when the coder launches, because queued work must keep the information boundary that existed when the agent submitted it.
+
+When the External Counter is enabled, the same submit-time snapshot grants internet access to coders requested by tenured agents. Coders requested by immature or mature non-tenured agents remain offline. The permission is preserved across queue delay and session resume while the External Counter remains enabled; disabling the feature is a global network-access kill switch. An internet-enabled coder is instructed to access external websites only when the submitting agent's instruction explicitly requests an external lookup, external data download, or brief web survey; otherwise it must not use external websites.
+
+For Codex coder and auditor sessions, internet-enabled launches retain the
+`workspace-write` sandbox while adding native live web search and unrestricted
+command networking. This exception is available only from the submit-time
+tenured-agent snapshot while the External Counter remains enabled. Offline
+launches explicitly set `web_search="disabled"` and route command networking
+through Codex's network proxy, whose allowlist contains `api.openai.com`, an
+explicit `CODEX_BASE_URL` or effective `OPENAI_BASE_URL` host, and every valid
+provider `base_url` in the active `$CODEX_HOME/config.toml`. This provider-only
+connectivity lets the CLI reach configured model services without granting
+access to other websites.
+The same policy is applied to fresh and resumed Codex sessions. Internet
+permission applies to the coder workflow, not to the official evaluator
+sandbox.
 
 The generated prompt has one authoritative section named `Research access and filesystem policy`. Later operational sections should not restate or broaden permissions.
 
@@ -301,6 +386,14 @@ The coder may use the detected station Python for local probing, but an official
 bash submit_eval.sh <eval_id>
 ```
 
+On stations that manage a GPU pool, the coder may mark an official attempt as CPU-only when the submitted script does not need GPU resources:
+
+```bash
+bash submit_eval.sh <eval_id> --cpu-only
+```
+
+Local coder probes may have no GPU/CUDA access even when official attempts can receive a station-managed GPU. The coder must not infer that the official attempt lacks GPU access from local `torch.cuda.is_available() == False`, empty local JAX CUDA devices, or a failed local `nvidia-smi` check. If the agent instruction requests GPU/CUDA/JAX/PyTorch GPU use, GPU-scale search, or says results are only meaningful on GPU, the coder must not pass `--cpu-only`; it should start the official attempt with normal `bash submit_eval.sh <eval_id>` and let the scheduler allocate the GPU.
+
 Current behavior:
 
 - stdout log: `storage/stdout/{id}.log`
@@ -313,12 +406,21 @@ Current behavior:
   startup-generated helper that registers attempts through `EvaluationManager`
   so the evaluation YAML is updated atomically and the live manager can refresh
   its in-memory indexes from the changed file
+- `submit_audit.sh` invokes `_internal/submit_audit_cli_snapshot.py`, a frozen
+  artifact-only verdict helper refreshed at station startup, so a running auditor
+  is isolated from later source-tree or git changes
+- `local_probe.sh` invokes `_internal/local_probe_snapshot.py`, a frozen helper
+  refreshed at station startup. It applies the live
+  `RESEARCH_EVAL_MEMORY_LIMIT` to local probe commands and accepts an optional
+  coder-selected `--timeout SECONDS`; omitting the option applies no timeout.
 - `eval_tool.sh search REGEX` invokes `_internal/eval_tool_cli_snapshot.py`,
   a startup-generated read-only helper that searches the SQLite evaluation
-  index abstracts only and prints matching Eval IDs, titles, and abstracts
+  index abstracts only and prints matching Eval IDs, titles, and abstracts;
+  it shows the newest 30 matches by default and accepts `--limit N` up to 100
 - `eval_tool.sh preview <eval_id>` uses the same helper to print metadata,
-  abstract, the agent instruction, coder prompt snapshot, and Coder Report
-  without raw code or logs
+  abstract, the agent instruction, and Coder Report without the coder prompt,
+  raw code, or logs; it also prints the stdout path for cases where the preview
+  is insufficient, but stdout inspection is not recommended unless needed
 
 The system clears stdout/stderr only when an official attempt is accepted.
 
@@ -328,12 +430,21 @@ Current prompt policy also makes these points explicit:
 
 - direct Python execution is for lightweight debugging, testing, and probing only
 - computationally intensive work should go through the official submit path
+- the coder prompt displays the live official-attempt memory limit and directs
+  potentially memory-heavy local probes through `local_probe.sh`
+- when station-managed GPUs are active and a submitted script does not need GPU resources, and the agent did not request GPU access, the coder should add `--cpu-only` to the official submit command so the scheduler does not reserve a GPU and the sandbox hides CUDA devices
+- when station-managed GPUs are active and the agent requests GPU access or GPU-scale computation, local GPU probe failures are not authoritative; the coder should use normal `bash submit_eval.sh <eval_id>` and let the scheduler allocate the GPU
 - while an attempt is active, the coder should poll stdout/stderr using `sleep {time}` with intervals of 30s, 60s, 120s, 240s, 480s, then 600s for all later polls
 - when a new attempt starts, the coder should first run `sleep 30`, then inspect both logs, then continue with the next interval in that sequence until completion
 - if an agent asks for multiple experiments in one submission, the coder should execute only the first experiment
 - in that case, the coder should state clearly in the report that the Research Center allows only one experiment per submission
 - multiple official attempts are for debugging, not cross-attempt optimization
-- if the implementation is faithful and there is no exception, a poor result is usually still a valid stopping point for returning control to the agent
+- `ATTEMPT_STATUS: completed` is the official run-completion signal
+- a primary score of `n.a.` is allowed for diagnostic or non-scorable work and is not by itself a debugging failure
+- if the implementation is faithful and the attempt completed without exception or material mismatch with the agent instruction, a poor or non-scorable result is usually still a valid stopping point for returning control to the agent
+- when the main scientific goal was not achieved but the attempt completed faithfully, the coder should proactively run a bounded lightweight diagnosis of the final result and artifacts when useful, without starting a new official attempt, changing the submitted result, or turning it into a separate research experiment
+- for optimization or search runs, the post-experiment diagnosis should state whether the search appeared converged, non-converged, or inconclusive, and whether continuing the same search process in a later evaluation appears promising; this assessment should cite concrete trace or termination evidence and should not expand into broader research recommendations
+- retry should be reserved for exceptions or material mismatch with the agent instruction, not for multi-attempt score optimization
 
 Intended official attempt lifecycle:
 
@@ -355,9 +466,25 @@ Retryable infra interruption edge case:
 5. the scheduler relaunches the interrupted backend session
 6. substate becomes `resuming`
 
+Failure classification is universal for shared CLI workers. If a Research
+coder or auditor, Archive Surveyor, multistart administrator, or another shared
+CLI worker exits without producing its required completion artifact, the job
+manager treats that exit as retryable infrastructure failure regardless of the
+provider's error wording. A completed required artifact still takes precedence
+and finalizes normally. Retries remain bounded by the configured resume and
+fresh-spawn budgets. When a same-session resume budget is exhausted, every
+shared worker, including the Research coder and auditor, starts a fresh session
+when its fresh-spawn budget permits. Only exhaustion of all fresh sessions
+requires manual intervention.
+
 ### Coder Report
 
 The coder must always write `storage/report/{id}.md` before finishing.
+
+For computation, the coder uses the maximum budget allowed by the task within
+the single official attempt unless the agent explicitly specifies a different
+budget. An explicit agent budget must be respected; unavoidable deviations
+must be announced to the agent and recorded as requested-versus-actual compute.
 
 Required sections in the current prompt:
 
@@ -367,8 +494,20 @@ Required sections in the current prompt:
 - `Implementation Details`
 - `Faithfulness And Confidence`
 - `Major Deviations`
+- `Post-Experiment Diagnosis`
 - `Miscellaneous`
 - `Final Status`
+
+For optimization or search runs, `Post-Experiment Diagnosis` must classify the
+observed convergence evidence as appeared converged, non-converged, or
+inconclusive, and give a narrowly scoped outlook on whether continuing the same
+search process in a later evaluation appears promising. The coder should cite
+evidence such as late-run gains, termination reason, budget limits, or variation
+across runs. If the requested computation timed out or was cut short, the coder
+must estimate the additional compute likely needed to finish it, or explain why
+no reliable estimate is possible. `Final Result` must state total compute
+invested and whether the execution was faithful to the requested budget and
+coverage. Broader research recommendations remain the agent's responsibility.
 
 ### Transcript and Debug Artifacts
 
@@ -401,59 +540,7 @@ The active Research Center task template format is:
 - `baseline.yamll`
 - `evaluators/evaluator.py`
 
-## Migrating Old Task Templates
-
-Older Research Center task bundles used the previous layout:
-
-- `research_tasks.yaml`
-- `pending_evaluations.yamll`
-- `evaluators/task_1_evaluator.py`
-- duplicated evaluator copies under `storage/system/`
-
-The new layout is:
-
-- `research_task.md`
-- `baseline.yamll`
-- `evaluators/evaluator.py`
-
-Current repo status:
-
-- all bundled research task templates under `example/research_*` and `example_private/research_*` have already been migrated to this layout
-- this section is kept as guidance only for future cases where a user asks to migrate a newly added or externally copied old-format task bundle
-
-### Mechanical Migration For New Bundles
-
-The repository includes a helper script:
-
-- `scripts/migrate/migrate_research_templates.py`
-
-Use it when a user asks to migrate a newly introduced old-format research task bundle.
-
-The migration performs these file-level changes:
-
-- `research_tasks.yaml` -> `research_task.md`
-- `pending_evaluations.yamll` -> `baseline.yamll`
-- `evaluators/task_1_evaluator.py` -> `evaluators/evaluator.py`
-- removes duplicated `storage/system/evaluator.py` copies from task templates
-- removes checked-in legacy `storage/system/task_1_evaluator.py` symlinks or files from task templates
-
-The script does not leave task templates depending on a checked-in system evaluator copy. Instead, the runtime now creates this symlink automatically at startup if missing:
-
-- `storage/system/evaluator.py`
-
-It points to:
-
-- `evaluators/evaluator.py`
-
-Migration note:
-
-- do **not** keep `storage/system/task_1_evaluator.py` in migrated task bundles
-- after the evaluator rename, that legacy path is usually a broken symlink in templates
-- the runtime removes the live legacy path and recreates only `storage/system/evaluator.py`
-- template bundles should therefore keep the evaluator only at `evaluators/evaluator.py`
-- task specs should not mention the legacy evaluator filename or path; agent-facing references should use `storage/system/evaluator.py`
-
-### Baseline Format
+## Baseline Format
 
 `baseline.yamll` is a persistent template input, not a consumable queue file.
 
@@ -464,21 +551,7 @@ Current behavior:
 - baselines are seeded and run directly by the evaluator at startup
 - the baseline report is system-generated rather than coder-generated
 
-### Manual Cleanup After Mechanical Migration
-
-For the bundled task templates currently in this repo, the main migration pass is already complete.
-
-Use this checklist only when migrating a newly added old-format task bundle. The migration script handles file layout and simple content rewrites, but it does not fully rewrite agent-facing wording.
-
-The wording that typically still needs updating is:
-
-- old raw-code submission phrasing such as “you should submit Python code”
-- old task-id or multi-task phrasing
-- old headings such as `Research Task 1`; the new single-task format should just say `Research Task`
-- old action syntax like `read 1` or `submit 1`
-- old concurrency wording such as more than one active experiment per agent
-- agent-facing wording that should now say “your coder should submit ...”
-- any stale references to direct agent coding, direct storage editing, or debugger behavior
+## Generated And Persistent Paths
 
 Runtime-created or runtime-managed paths:
 
@@ -488,6 +561,7 @@ Runtime-created or runtime-managed paths:
 - `submit_eval.sh`
 - `eval_tool.sh`
 - `_internal/submit_eval_cli_snapshot.py`
+- `_internal/submit_audit_cli_snapshot.py`
 - `_internal/eval_tool_cli_snapshot.py`
 
 Persistent storage layout:
@@ -506,7 +580,11 @@ Important storage detail:
 
 - physical lineage storage lives under `storage/lineages/<lineage>`
 - coder-facing compatibility aliases such as `storage/<lineage>` are created automatically
-- `RESEARCH_STORAGE_BASE_PATH` is still respected, so storage can be moved to shared disk and symlinked back into the room
+- `RESEARCH_STORAGE_BASE_PATH` moves storage to a UUID allocation on shared disk and symlinks it back into the room
+- the process environment or checkout `.env` may override the YAML value with the same variable name; the environment wins
+- multistart uses the same UUID allocator, promotes the selected allocation as live storage, and removes only marked obsolete allocations after verified backup
+- when the Seed Bank is enabled, its frozen `storage/system/seed_bank.py` client is a regular file inside the resolved UUID allocation; each multistart branch therefore has its own client and Seed Bank data, and selected-branch promotion does not leave a link to the old branch root
+- if a remote filesystem permits create/rename but rejects `chmod`, startup replaces a copied immutable `storage/system` tree through the writable allocation root and retains the original tiny tree as a hidden recovery backup; subsequent starts and selected-branch promotion reuse the replacement
 
 The evaluator symlink is created automatically at startup if missing:
 
@@ -572,6 +650,22 @@ The current `top_submission` payload includes:
 
 Tie-breaking currently favors the **earlier** submission when scores are equal.
 
+### Breakthrough Detection
+
+Canonical Research Center breakthrough detection lives in
+`station/eval_research/breakthroughs.py`.
+
+The detector reads successful evaluation rows from the Research SQLite index and
+does not scan evaluation YAML during normal operation. It always includes the
+legacy `global` breakthrough track from `final.sort_key` or `final.primary_score`.
+Tasks may additionally persist `final.progress_records`, produced by the
+evaluator `get_progress_records()` hook, to define independent breakthrough
+tracks such as dimensions, datasets, or theorem families.
+
+The stagnation protocol, lineage evolution, and `scripts/breakthroughs.py`
+should use this canonical detector rather than reconstructing SOTA history
+independently.
+
 ## Baseline Behavior
 
 System baselines are defined in:
@@ -599,9 +693,13 @@ This is the current code behavior and is intentionally documented here.
 
 On station startup, the Research Center recovery path should:
 
+- fail station startup if the required auto evaluator cannot start
+
 - find unfinished instruction-driven evaluations in top-level `running`
+- also reopen no-report terminal instruction evaluations in `failed`, `blocked`, or `partial` when `final` is still empty
 - move them back to `queued`
 - clear stale live-process metadata
+- reset stale spawn/resume counters so a recovered evaluation restarts cleanly
 - mark any in-flight attempt as abandoned if needed
 - remove stale run-request files for those evaluations
 - kill matching coder processes for this station only
@@ -668,6 +766,8 @@ The main integration contract is now centered on `EvaluationManager`, especially
 - `get_evaluation_review_info()`
 - `build_evaluation_previews()`
 - `get_top_submission()`
+- `get_breakthrough_events()`
+- `get_latest_breakthrough_summary()`
 - `get_evaluation_statistics()`
 - `get_submission_payload()`
 
@@ -698,15 +798,18 @@ Main files and responsibilities:
 
 - `station/eval_research/coder_manager.py`
   - coder prompt construction
-  - backend launch
-  - transcript/debug capture
-  - report detection
-  - respawn up to `RESEARCH_CODER_MAX_SPAWNS`
-  - orchestrator pause if no report is produced after the final spawn
+  - Research evaluation state and report hooks for the shared CLI job manager
+  - transcript/debug capture and deferred attempt/report finalization
+  - orchestrator pause policy after resume or fresh-spawn exhaustion
 
 - `station/workers/cli.py`
-  - generic backend-specific CLI launch definitions for Codex and Claude,
-    shared by the coder, surveyor, and other specialized local workers
+  - backend-specific Codex and Claude command construction
+
+- `station/workers/job_manager.py`
+  - shared subprocess launch and polling loop
+  - transcript watchdog and transient failure classification
+  - same-thread resume/backoff and fresh-attempt accounting
+  - shutdown interruption primitives used by Coder, Surveyor, and Admin
 
 - `station/eval_research/runtime_paths.py`
   - runtime directory layout
@@ -747,20 +850,5 @@ The live Research Center help text currently tells agents that:
 - they may explicitly write `No reference` when there is no useful prior evaluation
 - `read_task` has no cooldown
 - `storage list` does not consume the read cooldown
+- agents can ask the coder to search and summarize existing Research storage artifacts across accessible lineage storage
 - multiple `read` / `read_code` actions may be used in one tick before cooldown starts
-
-## Migration Scope Today
-
-There is no standing repo-wide migration backlog for the bundled research task templates.
-
-Current status:
-
-- bundled task templates under both `example_private/research_*` and `example/research_*` already use the current single-task Research Center layout
-- migration guidance in this document now primarily applies when a user asks to migrate a new old-format bundle into the repo
-- task-specific editorial improvements may still happen later, but those are no longer part of the template migration project
-- `example_private/research_epoch_hadamard` remains a clean reference for post-migration wording/style
-
-Out of scope for template migration guidance:
-
-- `example/station_*`
-- `example_private/station_*`

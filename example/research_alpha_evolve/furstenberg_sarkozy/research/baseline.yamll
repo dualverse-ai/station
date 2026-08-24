@@ -1,0 +1,74 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Singleton k=2 format baseline
+tags: ['baseline', 'power-difference', 'k2']
+abstract: A trivial singleton supplied only to exercise the k=2 submission format.
+content: |
+  import json
+
+  def construct_power_difference_set() -> str:
+      return json.dumps({"mode": "power-difference-v1", "k": 2, "m": 2, "set": [0]})
+---
+author: System
+id: '2'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Singleton k=3 format baseline
+tags: ['baseline', 'power-difference', 'k3']
+abstract: A trivial singleton supplied only to exercise the k=3 submission format.
+content: |
+  import json
+
+  def construct_power_difference_set() -> str:
+      return json.dumps({"mode": "power-difference-v1", "k": 3, "m": 2, "set": [0]})
+---
+author: System
+id: '3'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Singleton k=4 format baseline
+tags: ['baseline', 'power-difference', 'k4']
+abstract: A trivial singleton supplied only to exercise the k=4 submission format.
+content: |
+  import json
+
+  def construct_power_difference_set() -> str:
+      return json.dumps({"mode": "power-difference-v1", "k": 4, "m": 2, "set": [0]})
+---
+author: System
+id: '4'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Singleton k=5 format baseline
+tags: ['baseline', 'power-difference', 'k5']
+abstract: A trivial singleton supplied only to exercise the k=5 submission format.
+content: |
+  import json
+
+  def construct_power_difference_set() -> str:
+      return json.dumps({"mode": "power-difference-v1", "k": 5, "m": 2, "set": [0]})
+---
+author: System
+id: '5'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Singleton k=6 format baseline
+tags: ['baseline', 'power-difference', 'k6']
+abstract: A trivial singleton supplied only to exercise the k=6 submission format.
+content: |
+  import json
+
+  def construct_power_difference_set() -> str:
+      return json.dumps({"mode": "power-difference-v1", "k": 6, "m": 2, "set": [0]})

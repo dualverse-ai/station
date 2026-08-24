@@ -1,12 +1,15 @@
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from station import capsule
 from station import capsule_index
 from station import constants
 from station import file_io_utils
+from web_interface.live_event_broker import DashboardEventBroker
 from web_interface.stream_utils import sanitize_stream_event_payload
 
 
@@ -78,6 +81,98 @@ class CapsuleIndexTests(unittest.TestCase):
             constants.STATION_INDEX_DB_FILENAME,
         )
         self.assertTrue(os.path.exists(db_path))
+
+    def test_question_capsule_index_tracks_status_and_upvote_metadata(self):
+        numeric_id, capsule_data = capsule.create_capsule(
+            {
+                "title": "Question",
+                "content": "question body",
+                "abstract": "question abstract",
+                "tags": "problem",
+            },
+            constants.CAPSULE_TYPE_QUESTION,
+            self.author,
+            1,
+        )
+        self.assertEqual(1, numeric_id)
+        self.assertEqual(constants.QUESTION_STATUS_PENDING, capsule_data[constants.QUESTION_STATUS_KEY])
+
+        path = os.path.join(
+            self.tmpdir,
+            constants.CAPSULES_DIR_NAME,
+            constants.QUESTION_CAPSULES_SUBDIR_NAME,
+            f"question_{numeric_id}.yaml",
+        )
+        capsule_data[constants.QUESTION_STATUS_KEY] = constants.QUESTION_STATUS_OPEN
+        capsule_data[constants.QUESTION_NET_UPVOTE_KEY] = 3
+        capsule_data[constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY] = "question_1-2"
+        file_io_utils.save_yaml(capsule_data, path)
+        capsule_index.rebuild_capsule_index()
+
+        rows = capsule.list_capsules(constants.CAPSULE_TYPE_QUESTION, None, tag_filter="problem")
+        self.assertEqual(1, len(rows))
+        self.assertEqual(constants.QUESTION_STATUS_OPEN, rows[0][constants.QUESTION_STATUS_KEY])
+        self.assertEqual(3, rows[0][constants.QUESTION_NET_UPVOTE_KEY])
+        self.assertEqual("question_1-2", rows[0][constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY])
+
+    def test_question_capsule_pages_sort_in_sqlite(self):
+        first_id, first = capsule.create_capsule(
+            {"title": "Lower vote", "content": "body"},
+            constants.CAPSULE_TYPE_QUESTION,
+            self.author,
+            2,
+        )
+        second_id, second = capsule.create_capsule(
+            {"title": "Higher vote", "content": "body"},
+            constants.CAPSULE_TYPE_QUESTION,
+            self.author,
+            5,
+        )
+        for numeric_id, data, votes in ((first_id, first, -1), (second_id, second, 7)):
+            path = os.path.join(
+                self.tmpdir,
+                constants.CAPSULES_DIR_NAME,
+                constants.QUESTION_CAPSULES_SUBDIR_NAME,
+                f"question_{numeric_id}.yaml",
+            )
+            data[constants.QUESTION_NET_UPVOTE_KEY] = votes
+            file_io_utils.save_yaml(data, path)
+        capsule_index.rebuild_capsule_index()
+
+        page, total = capsule.list_capsules_page(
+            constants.CAPSULE_TYPE_QUESTION,
+            None,
+            page=1,
+            page_size=1,
+            sort_by="question_net_upvote",
+            sort_direction="desc",
+        )
+
+        self.assertEqual(2, total)
+        self.assertEqual("Higher vote", page[0][constants.CAPSULE_TITLE_KEY])
+
+    def test_sort_indexes_upgrade_existing_database_without_yaml_rebuild(self):
+        capsule.create_capsule(
+            {"title": "Existing question", "content": "body"},
+            constants.CAPSULE_TYPE_QUESTION,
+            self.author,
+            2,
+        )
+        db_path = capsule_index.get_database_path()
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DROP INDEX IF EXISTS idx_capsule_question_vote_sort")
+        capsule_index._SORT_INDEX_READY_PATHS.discard(db_path)
+
+        with mock.patch.object(capsule_index, "rebuild_capsule_index") as rebuild:
+            capsule_index.ensure_capsule_index()
+
+        rebuild.assert_not_called()
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+                ("idx_capsule_question_vote_sort",),
+            ).fetchone()
+        self.assertEqual(("idx_capsule_question_vote_sort",), row)
 
     def test_mail_visibility_uses_author_or_recipient(self):
         capsule.create_capsule(
@@ -170,6 +265,59 @@ class CapsuleIndexTests(unittest.TestCase):
         self.assertEqual("hidden", selected["data"]["thinking_text"])
         self.assertNotIn("text_preview", selected["data"])
         self.assertNotIn("content_omitted", selected["data"])
+
+    def test_dashboard_event_broker_is_bounded_broadcast_and_starts_new_clients_live(self):
+        broker = DashboardEventBroker(max_events=4, max_replay=2)
+        for number in range(1, 1001):
+            broker.put_nowait({"event": "test", "data": {"number": number}})
+
+        new_client = broker.open_cursor()
+        self.assertEqual(1000, new_client.cursor)
+        self.assertEqual([], broker.read_after(new_client.cursor).events)
+
+        first_reader = broker.read_after(998)
+        second_reader = broker.read_after(998)
+        self.assertEqual([999, 1000], [sequence for sequence, _event in first_reader.events])
+        self.assertEqual(first_reader.events, second_reader.events)
+        self.assertEqual(4, broker.buffered_count)
+
+    def test_dashboard_event_broker_bounds_reconnect_backlog_and_recovers_after_restart(self):
+        broker = DashboardEventBroker(max_events=10, max_replay=3)
+        for number in range(1, 11):
+            broker.put({"event": "test", "data": {"number": number}})
+
+        batch = broker.read_after(1, limit=10)
+        self.assertTrue(batch.reset)
+        self.assertEqual(6, batch.dropped_count)
+        self.assertEqual([8, 9, 10], [sequence for sequence, _event in batch.events])
+
+        restarted_broker = DashboardEventBroker()
+        reset_state = restarted_broker.open_cursor(999)
+        self.assertTrue(reset_state.reset)
+        self.assertEqual(0, reset_state.cursor)
+
+    def test_recent_yaml_tick_window_reads_only_requested_ticks(self):
+        path = os.path.join(self.tmpdir, "dialogue.yamll")
+        for tick in range(1, 7):
+            file_io_utils.append_yaml_line(
+                {"tick": tick, "type": "observation", "content": f"first {tick}\n---\ninside content"},
+                path,
+            )
+            file_io_utils.append_yaml_line(
+                {"tick": tick, "type": "submission", "content": f"second {tick}"},
+                path,
+            )
+
+        entries, metadata = file_io_utils.load_yaml_lines_tick_window(
+            path,
+            window="recent",
+            tick_limit=2,
+        )
+
+        self.assertEqual([5, 5, 6, 6], [entry["tick"] for entry in entries])
+        self.assertEqual("first 5\n---\ninside content", entries[0]["content"])
+        self.assertTrue(metadata["is_partial"])
+        self.assertTrue(metadata["has_older"])
 
     def test_rebuild_flag_can_come_from_environment(self):
         old_value = os.environ.get("STATION_REBUILD_DB")

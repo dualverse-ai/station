@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
+from filelock import FileLock
 
 from station import constants
 from station import file_io_utils
+from station import research_storage
 
 
 _CHMOD_BEST_EFFORT_ERRNOS = {
@@ -30,9 +32,14 @@ for _errno_name in ("ENOTSUP", "EOPNOTSUPP"):
 
 
 SUBMIT_EVAL_CLI_SNAPSHOT_FILENAME = "submit_eval_cli_snapshot.py"
+SUBMIT_AUDIT_CLI_SNAPSHOT_FILENAME = "submit_audit_cli_snapshot.py"
 EVAL_TOOL_CLI_SNAPSHOT_FILENAME = "eval_tool_cli_snapshot.py"
+LOCAL_PROBE_SNAPSHOT_FILENAME = "local_probe_snapshot.py"
 OLD_PREVIEW_EVAL_CLI_SNAPSHOT_FILENAME = "preview_eval_cli_snapshot.py"
 SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME = "_internal"
+LINEAGE_ALIAS_MIGRATION_LOCK_FILENAME = "lineage_alias_migration.lock"
+LINEAGE_ALIAS_CONFLICT_SUFFIX = ".pre_alias_merge"
+IMMUTABLE_SYSTEM_STORAGE_BACKUP_PREFIX = ".system_read_only_legacy"
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,7 @@ class ResearchRuntimePaths:
     stdout_dir: str
     stderr_dir: str
     reports_dir: str
+    audit_dir: str
     internal_root: str
     evaluations_dir: str
     evaluators_dir: str
@@ -59,6 +67,7 @@ class ResearchRuntimePaths:
     baseline_path: str
     submit_script_path: str
     eval_tool_script_path: str
+    local_probe_script_path: str
     evaluation_index_path: str
 
 
@@ -122,14 +131,126 @@ def _set_writable_tree(dir_path: str) -> bool:
     return permissions_applied
 
 
-def _migrate_storage_to_base_path(local_storage_path: str) -> str:
-    if os.path.islink(local_storage_path):
-        return os.path.realpath(local_storage_path)
+def _copy_tree_with_writable_creation_modes(source: Path, destination: Path) -> None:
+    """Copy a tree without chmod/copystat calls.
 
-    storage_uuid = str(uuid.uuid4())
-    shared_base_path = os.path.join(constants.RESEARCH_STORAGE_BASE_PATH, storage_uuid)
+    Some shared filesystems permit creating files and directories but reject
+    chmod.  New entries therefore need owner-write permission in their creation
+    mode rather than through a later permission repair.
+    """
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    destination.mkdir(mode=source_mode | stat.S_IRWXU)
+    with os.scandir(source) as entries:
+        for entry in entries:
+            source_child = Path(entry.path)
+            destination_child = destination / entry.name
+            if entry.is_symlink():
+                os.symlink(os.readlink(source_child), destination_child)
+            elif entry.is_dir(follow_symlinks=False):
+                _copy_tree_with_writable_creation_modes(source_child, destination_child)
+            elif entry.is_file(follow_symlinks=False):
+                child_mode = stat.S_IMODE(entry.stat(follow_symlinks=False).st_mode)
+                descriptor = os.open(
+                    destination_child,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    child_mode | stat.S_IWUSR,
+                )
+                try:
+                    with open(source_child, "rb") as source_handle, os.fdopen(descriptor, "wb") as destination_handle:
+                        descriptor = -1
+                        shutil.copyfileobj(source_handle, destination_handle)
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+            else:
+                raise RuntimeError(f"unsupported storage/system entry: {source_child}")
+
+
+def _replace_immutable_system_storage(system_storage: str) -> bool:
+    """Replace an immutable copied system tree through its writable parent.
+
+    Multistart can copy a local ``0555 storage/system`` directory into an NFS
+    allocation whose server permits create/rename but rejects chmod.  The old
+    tree cannot be updated in place, so build a writable copy beside it and swap
+    directory entries atomically.  Keep the old, tiny tree as a hidden recovery
+    backup because that same NFS policy may also prevent deleting its children.
+    """
+    system_path = Path(system_storage)
+    if not system_path.is_dir() or system_path.is_symlink():
+        return False
+    parent = system_path.parent
+    temporary = parent / f".system_writable.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    backup = parent / IMMUTABLE_SYSTEM_STORAGE_BACKUP_PREFIX
+    if backup.exists() or backup.is_symlink():
+        backup = parent / f"{IMMUTABLE_SYSTEM_STORAGE_BACKUP_PREFIX}.{uuid.uuid4().hex}"
+    moved_original = False
+    try:
+        _copy_tree_with_writable_creation_modes(system_path, temporary)
+        os.replace(system_path, backup)
+        moved_original = True
+        os.replace(temporary, system_path)
+        print(
+            "Research Center: Replaced immutable storage/system through its writable "
+            f"allocation parent; recovery backup kept at {backup}"
+        )
+        return True
+    except OSError as exc:
+        if moved_original and not system_path.exists() and backup.exists():
+            os.replace(backup, system_path)
+        if exc.errno in _CHMOD_BEST_EFFORT_ERRNOS:
+            return False
+        raise
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _station_id_for_storage(consts_module=constants) -> str:
+    config_path = os.path.join(
+        consts_module.BASE_STATION_DATA_PATH,
+        consts_module.STATION_CONFIG_FILENAME,
+    )
+    try:
+        config = file_io_utils.load_yaml(config_path)
+    except Exception:
+        config = {}
+    if isinstance(config, dict) and config.get(consts_module.STATION_ID_KEY):
+        return str(config[consts_module.STATION_ID_KEY])
+    return "station"
+
+
+def _migrate_storage_to_base_path(local_storage_path: str, consts_module=constants) -> str:
+    base_path = research_storage.configured_base_path(
+        getattr(consts_module, "RESEARCH_STORAGE_BASE_PATH", None)
+    )
+    if base_path is None:
+        return local_storage_path
+    station_id = _station_id_for_storage(consts_module)
+    if os.path.islink(local_storage_path):
+        target = research_storage.relocate_storage_symlink(
+            Path(local_storage_path),
+            base_path,
+            marker_payload={
+                "kind": "live",
+                "station_id": station_id,
+                "created_by": "research_runtime_relocation",
+            },
+            remove_tree=research_storage.remove_tree_allow_read_only,
+        )
+        print(f"Research Center: Storage link now uses configured base: {local_storage_path} -> {target}")
+        return str(target)
+    base_path.mkdir(parents=True, exist_ok=True)
+    shared_base_path = str(research_storage.new_allocation_path(base_path))
     print(f"Research Center: Starting storage migration to: {shared_base_path}")
     os.makedirs(shared_base_path, exist_ok=True)
+    research_storage.write_allocation_marker(
+        Path(shared_base_path),
+        {
+            "kind": "live",
+            "station_id": station_id,
+            "created_by": "research_runtime_migration",
+        },
+    )
 
     if os.path.exists(local_storage_path) and os.path.isdir(local_storage_path):
         for item in os.listdir(local_storage_path):
@@ -139,10 +260,10 @@ def _migrate_storage_to_base_path(local_storage_path: str) -> str:
                 print(f"Research Center: Skipping existing shared storage item {item}")
                 continue
             try:
-                if os.path.isdir(src) and item == constants.RESEARCH_STORAGE_SYSTEM_DIR:
+                if os.path.isdir(src) and item == consts_module.RESEARCH_STORAGE_SYSTEM_DIR:
                     _set_writable_tree(src)
                 shutil.move(src, dst)
-                if item == constants.RESEARCH_STORAGE_SYSTEM_DIR:
+                if item == consts_module.RESEARCH_STORAGE_SYSTEM_DIR:
                     _set_read_only_tree(dst)
             except Exception as exc:
                 print(f"Research Center: Warning - Could not move {item}: {exc}")
@@ -180,6 +301,7 @@ def build_runtime_paths(consts_module=constants) -> ResearchRuntimePaths:
         stdout_dir=os.path.join(storage_real_root, "stdout"),
         stderr_dir=os.path.join(storage_real_root, "stderr"),
         reports_dir=os.path.join(storage_real_root, "report"),
+        audit_dir=os.path.join(storage_real_root, getattr(consts_module, "RESEARCH_AUDIT_SUBDIR_NAME", "audit")),
         internal_root=os.path.join(research_root, consts_module.RESEARCH_INTERNAL_DIR),
         evaluations_dir=os.path.join(research_root, consts_module.RESEARCH_EVALUATIONS_SUBDIR_NAME),
         evaluators_dir=os.path.join(research_root, "evaluators"),
@@ -189,13 +311,83 @@ def build_runtime_paths(consts_module=constants) -> ResearchRuntimePaths:
         baseline_path=os.path.join(research_root, consts_module.RESEARCH_BASELINE_FILENAME),
         submit_script_path=os.path.join(research_root, "submit_eval.sh"),
         eval_tool_script_path=os.path.join(research_root, "eval_tool.sh"),
+        local_probe_script_path=os.path.join(research_root, "local_probe.sh"),
         evaluation_index_path=os.path.join(research_root, consts_module.RESEARCH_EVALUATIONS_SUBDIR_NAME, consts_module.RESEARCH_EVALUATION_INDEX_FILENAME),
     )
+
+
+def parse_memory_limit_bytes(memory_limit: Any) -> Optional[int]:
+    if not memory_limit:
+        return None
+    memory_str = str(memory_limit).strip().lower()
+    if not memory_str:
+        return None
+    multipliers = {
+        "gb": 1024 ** 3,
+        "g": 1024 ** 3,
+        "mb": 1024 ** 2,
+        "m": 1024 ** 2,
+        "kb": 1024,
+        "k": 1024,
+        "b": 1,
+    }
+    for suffix, multiplier in multipliers.items():
+        if memory_str.endswith(suffix):
+            return int(float(memory_str[: -len(suffix)]) * multiplier)
+    return int(memory_str)
 
 
 def _ensure_dir_list(dir_paths: list[str]):
     for dir_path in dir_paths:
         file_io_utils.ensure_dir_exists(dir_path)
+
+
+def _install_lineage_alias(alias_path: str, physical_path: str):
+    relative_target = os.path.relpath(physical_path, os.path.dirname(alias_path))
+    temporary_alias = f"{alias_path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        os.symlink(relative_target, temporary_alias)
+        os.replace(temporary_alias, alias_path)
+    finally:
+        if os.path.lexists(temporary_alias):
+            os.unlink(temporary_alias)
+
+
+def _next_lineage_conflict_path(path: str) -> str:
+    candidate = path + LINEAGE_ALIAS_CONFLICT_SUFFIX
+    index = 2
+    while os.path.lexists(candidate):
+        candidate = f"{path}{LINEAGE_ALIAS_CONFLICT_SUFFIX}.{index}"
+        index += 1
+    return candidate
+
+
+def _merge_directory_contents(source_dir: str, destination_dir: str) -> int:
+    renamed_conflicts = 0
+    for name in sorted(os.listdir(source_dir)):
+        source = os.path.join(source_dir, name)
+        destination = os.path.join(destination_dir, name)
+        if (
+            not os.path.islink(source)
+            and os.path.isdir(source)
+            and not os.path.islink(destination)
+            and os.path.isdir(destination)
+        ):
+            renamed_conflicts += _merge_directory_contents(source, destination)
+            os.rmdir(source)
+            continue
+        if os.path.lexists(destination):
+            os.replace(destination, _next_lineage_conflict_path(destination))
+            renamed_conflicts += 1
+        os.replace(source, destination)
+    return renamed_conflicts
+
+
+def _merge_legacy_lineage_directory(legacy_path: str, physical_path: str) -> int:
+    renamed_conflicts = _merge_directory_contents(legacy_path, physical_path)
+    os.rmdir(legacy_path)
+    _install_lineage_alias(legacy_path, physical_path)
+    return renamed_conflicts
 
 
 def ensure_lineage_storage(paths: ResearchRuntimePaths, lineage_name: str) -> str:
@@ -207,26 +399,35 @@ def ensure_lineage_storage(paths: ResearchRuntimePaths, lineage_name: str) -> st
     data_path = os.path.join(physical_path, "data")
     file_io_utils.ensure_dir_exists(data_path)
 
-    if os.path.lexists(alias_path):
-        if os.path.islink(alias_path):
-            try:
-                target = os.path.realpath(alias_path)
-                if target == os.path.realpath(physical_path):
-                    return physical_path
-            except OSError:
-                pass
-        if os.path.isdir(alias_path) and os.path.realpath(alias_path) == os.path.realpath(physical_path):
-            return physical_path
-        # Reserved directories should never be replaced.
+    if os.path.islink(alias_path) and os.path.realpath(alias_path) == os.path.realpath(physical_path):
         return physical_path
 
-    try:
-        relative_target = os.path.relpath(physical_path, os.path.dirname(alias_path))
-        os.symlink(relative_target, alias_path)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        print(f"Research Center: Warning - Could not create lineage alias {alias_path}: {exc}")
+    file_io_utils.ensure_dir_exists(paths.internal_root)
+    migration_lock_path = os.path.join(paths.internal_root, LINEAGE_ALIAS_MIGRATION_LOCK_FILENAME)
+    with FileLock(migration_lock_path):
+        if os.path.islink(alias_path):
+            if os.path.realpath(alias_path) == os.path.realpath(physical_path):
+                return physical_path
+            raise RuntimeError(
+                f"Lineage alias {alias_path} points to {os.path.realpath(alias_path)}, expected {physical_path}"
+            )
+        if os.path.lexists(alias_path):
+            if not os.path.isdir(alias_path):
+                raise RuntimeError(
+                    f"Lineage alias path is not a directory or symlink: {alias_path}"
+                )
+            conflict_count = _merge_legacy_lineage_directory(alias_path, physical_path)
+            print(
+                f"Research Center: Migrated legacy lineage storage {alias_path} -> {physical_path} "
+                f"({conflict_count} existing canonical entries received a {LINEAGE_ALIAS_CONFLICT_SUFFIX} suffix)"
+            )
+        else:
+            _install_lineage_alias(alias_path, physical_path)
+
+        if not os.path.islink(alias_path) or os.path.realpath(alias_path) != os.path.realpath(physical_path):
+            raise RuntimeError(
+                f"Could not establish lineage alias {alias_path} -> {physical_path}"
+            )
 
     return physical_path
 
@@ -314,13 +515,15 @@ def ensure_runtime_layout(consts_module=constants) -> ResearchRuntimePaths:
 
     local_storage_path = os.path.join(research_root, consts_module.RESEARCH_STORAGE_DIR)
     storage_real_root = local_storage_path
-    if consts_module.RESEARCH_STORAGE_BASE_PATH:
-        storage_real_root = _migrate_storage_to_base_path(local_storage_path)
+    if research_storage.configured_base_path(
+        getattr(consts_module, "RESEARCH_STORAGE_BASE_PATH", None)
+    ):
+        storage_real_root = _migrate_storage_to_base_path(local_storage_path, consts_module)
 
     file_io_utils.ensure_dir_exists(storage_real_root)
     paths = build_runtime_paths(consts_module)
 
-    _ensure_dir_list([
+    runtime_dirs = [
         paths.debug_tmp_root,
         paths.shared_storage,
         paths.system_storage,
@@ -335,11 +538,27 @@ def ensure_runtime_layout(consts_module=constants) -> ResearchRuntimePaths:
         paths.evaluations_dir,
         paths.run_requests_dir,
         paths.coder_sessions_dir,
-    ])
+    ]
+    if bool(getattr(consts_module, "RESEARCH_CODER_AUDIT_ENABLED", True)):
+        runtime_dirs.append(paths.audit_dir)
+    _ensure_dir_list(runtime_dirs)
 
     system_storage_writable = _set_writable_tree(paths.system_storage)
+    if not system_storage_writable and os.access(paths.system_storage, os.W_OK | os.X_OK):
+        system_storage_writable = True
+    if not system_storage_writable:
+        system_storage_writable = _replace_immutable_system_storage(paths.system_storage)
     sync_lineage_aliases(paths)
     ensure_evaluator_symlinks(paths)
+    if bool(getattr(consts_module, "RESEARCH_SEED_BANK_ENABLED", False)):
+        from station.eval_research.seed_bank import ensure_seed_bank_layout, install_seed_bank_client
+
+        ensure_seed_bank_layout(paths, consts_module)
+        install_seed_bank_client(
+            paths,
+            consts_module,
+            snapshot_dirname=SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME,
+        )
     system_storage_read_only = _set_read_only_tree(paths.system_storage)
     if not system_storage_writable or not system_storage_read_only:
         print(
@@ -348,6 +567,9 @@ def ensure_runtime_layout(consts_module=constants) -> ResearchRuntimePaths:
         )
     ensure_submit_script(paths)
     ensure_eval_tool_script(paths)
+    ensure_local_probe_script(paths, consts_module)
+    if bool(getattr(consts_module, "RESEARCH_CODER_AUDIT_ENABLED", True)):
+        ensure_audit_script(paths)
     return paths
 
 
@@ -420,16 +642,6 @@ def ensure_evaluator_symlinks(paths: Optional[ResearchRuntimePaths] = None):
     if not file_io_utils.file_exists(evaluator_source):
         return
 
-    legacy_link = os.path.join(paths.system_storage, "task_1_evaluator.py")
-    if os.path.lexists(legacy_link):
-        try:
-            if os.path.isdir(legacy_link) and not os.path.islink(legacy_link):
-                pass
-            else:
-                os.unlink(legacy_link)
-        except OSError:
-            pass
-
     desired_links = [os.path.join(paths.system_storage, "evaluator.py")]
 
     for link_path in desired_links:
@@ -484,6 +696,7 @@ RESEARCH_EVALUATIONS_SUBDIR_NAME = __RESEARCH_EVALUATIONS_SUBDIR_NAME__
 RESEARCH_RUN_REQUESTS_SUBDIR_NAME = __RESEARCH_RUN_REQUESTS_SUBDIR_NAME__
 RESEARCH_SCORE_NA = __RESEARCH_SCORE_NA__
 RESEARCH_CODER_MAX_ATTEMPTS = __RESEARCH_CODER_MAX_ATTEMPTS__
+GPU_MANAGEMENT_ENABLED = __GPU_MANAGEMENT_ENABLED__
 TERMINAL_STATUSES = {"completed", "failed", "blocked", "partial"}
 ACTIVE_ATTEMPT_STATUSES = {"queued", "running"}
 ARTIFACT_SPECS = {
@@ -535,10 +748,26 @@ def _atomic_write_yaml(path: Path, data: Dict[str, Any]):
     _atomic_write_text(path, text)
 
 
-def _attempt_footer(primary_score: Any, secondary_metrics: Any, safe_to_resubmit: bool) -> list[str]:
+def _attempt_footer(
+    primary_score: Any,
+    secondary_metrics: Any,
+    safe_to_resubmit: bool,
+    attempt_status: str = "completed",
+) -> list[str]:
+    normalized_status = str(attempt_status or "completed").strip().lower()
+    if normalized_status == "completed":
+        status_message = (
+            "The submission has run to completion. You may now submit the next attempt or write the final Coder Report."
+        )
+    else:
+        status_message = (
+            f"The attempt has settled with status '{normalized_status}'. Inspect the rejection or failure details "
+            "before deciding whether to retry or finalize."
+        )
     return [
         "ATTEMPT_COMPLETE",
-        "The submission has run to completion. You may now submit the next attempt or write the final Coder Report.",
+        f"ATTEMPT_STATUS: {normalized_status}",
+        status_message,
         f"PRIMARY_SCORE: {primary_score}",
         f"SECONDARY_METRICS: {secondary_metrics}",
         f"SAFE_TO_RESUBMIT: {'true' if safe_to_resubmit else 'false'}",
@@ -552,6 +781,7 @@ def _attempt_queue_banner(eval_id: str, attempt_number: int) -> list[str]:
         "The attempt is waiting for an evaluator worker and any required CPU/GPU resources.",
         "This is normal. Keep polling this log and wait here while the station scheduler dispatches the official run.",
         "Do not treat the queued state by itself as a failure, and do not bypass the official submit path just because the run has not started yet.",
+        "The evaluator may run outside your sandbox's PID namespace, so do not use `ps` or `pgrep` to decide whether it has ended; wait patiently for `ATTEMPT_COMPLETE`.",
     ]
 
 
@@ -578,7 +808,7 @@ def _latest_attempt_is_active(eval_data: Dict[str, Any]) -> bool:
     return str(latest.get("status")) in ACTIVE_ATTEMPT_STATUSES
 
 
-def submit_eval(eval_id: str) -> int:
+def submit_eval(eval_id: str, *, cpu_only: bool = False) -> int:
     eval_id = str(eval_id)
     research_root = _research_root()
     evaluations_dir = research_root / RESEARCH_EVALUATIONS_SUBDIR_NAME
@@ -591,13 +821,14 @@ def submit_eval(eval_id: str) -> int:
 
     eval_manager = EvaluationManager(str(evaluations_dir), preload=False)
     eval_data = eval_manager.get_evaluation(eval_id)
+    effective_cpu_only = bool(cpu_only and GPU_MANAGEMENT_ENABLED)
     if not eval_data:
         _write_status(
             research_root,
             eval_id,
             None,
             [f"Submission rejected: evaluation {eval_id} not found."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
 
@@ -607,7 +838,7 @@ def submit_eval(eval_id: str) -> int:
             eval_id,
             eval_data,
             [f"Submission rejected: submission file not found at {submission_path}."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
 
@@ -618,7 +849,7 @@ def submit_eval(eval_id: str) -> int:
             eval_id,
             eval_data,
             [f"Submission rejected: submission file {submission_path} is empty."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
 
@@ -628,7 +859,7 @@ def submit_eval(eval_id: str) -> int:
             eval_id,
             eval_data,
             [f"Submission rejected: evaluation {eval_id} is already in terminal status '{eval_data.get('status')}'."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
     max_attempts = int((eval_data.get("coder") or {}).get("max_attempts", RESEARCH_CODER_MAX_ATTEMPTS))
@@ -639,7 +870,7 @@ def submit_eval(eval_id: str) -> int:
             eval_id,
             eval_data,
             [f"Submission rejected: maximum attempts reached ({max_attempts})."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
     if _latest_attempt_is_active(eval_data):
@@ -650,25 +881,31 @@ def submit_eval(eval_id: str) -> int:
             ]
         )
         return 1
-    attempt_number = eval_manager.register_attempt(eval_id, str(submission_path))
+    attempt_number = eval_manager.register_attempt(eval_id, str(submission_path), cpu_only=effective_cpu_only)
     if attempt_number is None:
         _write_status(
             research_root,
             eval_id,
             eval_data,
             [f"Submission rejected: could not register attempt for evaluation {eval_id}."]
-            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False),
+            + _attempt_footer(RESEARCH_SCORE_NA, "{}", False, attempt_status="rejected"),
         )
         return 1
 
-    _write_status(research_root, eval_id, eval_data, _attempt_queue_banner(eval_id, int(attempt_number)))
+    queue_banner = _attempt_queue_banner(eval_id, int(attempt_number))
+    if effective_cpu_only:
+        queue_banner.append("CPU-only mode requested: the scheduler will not reserve a GPU for this attempt.")
+    _write_status(research_root, eval_id, eval_data, queue_banner)
+    run_request = {
+        "eval_id": eval_id,
+        "attempt": int(attempt_number),
+        "created_timestamp": time.time(),
+    }
+    if effective_cpu_only:
+        run_request["cpu_only"] = True
     _atomic_write_yaml(
         run_requests_dir / f"{eval_id}_attempt_{attempt_number}.yaml",
-        {
-            "eval_id": eval_id,
-            "attempt": int(attempt_number),
-            "created_timestamp": time.time(),
-        },
+        run_request,
     )
     return 0
 
@@ -676,8 +913,14 @@ def submit_eval(eval_id: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Queue a Research Center evaluation attempt.")
     parser.add_argument("eval_id", help="Evaluation ID to submit")
+    if GPU_MANAGEMENT_ENABLED:
+        parser.add_argument(
+            "--cpu-only",
+            action="store_true",
+            help="Queue this attempt without reserving a station-managed GPU.",
+        )
     args = parser.parse_args(argv)
-    return submit_eval(args.eval_id)
+    return submit_eval(args.eval_id, cpu_only=getattr(args, "cpu_only", False))
 
 
 if __name__ == "__main__":
@@ -689,6 +932,9 @@ if __name__ == "__main__":
         "__RESEARCH_RUN_REQUESTS_SUBDIR_NAME__": repr(constants.RESEARCH_RUN_REQUESTS_SUBDIR_NAME),
         "__RESEARCH_SCORE_NA__": repr(constants.RESEARCH_SCORE_NA),
         "__RESEARCH_CODER_MAX_ATTEMPTS__": repr(constants.RESEARCH_CODER_MAX_ATTEMPTS),
+        "__GPU_MANAGEMENT_ENABLED__": repr(
+            constants.RESEARCH_EVAL_GPU_NUM is not None or bool(constants.RESEARCH_EVAL_USE_DIFF_GPU)
+        ),
         "__STATION_REPO_ROOT__": repr(str(Path(__file__).resolve().parents[2])),
     }
     for placeholder, value in replacements.items():
@@ -701,6 +947,7 @@ def _submit_script_wrapper_source(python_executable: str) -> str:
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+export STATION_BASE_DATA_PATH="$(cd "$SCRIPT_DIR/../.." && pwd)"
 exec "{python_executable}" "$SCRIPT_DIR/{SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME}/{SUBMIT_EVAL_CLI_SNAPSHOT_FILENAME}" "$@"
 """
 
@@ -728,11 +975,12 @@ if STATION_REPO_ROOT and STATION_REPO_ROOT not in sys.path:
 RESEARCH_STORAGE_DIR = __RESEARCH_STORAGE_DIR__
 RESEARCH_EVALUATIONS_SUBDIR_NAME = __RESEARCH_EVALUATIONS_SUBDIR_NAME__
 RESEARCH_EVALUATION_FILE_EXTENSION = __RESEARCH_EVALUATION_FILE_EXTENSION__
-RESEARCH_CODER_SESSIONS_SUBDIR_NAME = __RESEARCH_CODER_SESSIONS_SUBDIR_NAME__
 EVALUATION_DETAILS_KEY = __EVALUATION_DETAILS_KEY__
 EVALUATION_ID_KEY = __EVALUATION_ID_KEY__
 EVALUATION_TITLE_KEY = __EVALUATION_TITLE_KEY__
 EVALUATION_ABSTRACT_KEY = __EVALUATION_ABSTRACT_KEY__
+SEARCH_DEFAULT_LIMIT = 30
+SEARCH_MAX_LIMIT = 100
 ARTIFACT_SPECS = {
     "submission": ("submission", ".py"),
     "stdout": ("stdout", ".log"),
@@ -816,25 +1064,6 @@ def _display_path(research_root: Path, path: Optional[Path]) -> str:
         return str(path)
 
 
-def _session_prompt_path(research_root: Path, eval_id: str, eval_data: Dict[str, Any]) -> tuple[Optional[Path], str]:
-    coder = eval_data.get("coder") if isinstance(eval_data.get("coder"), dict) else {}
-    raw_session_id = str(coder.get("session_id") or "").strip()
-    sessions_dir = research_root / RESEARCH_CODER_SESSIONS_SUBDIR_NAME
-    if raw_session_id:
-        session_id = Path(raw_session_id).name
-        return sessions_dir / session_id / "prompt.txt", session_id
-
-    candidates = []
-    if sessions_dir.exists():
-        for path in sessions_dir.iterdir():
-            if path.is_dir() and f"_{eval_id}_spawn_" in path.name:
-                candidates.append(path)
-    if not candidates:
-        return None, ""
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return candidates[0] / "prompt.txt", candidates[0].name
-
-
 def _final_score_summary(eval_data: Dict[str, Any]) -> str:
     final = eval_data.get("final")
     if not isinstance(final, dict) or not final:
@@ -873,6 +1102,10 @@ def _print_section(title: str, body: str, missing_message: str = "_Not available
 
 def search_evals(pattern: str, limit: int) -> int:
     research_root = _research_root()
+    if limit < 0:
+        print("Search limit must be non-negative.", file=sys.stderr)
+        return 2
+    effective_limit = min(limit, SEARCH_MAX_LIMIT)
     try:
         regex = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     except re.error as exc:
@@ -880,7 +1113,7 @@ def search_evals(pattern: str, limit: int) -> int:
         return 2
 
     try:
-        total_matches, shown = _search_abstracts_from_index(research_root, pattern, limit)
+        total_matches, shown = _search_abstracts_from_index(research_root, pattern, effective_limit)
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
@@ -889,8 +1122,11 @@ def search_evals(pattern: str, limit: int) -> int:
     print(f"\nRegex: `{pattern}`")
     print("Scope: evaluation abstracts only")
     print(f"Matches: {total_matches}")
-    if limit >= 0 and total_matches > len(shown):
-        print(f"Showing: first {len(shown)} newest matches")
+    if limit > SEARCH_MAX_LIMIT:
+        print(f"Requested limit {limit} exceeds the maximum; showing at most {SEARCH_MAX_LIMIT}.")
+    print(f"Showing: first {len(shown)} of {total_matches} newest matches")
+    if total_matches > len(shown):
+        print(f"Use a narrower search term if needed, or pass `--limit N` with N up to {SEARCH_MAX_LIMIT}.")
     print("\nPreview a relevant match with `bash eval_tool.sh preview {ID}` from the Research Center directory, or `bash research_center/eval_tool.sh preview {ID}` from the Surveyor workspace.")
 
     if not shown:
@@ -915,15 +1151,14 @@ def preview_eval(eval_id: str) -> int:
         print(f"Evaluation {eval_id} not found at {_display_path(research_root, eval_path)}.", file=sys.stderr)
         return 1
 
-    prompt_path, session_id = _session_prompt_path(research_root, eval_id, eval_data)
     report_path = _artifact_abs_path(research_root, eval_id, "report", eval_data)
+    stdout_path = _artifact_abs_path(research_root, eval_id, "stdout", eval_data)
     abstract = str(eval_data.get("abstract") or "").strip()
     instruction = str(eval_data.get("instruction") or "").strip()
-    prompt_text = _read_text(prompt_path) if prompt_path else ""
     report_text = _read_text(report_path)
 
     print(f"# Research Evaluation Preview #{eval_id}")
-    print("\nThis preview intentionally includes the evaluation instruction, coder prompt, and Coder Report. It does not print raw submission code, stdout, or stderr logs.")
+    print("\nThis preview intentionally includes evaluation metadata, abstract, the agent instruction, and Coder Report. It does not print the coder prompt, raw submission code, stdout, or stderr logs.")
     print("\n## Metadata\n")
     print(f"- Eval: #{eval_id}")
     print(f"- Title: {eval_data.get('title') or '(untitled)'}")
@@ -936,24 +1171,11 @@ def preview_eval(eval_id: str) -> int:
     print(f"- Final score: {_final_score_summary(eval_data)}")
     print(f"- Secondary metrics: {_secondary_metrics_summary(eval_data)}")
     print(f"- Evaluation YAML: {_display_path(research_root, eval_path)}")
-    print(f"- Coder session: {session_id or '(none recorded)'}")
-    print(f"- Coder prompt: {_display_path(research_root, prompt_path)}")
+    print("- Agent instruction: shown below")
     print(f"- Coder Report: {_display_path(research_root, report_path)}")
 
     _print_section("Abstract", abstract, "_No abstract recorded._")
     _print_section("Agent Instruction", instruction, "_No instruction recorded._")
-    if prompt_path is None:
-        _print_section(
-            "Coder Prompt",
-            "",
-            "_No coder session is recorded. This may be a direct/system-baseline evaluation or a queued evaluation that has not launched._",
-        )
-    else:
-        _print_section(
-            "Coder Prompt",
-            prompt_text,
-            f"_Prompt file not found or empty at `{_display_path(research_root, prompt_path)}`._",
-        )
     _print_section(
         "Coder Report",
         report_text,
@@ -962,10 +1184,10 @@ def preview_eval(eval_id: str) -> int:
 
     print("\n## Follow-Up Paths\n")
     print(f"- Evaluation YAML: `{_display_path(research_root, eval_path)}`")
-    if prompt_path is not None:
-        print(f"- Coder prompt: `{_display_path(research_root, prompt_path)}`")
     print(f"- Coder Report: `{_display_path(research_root, report_path)}`")
-    print(f"- Raw submission, stdout, and stderr are under `storage/submission/`, `storage/stdout/`, and `storage/stderr/`; inspect them only when this preview is insufficient for the requested technical claim.")
+    print(f"- Stdout log: `{_display_path(research_root, stdout_path)}`")
+    print("- Reading stdout is not recommended unless the preview is insufficient for the needed technical claim.")
+    print("- Raw submission code and stderr are under `storage/submission/` and `storage/stderr/`; inspect them only when the preview and stdout are insufficient.")
     return 0
 
 
@@ -987,13 +1209,13 @@ def main(argv: list[str] | None = None) -> int:
     search_parser.add_argument(
         "--limit",
         type=int,
-        default=50,
-        help="Maximum number of newest matches to print. Default: 50.",
+        default=SEARCH_DEFAULT_LIMIT,
+        help=f"Maximum number of newest matches to print. Default: {SEARCH_DEFAULT_LIMIT}; maximum: {SEARCH_MAX_LIMIT}.",
     )
 
     preview_parser = subparsers.add_parser(
         "preview",
-        help="Preview metadata, abstract, instruction, coder prompt, and Coder Report for one evaluation.",
+        help="Preview metadata, abstract, instruction, and Coder Report for one evaluation.",
     )
     preview_parser.add_argument("eval_id", help="Evaluation ID to preview")
 
@@ -1013,7 +1235,6 @@ if __name__ == "__main__":
         "__RESEARCH_STORAGE_DIR__": repr(constants.RESEARCH_STORAGE_DIR),
         "__RESEARCH_EVALUATIONS_SUBDIR_NAME__": repr(constants.RESEARCH_EVALUATIONS_SUBDIR_NAME),
         "__RESEARCH_EVALUATION_FILE_EXTENSION__": repr(constants.RESEARCH_EVALUATION_FILE_EXTENSION),
-        "__RESEARCH_CODER_SESSIONS_SUBDIR_NAME__": repr(constants.RESEARCH_CODER_SESSIONS_SUBDIR_NAME),
         "__EVALUATION_DETAILS_KEY__": repr(constants.EVALUATION_DETAILS_KEY),
         "__EVALUATION_ID_KEY__": repr(constants.EVALUATION_ID_KEY),
         "__EVALUATION_TITLE_KEY__": repr(constants.EVALUATION_TITLE_KEY),
@@ -1030,7 +1251,182 @@ def _eval_tool_script_wrapper_source(python_executable: str) -> str:
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+export STATION_BASE_DATA_PATH="$(cd "$SCRIPT_DIR/../.." && pwd)"
 exec "{python_executable}" "$SCRIPT_DIR/{SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME}/{EVAL_TOOL_CLI_SNAPSHOT_FILENAME}" "$@"
+"""
+
+
+def _local_probe_snapshot_source(memory_limit: Any) -> str:
+    memory_limit_bytes = parse_memory_limit_bytes(memory_limit)
+    template = r'''#!/usr/bin/env python3
+"""Frozen Research Center local-probe wrapper generated at station startup."""
+
+from __future__ import annotations
+
+import os
+import resource
+import signal
+import subprocess
+import sys
+import time
+
+
+MEMORY_LIMIT = __MEMORY_LIMIT__
+MEMORY_LIMIT_BYTES = __MEMORY_LIMIT_BYTES__
+POLL_SECONDS = 0.25
+TERMINATE_GRACE_SECONDS = 5.0
+
+
+def _usage() -> str:
+    return (
+        "Usage: bash local_probe.sh [--timeout SECONDS] -- <command> [args...]\n"
+        "The timeout is optional; omitting it applies no wall-clock timeout."
+    )
+
+
+def _process_group_rss_bytes(process_group_id: int) -> int:
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    total = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        proc_path = os.path.join("/proc", entry)
+        try:
+            with open(os.path.join(proc_path, "stat"), "r", encoding="utf-8", errors="replace") as handle:
+                stat_text = handle.read()
+            close_paren = stat_text.rfind(")")
+            if close_paren < 0:
+                continue
+            fields = stat_text[close_paren + 2 :].split()
+            if len(fields) < 3 or int(fields[2]) != int(process_group_id):
+                continue
+            with open(os.path.join(proc_path, "statm"), "r", encoding="utf-8", errors="replace") as handle:
+                statm = handle.read().split()
+            if len(statm) >= 2:
+                total += int(statm[1]) * page_size
+        except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError, OSError):
+            continue
+    return total
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _terminate_process_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + TERMINATE_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _process_group_exists(process.pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _parse_args(argv: list[str]) -> tuple[float | None, list[str]]:
+    args = list(argv)
+    timeout = None
+    if args[:1] == ["--timeout"]:
+        if len(args) < 2:
+            raise ValueError("--timeout requires a positive number of seconds")
+        try:
+            timeout = float(args[1])
+        except ValueError as exc:
+            raise ValueError("--timeout requires a positive number of seconds") from exc
+        if timeout <= 0:
+            raise ValueError("--timeout requires a positive number of seconds")
+        args = args[2:]
+    if args[:1] != ["--"]:
+        raise ValueError("expected -- before the command")
+    command = args[1:]
+    if not command:
+        raise ValueError("no command supplied")
+    return timeout, command
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        timeout, command = _parse_args(sys.argv[1:] if argv is None else argv)
+    except ValueError as exc:
+        print("local_probe.sh: %s" % exc, file=sys.stderr)
+        print(_usage(), file=sys.stderr)
+        return 2
+
+    if MEMORY_LIMIT_BYTES is None:
+        print(
+            "local_probe.sh: RESEARCH_EVAL_MEMORY_LIMIT is not configured; "
+            "refusing to run an unbounded local probe. Use the official submit path.",
+            file=sys.stderr,
+        )
+        return 2
+
+    def _set_memory_limit() -> None:
+        resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT_BYTES, MEMORY_LIMIT_BYTES))
+
+    try:
+        process = subprocess.Popen(
+            command,
+            start_new_session=True,
+            preexec_fn=_set_memory_limit,
+        )
+    except OSError as exc:
+        print("local_probe.sh: failed to start command: %s" % exc, file=sys.stderr)
+        return 127
+
+    started_at = time.monotonic()
+    while process.poll() is None:
+        rss_bytes = _process_group_rss_bytes(process.pid)
+        if rss_bytes > MEMORY_LIMIT_BYTES:
+            print(
+                "local_probe.sh: memory limit exceeded: rss=%d bytes limit=%s"
+                % (rss_bytes, MEMORY_LIMIT),
+                file=sys.stderr,
+            )
+            _terminate_process_group(process)
+            return 137
+        if timeout is not None and time.monotonic() - started_at >= timeout:
+            print(
+                "local_probe.sh: timeout exceeded after %.3f seconds" % timeout,
+                file=sys.stderr,
+            )
+            _terminate_process_group(process)
+            return 124
+        time.sleep(POLL_SECONDS)
+    return_code = int(process.returncode or 0)
+    return 128 - return_code if return_code < 0 else return_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+    replacements = {
+        "__MEMORY_LIMIT__": repr(memory_limit),
+        "__MEMORY_LIMIT_BYTES__": repr(memory_limit_bytes),
+    }
+    for placeholder, value in replacements.items():
+        template = template.replace(placeholder, value)
+    return template
+
+
+def _local_probe_script_wrapper_source(python_executable: str) -> str:
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+exec "{python_executable}" "$SCRIPT_DIR/{SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME}/{LOCAL_PROBE_SNAPSHOT_FILENAME}" "$@"
 """
 
 
@@ -1064,6 +1460,42 @@ def ensure_submit_script(paths: Optional[ResearchRuntimePaths] = None):
     os.chmod(paths.submit_script_path, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def _audit_snapshot_source() -> str:
+    source_path = os.path.join(os.path.dirname(__file__), "submit_audit_cli.py")
+    return file_io_utils.load_text(source_path)
+
+
+def _audit_script_wrapper_source(python_executable: str) -> str:
+    return f'''#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+export STATION_RESEARCH_ROOT="$SCRIPT_DIR"
+exec "{python_executable}" "$SCRIPT_DIR/{SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME}/{SUBMIT_AUDIT_CLI_SNAPSHOT_FILENAME}" "$@"
+'''
+
+
+def ensure_audit_script(paths: Optional[ResearchRuntimePaths] = None):
+    """Install the small, artifact-only auditor verdict command."""
+    if paths is None:
+        paths = build_runtime_paths(constants)
+    python_executable = detect_station_python_executable()
+    snapshot_dir = os.path.join(paths.research_root, SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME)
+    file_io_utils.ensure_dir_exists(snapshot_dir)
+    snapshot_path = os.path.join(snapshot_dir, SUBMIT_AUDIT_CLI_SNAPSHOT_FILENAME)
+    snapshot_content = _audit_snapshot_source()
+    current_snapshot = file_io_utils.load_text(snapshot_path) if file_io_utils.file_exists(snapshot_path) else None
+    if current_snapshot != snapshot_content:
+        file_io_utils.save_text(snapshot_content, snapshot_path)
+    script_path = os.path.join(paths.research_root, getattr(constants, "RESEARCH_AUDIT_SCRIPT_FILENAME", "submit_audit.sh"))
+    content = _audit_script_wrapper_source(python_executable)
+    current = file_io_utils.load_text(script_path) if file_io_utils.file_exists(script_path) else None
+    if current != content:
+        file_io_utils.save_text(content, script_path)
+    mode = os.stat(script_path).st_mode
+    os.chmod(script_path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
 def ensure_eval_tool_script(paths: Optional[ResearchRuntimePaths] = None):
     if paths is None:
         paths = build_runtime_paths(constants)
@@ -1084,6 +1516,32 @@ def ensure_eval_tool_script(paths: Optional[ResearchRuntimePaths] = None):
     current_mode = os.stat(paths.eval_tool_script_path).st_mode
     os.chmod(paths.eval_tool_script_path, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     _remove_old_preview_eval_tool(paths, snapshot_dir)
+
+
+def ensure_local_probe_script(
+    paths: Optional[ResearchRuntimePaths] = None,
+    consts_module=constants,
+):
+    if paths is None:
+        paths = build_runtime_paths(consts_module)
+    python_executable = detect_station_python_executable()
+    snapshot_dir = os.path.join(paths.research_root, SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME)
+    file_io_utils.ensure_dir_exists(snapshot_dir)
+    snapshot_path = os.path.join(snapshot_dir, LOCAL_PROBE_SNAPSHOT_FILENAME)
+    snapshot_content = _local_probe_snapshot_source(consts_module.RESEARCH_EVAL_MEMORY_LIMIT)
+    current_snapshot = file_io_utils.load_text(snapshot_path) if file_io_utils.file_exists(snapshot_path) else None
+    if current_snapshot != snapshot_content:
+        file_io_utils.save_text(snapshot_content, snapshot_path)
+    script_content = _local_probe_script_wrapper_source(python_executable)
+    current_content = (
+        file_io_utils.load_text(paths.local_probe_script_path)
+        if file_io_utils.file_exists(paths.local_probe_script_path)
+        else None
+    )
+    if current_content != script_content:
+        file_io_utils.save_text(script_content, paths.local_probe_script_path)
+    current_mode = os.stat(paths.local_probe_script_path).st_mode
+    os.chmod(paths.local_probe_script_path, current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def _remove_old_preview_eval_tool(paths: ResearchRuntimePaths, snapshot_dir: str):

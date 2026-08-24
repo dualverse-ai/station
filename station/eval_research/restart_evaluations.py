@@ -28,6 +28,7 @@ import signal
 import time
 from typing import Iterable, Optional
 
+from station import constants
 from station import file_io_utils
 from station import agent as agent_module
 from station.eval_research import evaluation_index
@@ -37,6 +38,7 @@ from station.eval_research.evaluation_manager import (
     _normalize_evaluation_status,
 )
 from station.eval_research.runtime_paths import ensure_submit_runtime_layout
+from station.workers.cli import get_cli_worker_backend
 
 
 def _ensure_recovery_paths(paths=None):
@@ -185,13 +187,108 @@ def _remove_run_requests(paths, eval_id: str) -> int:
     return removed
 
 
-def _is_resume_requeueable_blocked(eval_data: dict) -> bool:
+def _is_no_report_terminal_requeueable(eval_data: dict) -> bool:
     coder = eval_data.get("coder", {}) or {}
-    if str(eval_data.get("status", "")).strip().lower() != "blocked":
+    status = str(eval_data.get("status", "")).strip().lower()
+    if status not in {"failed", "blocked", "partial"}:
         return False
     if eval_data.get("final"):
         return False
+    if eval_data.get("submission_mode") == "direct" or eval_data.get("system_baseline"):
+        return False
     return not bool(coder.get("active"))
+
+
+def _coder_report_path(eval_data: dict, eval_manager: EvaluationManager) -> Optional[str]:
+    evaluations_dir = getattr(eval_manager, "evaluations_dir", "")
+    if not evaluations_dir:
+        return None
+    return os.path.join(
+        os.path.dirname(os.path.abspath(evaluations_dir)),
+        "storage",
+        "report",
+        f"{eval_data.get('id')}.md",
+    )
+
+
+def _repair_report_is_new(eval_data: dict, eval_manager: EvaluationManager) -> bool:
+    """Tell restart recovery whether a repair coder replaced the old report."""
+    audit = eval_data.get("audit", {}) or {}
+    baseline = int(audit.get("repair_report_baseline_mtime_ns", 0) or 0)
+    report_path = _coder_report_path(eval_data, eval_manager)
+    if not baseline or not report_path:
+        return False
+    try:
+        return os.stat(report_path).st_mtime_ns > baseline
+    except OSError:
+        return False
+
+
+def _coder_report_exists(eval_data: dict, eval_manager: EvaluationManager) -> bool:
+    report_path = _coder_report_path(eval_data, eval_manager)
+    if not report_path:
+        return False
+    return file_io_utils.file_exists(report_path) and bool((file_io_utils.load_text(report_path) or "").strip())
+
+
+def _abandon_interrupted_repair_attempt(
+    eval_data: dict,
+    reason: str,
+    eval_manager: EvaluationManager,
+) -> bool:
+    """Abandon a dead repair attempt and require a subsequent report rewrite."""
+    attempts = eval_data.get("attempts") or []
+    if not attempts:
+        return False
+    latest_attempt = attempts[-1]
+    if str(latest_attempt.get("status", "")).strip().lower() not in {"queued", "running"}:
+        return False
+
+    latest_attempt["status"] = "abandoned"
+    latest_attempt["completed_timestamp"] = latest_attempt.get("completed_timestamp") or time.time()
+    latest_attempt["error"] = reason
+
+    report_path = _coder_report_path(eval_data, eval_manager)
+    if report_path:
+        try:
+            report_mtime_ns = os.stat(report_path).st_mtime_ns
+        except OSError:
+            report_mtime_ns = 0
+        if report_mtime_ns:
+            audit = eval_data.setdefault("audit", {})
+            previous_baseline = int(audit.get("repair_report_baseline_mtime_ns", 0) or 0)
+            audit["repair_report_baseline_mtime_ns"] = max(previous_baseline, report_mtime_ns)
+    return True
+
+
+def _extract_audit_resume_token(eval_data: dict, eval_manager: EvaluationManager) -> Optional[str]:
+    audit = eval_data.get("audit", {}) or {}
+    persisted = str(audit.get("resume_token") or "").strip()
+    if persisted:
+        return persisted
+    session_id = str(audit.get("session_id") or "").strip()
+    if not session_id:
+        return None
+    backend = str((eval_data.get("coder", {}) or {}).get("backend") or constants.RESEARCH_CODER_BACKEND).lower()
+    backend_runner = get_cli_worker_backend(backend)
+    if not bool(getattr(backend_runner, "supports_resume", False)):
+        return None
+    research_root = os.path.dirname(os.path.abspath(eval_manager.evaluations_dir))
+    transcript_path = os.path.join(
+        research_root,
+        "coder_sessions",
+        f"audit_{session_id}",
+        backend_runner.transcript_filename,
+    )
+    return backend_runner.extract_resume_token(transcript_path)
+
+
+def _is_retryable_audit_infrastructure_block(audit: dict) -> bool:
+    if str(audit.get("status", "")).strip().lower() != "blocked":
+        return False
+    if str(audit.get("failure_category", "")).strip().lower() == "infra_transient":
+        return True
+    return "transient auditor backend/provider failure" in str(audit.get("last_error") or "").lower()
 
 
 def _requeue_eval_record(
@@ -217,16 +314,149 @@ def _requeue_eval_record(
     if force_reopen_terminal:
         pass
     elif status not in ACTIVE_EVALUATION_STATUSES and status != "queued":
-        if not (allow_retryable_blocked and _is_resume_requeueable_blocked(eval_data)):
+        if not (allow_retryable_blocked and _is_no_report_terminal_requeueable(eval_data)):
             return False
-    elif status == "blocked" and not (allow_retryable_blocked and _is_resume_requeueable_blocked(eval_data)):
+    elif status == "blocked" and not (allow_retryable_blocked and _is_no_report_terminal_requeueable(eval_data)):
         return False
 
     def mutator(record):
+        audit_record = record.setdefault("audit", {})
+        coder_current = record.setdefault("coder", {})
+        audit_stage = str(audit_record.get("status", "")).strip().lower()
+        attempts = record.get("attempts") or []
+        latest_attempt_status = str((attempts[-1] if attempts else {}).get("status", "")).strip().lower()
+        if (
+            bool(getattr(constants, "RESEARCH_CODER_AUDIT_ENABLED", True))
+            and _is_retryable_audit_infrastructure_block(audit_record)
+            and attempts
+        ):
+            audit_resume_token = _extract_audit_resume_token(record, eval_manager)
+            coder_current.update({"active": False, "active_pid": None, "status": "audit_running"})
+            audit_record.update({
+                "active": False,
+                "active_pid": None,
+                "status": "pending_resume" if audit_resume_token else "retry",
+                "spawn_count": 0,
+                "resume_count": 0,
+                "max_spawns": constants.RESEARCH_CODER_MAX_SPAWNS,
+                "max_resumes": constants.RESEARCH_CODER_MAX_RESUMES,
+                "next_resume_timestamp": None,
+                "resume_delay_seconds": None,
+                "resume_token": audit_resume_token,
+                "started_timestamp": None,
+                "completed_timestamp": None,
+                "failure_category": "infra_transient",
+                "last_error": reason,
+            })
+            record["status"] = "running"
+            return
+        # A completed report recovered after its official attempt settled must
+        # proceed to audit, not relaunch the already-finished coder.
+        if (
+            bool(getattr(constants, "RESEARCH_CODER_AUDIT_ENABLED", True))
+            and audit_stage in {"", "not_started"}
+            and attempts
+            and latest_attempt_status not in {"queued", "running"}
+            and _coder_report_exists(record, eval_manager)
+        ):
+            coder_current.update({
+                "active": False,
+                "active_pid": None,
+                "status": "audit_running",
+                "spawn_count": 0,
+                "resume_count": 0,
+            })
+            audit_record.update({
+                "active": False,
+                "active_pid": None,
+                "status": "retry",
+                "spawn_count": 0,
+                "resume_count": 0,
+                "next_resume_timestamp": None,
+                "resume_delay_seconds": None,
+                "resume_token": None,
+                "started_timestamp": None,
+                "completed_timestamp": None,
+                "last_error": reason,
+            })
+            record["status"] = "running"
+            return
+        # An interrupted repair coder must resume independently. A replacement
+        # report is ready for re-audit only after its official attempt settles.
+        if bool(getattr(constants, "RESEARCH_CODER_AUDIT_ENABLED", True)) and audit_stage == "repairing" and record.get("attempts"):
+            repair_attempt_interrupted = _abandon_interrupted_repair_attempt(
+                record,
+                reason,
+                eval_manager,
+            )
+            if not repair_attempt_interrupted and _repair_report_is_new(record, eval_manager):
+                coder_current.update({
+                    "active": False,
+                    "active_pid": None,
+                    "status": "audit_running",
+                    "spawn_count": 0,
+                    "resume_count": 0,
+                })
+                audit_record.update({
+                    "active": False,
+                    "active_pid": None,
+                    "status": "retry",
+                    "spawn_count": 0,
+                    "resume_count": 0,
+                    "next_resume_timestamp": None,
+                    "resume_delay_seconds": None,
+                    "resume_token": None,
+                    "started_timestamp": None,
+                    "completed_timestamp": None,
+                    "last_error": reason,
+                })
+                record["status"] = "running"
+            else:
+                resume_token = str(coder_current.get("resume_token") or "").strip()
+                coder_current.update({
+                    "active": bool(resume_token),
+                    "active_pid": None,
+                    "status": "pending_resume" if resume_token else "queued",
+                    "spawn_count": 0,
+                    "resume_count": 0,
+                    "next_resume_timestamp": None,
+                    "resume_delay_seconds": None,
+                    "started_timestamp": None,
+                    "completed_timestamp": None,
+                    "last_error": reason,
+                })
+                record["status"] = "running" if resume_token else "queued"
+            return
+        if (
+            bool(getattr(constants, "RESEARCH_CODER_AUDIT_ENABLED", True))
+            and not coder_current.get("active")
+            and audit_stage in {"running", "retry", "queued", "pending_resume", "resuming"}
+            and record.get("attempts")
+        ):
+            audit_resume_token = str(audit_record.get("resume_token") or "").strip()
+            coder_current.update({"active": False, "active_pid": None, "status": "audit_running"})
+            audit_record.update({
+                "active": False,
+                "active_pid": None,
+                "status": "pending_resume" if audit_resume_token else "retry",
+                "spawn_count": 0,
+                "resume_count": 0,
+                "next_resume_timestamp": None,
+                "resume_delay_seconds": None,
+                "resume_token": audit_resume_token or None,
+                "started_timestamp": None,
+                "completed_timestamp": None,
+                "last_error": reason,
+            })
+            record["status"] = "running"
+            return
         coder_record = record.setdefault("coder", {})
         coder_record["active"] = False
         coder_record["active_pid"] = None
         coder_record["status"] = "queued"
+        coder_record["spawn_count"] = 0
+        coder_record["resume_count"] = 0
+        coder_record["max_resumes"] = constants.RESEARCH_CODER_MAX_RESUMES
         coder_record["failure_category"] = None
         coder_record["session_id"] = None
         coder_record["resume_token"] = None
@@ -241,7 +471,6 @@ def _requeue_eval_record(
             notification["sent"] = False
             notification["sent_timestamp"] = None
             notification["message"] = None
-        attempts = record.get("attempts") or []
         if attempts:
             latest = attempts[-1]
             latest_status = str(latest.get("status", ""))
@@ -283,6 +512,14 @@ def reset_runtime_coder_counters(
         def mutator(record):
             coder_record = record.setdefault("coder", {})
             coder_record["spawn_count"] = 0
+            coder_record["resume_count"] = 0
+            coder_record["max_resumes"] = constants.RESEARCH_CODER_MAX_RESUMES
+            audit_record = record.setdefault("audit", {})
+            if str(audit_record.get("status", "")).strip().lower() in {
+                "queued", "retry", "running", "pending_resume", "resuming",
+            }:
+                audit_record["spawn_count"] = 0
+                audit_record["resume_count"] = 0
 
         updated = eval_manager.update_evaluation(str(eval_id), mutator)
         if updated is not None:
@@ -338,6 +575,9 @@ def requeue_instruction_evaluations(
         pid = coder.get("active_pid")
         if kill_running_coders and _pid_matches_station(pid, paths.research_root, paths.coder_sessions_dir):
             _terminate_pid(pid, kill_process_group=True)
+        audit_pid = (eval_data.get("audit", {}) or {}).get("active_pid")
+        if kill_running_coders and _pid_matches_station(audit_pid, paths.research_root, paths.coder_sessions_dir):
+            _terminate_pid(audit_pid, kill_process_group=True)
 
         notification_message = None
         author = None
@@ -380,15 +620,11 @@ def requeue_unfinished_instruction_evaluations(
     eval_manager = eval_manager or EvaluationManager(paths.evaluations_dir)
     recovered = 0
 
-    target_ids = set(eval_manager.get_queued_instruction_eval_ids())
-    target_ids.update(eval_manager.get_retryable_blocked_instruction_eval_ids())
-    for eval_id in eval_manager.get_running_instruction_eval_ids():
-        eval_data = eval_manager.get_evaluation(eval_id)
-        if not isinstance(eval_data, dict):
-            continue
-        coder = eval_data.get("coder", {}) or {}
-        if not bool(coder.get("active")):
-            target_ids.add(str(eval_id))
+    target_ids = set(
+        eval_manager.get_unfinished_requeue_candidate_instruction_eval_ids(
+            include_active_statuses=include_active_statuses,
+        )
+    )
 
     for eval_id in sorted(target_ids, key=lambda value: (0, int(value)) if str(value).isdigit() else (1, str(value))):
         eval_data = eval_manager.get_evaluation(eval_id)
@@ -400,8 +636,8 @@ def requeue_unfinished_instruction_evaluations(
             continue
 
         status = _normalize_evaluation_status(eval_data.get("status")) or "queued"
-        if status == "blocked":
-            if not _is_resume_requeueable_blocked(eval_data):
+        if status in {"failed", "blocked", "partial"}:
+            if not _is_no_report_terminal_requeueable(eval_data):
                 continue
         elif status not in ACTIVE_EVALUATION_STATUSES and status != "queued":
             continue

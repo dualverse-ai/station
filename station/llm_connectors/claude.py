@@ -15,6 +15,8 @@
 import os
 import json
 import re
+import time
+import hashlib
 from typing import Dict, Any, Optional, List, Tuple
 
 import anthropic
@@ -31,6 +33,28 @@ from .base import (
     LLMSafetyBlockError,
     LLMContextOverflowError
 )
+
+
+CLAUDE_OPUS_5_REFUSAL_FALLBACK_MODEL = "claude-opus-4-8"
+
+
+class _ClaudeRawStreamMessage:
+    def __init__(
+        self,
+        *,
+        message_id: Optional[str],
+        request_id: Optional[str],
+        stop_reason: Optional[str],
+        stop_sequence: Optional[str],
+        usage: Dict[str, Any],
+        content: List[Dict[str, Any]],
+    ) -> None:
+        self.id = message_id
+        self.request_id = request_id
+        self.stop_reason = stop_reason
+        self.stop_sequence = stop_sequence
+        self.usage = usage
+        self.content = content
 
 
 class ClaudeConnector(BaseLLMConnector):
@@ -72,17 +96,65 @@ class ClaudeConnector(BaseLLMConnector):
 
         print(f"ClaudeConnector for '{self.agent_name}' initialized with model: '{self.model_name}', temp: {self.temperature}, max_tokens: {self.max_output_tokens}.")
 
-    def _build_api_headers(self) -> Dict[str, str]:
+    def _resolve_cache_ttl(self) -> Optional[str]:
+        custom_api_params = getattr(self, "custom_api_params", {}) or {}
+        raw_ttl = custom_api_params.get("claude_cache_ttl")
+        if raw_ttl is not None:
+            ttl = str(raw_ttl).strip().lower()
+            if ttl in {"", "none", "off", "false", "disabled"}:
+                return None
+            return ttl
         if self._should_skip_token_counting():
+            return "5m"
+        return "1h"
+
+    def _build_api_headers(self) -> Dict[str, str]:
+        if self._resolve_cache_ttl() != "1h":
             return {}
         return {
             "anthropic-beta": "extended-cache-ttl-2025-04-11"
         }
 
-    def _build_cache_control(self) -> Dict[str, str]:
+    def _build_request_cache_control(self) -> Optional[Dict[str, str]]:
+        ttl = self._resolve_cache_ttl()
+        if ttl is None:
+            return None
+        return {"type": "ephemeral", "ttl": ttl}
+
+    def _load_station_id_for_cache(self) -> str:
+        try:
+            station_config_path = os.path.join(
+                os.getcwd(),
+                constants.BASE_STATION_DATA_PATH,
+                constants.STATION_CONFIG_FILENAME,
+            )
+            station_config = file_io_utils.load_yaml(station_config_path)
+            if isinstance(station_config, dict):
+                candidate = station_config.get(constants.STATION_ID_KEY)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+        except Exception as e:
+            self._log("WARNING", f"Failed to resolve station_id for Claude cache metadata: {e}")
+        station_data_path = os.path.abspath(os.path.join(os.getcwd(), constants.BASE_STATION_DATA_PATH))
+        return f"path:{station_data_path}"
+
+    def _build_stable_agent_cache_id(self) -> str:
+        station_id = self._load_station_id_for_cache()
+        raw_key = f"{station_id}:{self.agent_name}"
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:32]
+        return f"station-agent-{digest}"
+
+    def _build_request_metadata(self) -> Optional[Dict[str, str]]:
+        if self._resolve_cache_ttl() is None:
+            return None
+        metadata_id = self._build_stable_agent_cache_id()
+        metadata = {"user_id": metadata_id}
         if self._should_skip_token_counting():
-            return {"type": "ephemeral", "ttl": "5m"}
-        return {"type": "ephemeral", "ttl": "1h"}
+            metadata["session_id"] = metadata_id
+        return metadata
+
+    def _build_text_block(self, text: str) -> Dict[str, Any]:
+        return {"type": "text", "text": text}
 
     def _resolve_endpoint_settings(self, snapshot: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], str, str]:
         if snapshot is None:
@@ -218,6 +290,14 @@ class ClaudeConnector(BaseLLMConnector):
         ]
         return any(indicator in error_text for indicator in indicators)
 
+    def _should_fallback_after_refusal(self, final_message: Any) -> bool:
+        model_name = str(self.model_name or "").strip().lower()
+        stop_reason = str(self._read_value(final_message, "stop_reason", "") or "").strip().lower()
+        return (
+            (model_name == "claude-opus-5" or model_name.startswith("claude-opus-5-"))
+            and stop_reason == "refusal"
+        )
+
     def _is_output_config_unsupported_error(self, error: Exception) -> bool:
         error_text = str(error).lower()
         return "output_config" in error_text and any(indicator in error_text for indicator in [
@@ -227,18 +307,133 @@ class ClaudeConnector(BaseLLMConnector):
             "unsupported",
         ])
 
-    def _stream_with_output_config_fallback(self, stream_kwargs: Dict[str, Any]):
+    def _create_raw_stream_with_output_config_fallback(self, request_kwargs: Dict[str, Any]):
+        stream_request_kwargs = dict(request_kwargs)
+        stream_request_kwargs["stream"] = True
         try:
-            return self.client.messages.stream(**stream_kwargs)
+            return self.client.messages.create(**stream_request_kwargs)
         except Exception as stream_error:
-            if "output_config" in stream_kwargs and self._is_output_config_unsupported_error(stream_error):
-                print(f"Info ({self.agent_name}): output_config rejected; retrying Claude request without output_config.")
-                fallback_kwargs = dict(stream_kwargs)
+            if "output_config" in stream_request_kwargs and self._is_output_config_unsupported_error(stream_error):
+                print(f"Info ({self.agent_name}): output_config rejected; retrying Claude stream request without output_config.")
+                fallback_kwargs = dict(stream_request_kwargs)
                 fallback_kwargs.pop("output_config", None)
-                return self.client.messages.stream(**fallback_kwargs)
+                return self.client.messages.create(**fallback_kwargs)
             raise
 
+    def _read_value(self, value: Any, field: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(field, default)
+        return getattr(value, field, default)
+
+    def _merge_usage_dict(self, target: Dict[str, Any], usage: Any) -> None:
+        if not usage:
+            return
+        for key, value in self._usage_to_jsonable(usage).items():
+            if value is not None:
+                target[key] = value
+
+    def _consume_raw_stream(
+        self,
+        request_kwargs: Dict[str, Any],
+        thinking_enabled: bool,
+    ) -> Tuple[str, Optional[str], _ClaudeRawStreamMessage]:
+        raw_stream = self._create_raw_stream_with_output_config_fallback(request_kwargs)
+        text_parts: List[str] = []
+        thinking_parts: List[str] = []
+        content_blocks: List[Dict[str, Any]] = []
+        usage: Dict[str, Any] = {}
+        message_id: Optional[str] = None
+        request_id: Optional[str] = None
+        stop_reason: Optional[str] = None
+        stop_sequence: Optional[str] = None
+
+        for event in raw_stream:
+            event_type = self._read_value(event, "type")
+            if event_type == "message_start":
+                message = self._read_value(event, "message")
+                message_id = self._read_value(message, "id")
+                request_id = self._read_value(message, "request_id")
+                self._merge_usage_dict(usage, self._read_value(message, "usage"))
+            elif event_type == "content_block_start":
+                index = self._read_value(event, "index", len(content_blocks))
+                block = self._to_jsonable(self._read_value(event, "content_block", {}))
+                if not isinstance(block, dict):
+                    block = {"type": self._read_value(block, "type"), "raw": repr(block)}
+                block_type = block.get("type")
+                if block_type == "text":
+                    block["text"] = block.get("text") or ""
+                elif block_type == "thinking":
+                    block["thinking"] = block.get("thinking") or ""
+                while len(content_blocks) <= int(index):
+                    content_blocks.append({"type": "unknown"})
+                content_blocks[int(index)] = block
+            elif event_type == "content_block_delta":
+                index = int(self._read_value(event, "index", 0) or 0)
+                delta = self._read_value(event, "delta", {})
+                delta_type = self._read_value(delta, "type")
+                while len(content_blocks) <= index:
+                    content_blocks.append({"type": "unknown"})
+                block = content_blocks[index]
+                if delta_type == "text_delta":
+                    text = self._block_text(delta, "text")
+                    text_parts.append(text)
+                    block["type"] = "text"
+                    block["text"] = str(block.get("text") or "") + text
+                elif thinking_enabled and delta_type == "thinking_delta":
+                    thinking = self._block_text(delta, "thinking")
+                    thinking_parts.append(thinking)
+                    block["type"] = "thinking"
+                    block["thinking"] = str(block.get("thinking") or "") + thinking
+                elif thinking_enabled and delta_type == "signature_delta":
+                    block["signature"] = self._block_text(delta, "signature")
+            elif event_type == "message_delta":
+                delta = self._read_value(event, "delta", {})
+                stop_reason = self._read_value(delta, "stop_reason", stop_reason)
+                stop_sequence = self._read_value(delta, "stop_sequence", stop_sequence)
+                self._merge_usage_dict(usage, self._read_value(event, "usage"))
+
+        llm_text_response = "".join(text_parts)
+        thinking_text = "\n".join(part for part in thinking_parts if part) or None
+        final_message = _ClaudeRawStreamMessage(
+            message_id=message_id,
+            request_id=request_id,
+            stop_reason=stop_reason,
+            stop_sequence=stop_sequence,
+            usage=usage,
+            content=content_blocks,
+        )
+        return llm_text_response, thinking_text, final_message
+
+    def _iter_content_blocks(self, message: Any) -> List[Any]:
+        content = self._read_value(message, "content")
+        if not content:
+            return []
+        if isinstance(content, list):
+            return content
+        return [content]
+
+    def _block_text(self, block: Any, field: str) -> str:
+        value = self._read_value(block, field, "") or ""
+        return value if isinstance(value, str) else str(value)
+
+    def _extract_message_text_and_thinking(
+        self,
+        message: Any,
+        thinking_enabled: bool,
+    ) -> Tuple[str, Optional[str]]:
+        text_parts: List[str] = []
+        thinking_text: Optional[str] = None
+        for block in self._iter_content_blocks(message):
+            block_type = self._read_value(block, "type")
+            if block_type == "text":
+                text_parts.append(self._block_text(block, "text"))
+            elif thinking_enabled and block_type == "thinking" and thinking_text is None:
+                thinking_text = self._block_text(block, "thinking")
+        return "".join(text_parts), thinking_text
+
     def _usage_to_jsonable(self, usage: Any) -> Dict[str, Any]:
+        if isinstance(usage, dict):
+            return {str(k): self._to_jsonable(v) for k, v in usage.items()}
         fields = [
             "input_tokens",
             "output_tokens",
@@ -280,20 +475,20 @@ class ClaudeConnector(BaseLLMConnector):
 
     def _summarize_final_message_blocks(self, final_message_snapshot: Any) -> List[Dict[str, Any]]:
         summaries: List[Dict[str, Any]] = []
-        if not final_message_snapshot or not getattr(final_message_snapshot, "content", None):
+        if not final_message_snapshot or not self._read_value(final_message_snapshot, "content"):
             return summaries
 
-        for block in final_message_snapshot.content:
-            block_type = getattr(block, "type", None)
+        for block in self._iter_content_blocks(final_message_snapshot):
+            block_type = self._read_value(block, "type")
             summary: Dict[str, Any] = {"type": block_type}
             if block_type == "thinking":
-                thinking_text = getattr(block, "thinking", "") or ""
+                thinking_text = self._block_text(block, "thinking")
                 summary["thinking_len"] = len(thinking_text)
             elif block_type == "text":
-                text = getattr(block, "text", "") or ""
+                text = self._block_text(block, "text")
                 summary["text_len"] = len(text)
             elif block_type == "tool_use":
-                summary["name"] = getattr(block, "name", None)
+                summary["name"] = self._read_value(block, "name")
             summaries.append(summary)
 
         return summaries
@@ -339,32 +534,54 @@ class ClaudeConnector(BaseLLMConnector):
         }
         self._write_debug_api_snapshot(filename, snapshot)
 
-    def _rough_token_estimate_for_text(self, text: str) -> int:
-        text = str(text or "")
-        if not text:
-            return 0
-        word_estimate = len(text.split())
-        char_estimate = max(1, len(text) // 4)
-        return max(word_estimate, char_estimate)
-
-    def _estimate_tokens_without_api_counting(self, user_prompt: str) -> int:
-        history_estimate = 0
-        for msg in getattr(self, "history_messages", []) or []:
-            history_estimate += self._rough_token_estimate_for_text(msg.get("content", ""))
-
-        system_estimate = self._rough_token_estimate_for_text(getattr(self, "system_prompt", ""))
-        prompt_estimate = self._rough_token_estimate_for_text(user_prompt)
-        return history_estimate + system_estimate + prompt_estimate
-
     def _estimate_total_session_tokens_from_usage(self, usage: Any) -> Optional[int]:
         if usage is None:
             return None
-        input_tokens = getattr(usage, "input_tokens", None)
-        output_tokens = getattr(usage, "output_tokens", None)
-        cache_read_input_tokens = getattr(usage, "cache_read_input_tokens", 0) or 0
+        input_tokens = self._read_value(usage, "input_tokens")
+        output_tokens = self._read_value(usage, "output_tokens")
+        cache_read_input_tokens = self._read_value(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation_input_tokens = self._read_value(usage, "cache_creation_input_tokens", 0) or 0
         if input_tokens is None or output_tokens is None:
             return None
-        return int(input_tokens) + int(cache_read_input_tokens) + int(output_tokens)
+        return (
+            int(input_tokens)
+            + int(cache_read_input_tokens)
+            + int(cache_creation_input_tokens)
+            + int(output_tokens)
+        )
+
+    def _raise_for_empty_text_response(
+        self,
+        final_message_snapshot: Any,
+        token_info: Dict[str, Optional[int]],
+    ) -> None:
+        stop_reason = self._read_value(final_message_snapshot, "stop_reason") if final_message_snapshot is not None else None
+        content_summary = self._summarize_final_message_blocks(final_message_snapshot)
+        total_tokens = token_info.get("total_tokens_in_session")
+        detail = (
+            f"Claude returned no text content for {self.agent_name}. "
+            f"stop_reason={stop_reason!r}, content_blocks={json.dumps(content_summary, ensure_ascii=True)}, "
+            f"total_tokens_in_session={total_tokens!r}."
+        )
+        raise LLMTransientAPIError(
+            f"{detail} This may indicate a provider/model empty completion or filtered content."
+        )
+
+    def _raise_for_missing_stop_reason(self, final_message_snapshot: Any) -> None:
+        stop_reason = (
+            self._read_value(final_message_snapshot, "stop_reason")
+            if final_message_snapshot is not None
+            else None
+        )
+        if stop_reason is not None and str(stop_reason).strip():
+            return
+
+        content_summary = self._summarize_final_message_blocks(final_message_snapshot)
+        raise LLMTransientAPIError(
+            f"Claude stream ended without a stop_reason for {self.agent_name}. "
+            f"content_blocks={json.dumps(content_summary, ensure_ascii=True)}. "
+            "The response may be truncated and will be retried."
+        )
 
     def _load_history_from_file(self) -> List[Dict[str, Any]]:
         history_for_filtering: List[Dict[str, Any]] = []
@@ -379,12 +596,15 @@ class ClaudeConnector(BaseLLMConnector):
                     text_content = "".join(part.get("text", "") for part in entry["parts"] if isinstance(part, dict))
                     # Load thinking_content
                     thinking_content = entry.get("thinking_content") 
-                    history_for_filtering.append({
+                    history_entry = {
                         "tick": entry["tick"],
                         "role": entry["role"], 
                         "text_content": text_content,
                         "thinking_content": thinking_content
-                    })
+                    }
+                    if entry["role"] == "model" and isinstance(entry.get("token_info"), dict):
+                        history_entry["token_info"] = entry.get("token_info")
+                    history_for_filtering.append(history_entry)
                 else:
                      print(f"Warning ({self.agent_name}): Malformed history entry in {self.history_file_path} for Claude, skipping: {entry}")
         except Exception as e:
@@ -424,17 +644,17 @@ class ClaudeConnector(BaseLLMConnector):
         final_message_snapshot: Any,
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        usage_obj = getattr(final_message_snapshot, "usage", None) if final_message_snapshot is not None else None
+        usage_obj = self._read_value(final_message_snapshot, "usage") if final_message_snapshot is not None else None
         metadata: Dict[str, Any] = {
             "provider": "claude",
             "streaming": True,
             "model_name": self.model_name,
             "endpoint_name": self.active_endpoint_name,
             "base_url": self.base_url,
-            "message_id": getattr(final_message_snapshot, "id", None),
-            "request_id": getattr(final_message_snapshot, "request_id", None),
-            "stop_reason": getattr(final_message_snapshot, "stop_reason", None),
-            "stop_sequence": getattr(final_message_snapshot, "stop_sequence", None),
+            "message_id": self._read_value(final_message_snapshot, "id"),
+            "request_id": self._read_value(final_message_snapshot, "request_id"),
+            "stop_reason": self._read_value(final_message_snapshot, "stop_reason"),
+            "stop_sequence": self._read_value(final_message_snapshot, "stop_sequence"),
             "usage_raw": self._sanitize_api_return_payload(self._usage_to_jsonable(usage_obj)) if usage_obj is not None else None,
             "raw_return": self._sanitize_api_return_payload(self._to_jsonable(final_message_snapshot)) if final_message_snapshot is not None else None,
         }
@@ -449,14 +669,20 @@ class ClaudeConnector(BaseLLMConnector):
         processed_history_entries = self._filter_and_prune_history(raw_history_with_ticks)
 
         claude_ready_history: List[Dict[str, Any]] = []
+        last_active_total_tokens: Optional[int] = None
         for entry in processed_history_entries:
             claude_role = "user" if entry['role'] == "user" else "assistant" 
             # Skip entries with empty text content to avoid API errors
             if entry.get('text_content', '').strip():
                 # Thinking blocks are not part of Claude's message history API payload
                 claude_ready_history.append({"role": claude_role, "content": entry['text_content']})
+                if entry.get("role") == "model" and isinstance(entry.get("token_info"), dict):
+                    total_tokens = entry["token_info"].get("total_tokens_in_session")
+                    if isinstance(total_tokens, (int, float)):
+                        last_active_total_tokens = int(total_tokens)
         
         self.history_messages = claude_ready_history
+        self.last_known_total_session_tokens = last_active_total_tokens
         print(f"Info ({self.agent_name}): Claude history_messages initialized/re-initialized. Length: {len(self.history_messages)}")
 
     def _send_message_implementation(self, user_prompt: str, current_tick: int, attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
@@ -492,79 +718,19 @@ class ClaudeConnector(BaseLLMConnector):
         # Note: Claude API requires alternating user/assistant messages
         # If filtering empty messages causes consecutive user messages, the API will handle it
         
-        # Current user prompt WITH cache control for incremental conversation caching
+        # Current user prompt is plain; prompt caching is controlled at the request level.
         api_messages_payload.append({
             "role": "user", 
-            "content": [{"type": "text", "text": user_prompt, "cache_control": self._build_cache_control()}]
+            "content": [self._build_text_block(user_prompt)]
         })
         
-        # --- ADDED BACK: Token counting and effective_max_tokens adjustment ---
         effective_max_tokens = int(self.max_output_tokens) if self.max_output_tokens is not None and self.max_output_tokens > 0 else self._get_default_max_output_tokens()
-        
-        # Calculate current history tokens before adding the new user_prompt for this specific calculation
-        # self.history_messages is already pruned and in Claude's format
-        current_history_tokens_for_calc = 0
-        if not self._skip_token_counting and self.history_messages: # Only count if there's history
-            try:
-                # Use the most reliable count_tokens method available
-                if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'messages') and hasattr(self.client.beta.messages, 'count_tokens'):
-                    count_response = self.client.beta.messages.count_tokens(
-                        model=self.model_name, 
-                        messages=self.history_messages,
-                        extra_headers=self.api_headers
-                    )
-                elif hasattr(self.client, 'count_tokens'): # Fallback, less accurate for message lists
-                    combined_text = " ".join([m.get('content', '') for m in self.history_messages if isinstance(m.get('content'), str)])
-                    count_response = self.client.count_tokens(text=combined_text)
-                else: # Should not happen if client initialized
-                    count_response = None
-
-                if count_response:
-                    if hasattr(count_response, 'input_tokens'):
-                        current_history_tokens_for_calc = count_response.input_tokens
-                    elif hasattr(count_response, 'count'):
-                        current_history_tokens_for_calc = count_response.count
-            except Exception as e_count:
-                print(f"Warning ({self.agent_name}): Could not count tokens for Claude history pre-adjustment: {e_count}")
-
-        estimated_input_tokens_for_call = 0
-        if self._skip_token_counting:
-            estimated_input_tokens_for_call = self._estimate_tokens_without_api_counting(user_prompt)
-        else:
-            try:
-                if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'messages') and hasattr(self.client.beta.messages, 'count_tokens'):
-                    count_resp_payload = self.client.beta.messages.count_tokens(
-                        model=self.model_name, 
-                        messages=api_messages_payload,
-                        extra_headers=self.api_headers
-                    )
-                    if hasattr(count_resp_payload, 'input_tokens'):
-                        estimated_input_tokens_for_call = count_resp_payload.input_tokens
-                    elif hasattr(count_resp_payload, 'count'):
-                        estimated_input_tokens_for_call = count_resp_payload.count
-                # else: could do a rough string concat and count if no better method
-            except Exception as e_payload_count:
-                 print(f"Warning ({self.agent_name}): Could not count tokens for Claude api_messages_payload: {e_payload_count}")
-                 # Fallback: use previous history count + rough estimate for user_prompt
-                 estimated_input_tokens_for_call = current_history_tokens_for_calc + len(user_prompt.split()) # Very rough
-
-        # Claude's (and many models') context window limit (e.g., 200k) is for INPUT + OUTPUT.
-        # So, max_tokens for output should be context_limit - input_tokens.
-        MODEL_CONTEXT_WINDOW_LIMIT = 200000 # Example for Claude models
-        
-        if effective_max_tokens is not None and estimated_input_tokens_for_call + effective_max_tokens > MODEL_CONTEXT_WINDOW_LIMIT:
-            original_max_tokens = effective_max_tokens
-            effective_max_tokens = MODEL_CONTEXT_WINDOW_LIMIT - estimated_input_tokens_for_call
-            effective_max_tokens = int(0.95 * effective_max_tokens) # Add a small buffer
-            effective_max_tokens = max(1, effective_max_tokens) # Ensure at least 1 token can be generated
-            print(f"Info ({self.agent_name}): Adjusted effective_max_tokens from {original_max_tokens} to {effective_max_tokens} due to context window limit (input: {estimated_input_tokens_for_call}).")
-        # --- END ADDED BACK ---
 
         try:
-            # Convert system prompt to proper format for Anthropic API with cache control
+            # Convert system prompt to Anthropic's block format.
             system_messages = []
             if self.system_prompt:
-                system_messages = [{"type": "text", "text": self.system_prompt, "cache_control": self._build_cache_control()}]
+                system_messages = [self._build_text_block(self.system_prompt)]
             
             thinking_config = self._build_preferred_thinking_config(effective_max_tokens)
             manual_thinking_config = self._build_manual_thinking_config(effective_max_tokens)
@@ -577,6 +743,12 @@ class ClaudeConnector(BaseLLMConnector):
                 "messages": api_messages_payload,
                 "extra_headers": self.api_headers
             }
+            request_cache_control = self._build_request_cache_control()
+            if request_cache_control is not None:
+                stream_kwargs["cache_control"] = request_cache_control
+                request_metadata = self._build_request_metadata()
+                if request_metadata is not None:
+                    stream_kwargs["metadata"] = request_metadata
             if effective_max_tokens is not None:
                 stream_kwargs["max_tokens"] = effective_max_tokens
             
@@ -587,7 +759,10 @@ class ClaudeConnector(BaseLLMConnector):
             self._dump_send_payload_snapshot(user_prompt, current_tick, attempt_number, stream_kwargs)
 
             try:
-                stream_context = self._stream_with_output_config_fallback(stream_kwargs)
+                llm_text_response, extracted_thinking_text, final_message_snapshot = self._consume_raw_stream(
+                    stream_kwargs,
+                    thinking_enabled=thinking_config is not None,
+                )
             except Exception as stream_error:
                 if (
                     thinking_config
@@ -598,51 +773,63 @@ class ClaudeConnector(BaseLLMConnector):
                     print(f"Info ({self.agent_name}): Adaptive thinking rejected; retrying with manual thinking mode.")
                     stream_kwargs["thinking"] = manual_thinking_config
                     thinking_config = manual_thinking_config
-                    stream_context = self._stream_with_output_config_fallback(stream_kwargs)
+                    llm_text_response, extracted_thinking_text, final_message_snapshot = self._consume_raw_stream(
+                        stream_kwargs,
+                        thinking_enabled=thinking_config is not None,
+                    )
                 else:
                     raise
 
-            with stream_context as stream:
-                llm_text_response_parts: List[str] = []
-                for text_delta in stream.text_stream:
-                    llm_text_response_parts.append(text_delta)
-                
-                llm_text_response = "".join(llm_text_response_parts)
+            response_model_name = self.model_name
+            refusal_fallback_model = None
+            if self._should_fallback_after_refusal(final_message_snapshot):
+                refusal_fallback_model = CLAUDE_OPUS_5_REFUSAL_FALLBACK_MODEL
+                print(
+                    f"Warning ({self.agent_name}): Claude Opus 5 returned stop_reason='refusal'; "
+                    f"retrying this turn with {refusal_fallback_model}."
+                )
+                fallback_kwargs = dict(stream_kwargs)
+                fallback_kwargs["model"] = refusal_fallback_model
+                llm_text_response, extracted_thinking_text, final_message_snapshot = self._consume_raw_stream(
+                    fallback_kwargs,
+                    thinking_enabled=thinking_config is not None,
+                )
+                response_model_name = refusal_fallback_model
 
-                final_message_snapshot = stream.get_final_message()
-                self._dump_response_snapshot(current_tick, attempt_number, final_message_snapshot)
-                if final_message_snapshot:
-                    # Extract thinking from the final message snapshot (only if thinking was enabled)
-                    if thinking_config:
-                        for block in final_message_snapshot.content:
-                            if block.type == 'thinking' and hasattr(block, 'thinking'):
-                                extracted_thinking_text = block.thinking
-                                break # Assuming one thinking block for now
-                    
-                    if final_message_snapshot.usage: 
-                        token_info['last_exchange_prompt_tokens'] = final_message_snapshot.usage.input_tokens
-                        token_info['last_exchange_completion_tokens'] = final_message_snapshot.usage.output_tokens                        
-                        token_info['last_exchange_cached_tokens'] = final_message_snapshot.usage.cache_read_input_tokens # type: ignore
-                        token_info['cache_creation_input_tokens'] = final_message_snapshot.usage.cache_creation_input_tokens # type: ignore
-                        estimated_total_tokens = self._estimate_total_session_tokens_from_usage(final_message_snapshot.usage)
-                        if estimated_total_tokens is not None:
-                            token_info['total_tokens_in_session'] = estimated_total_tokens
-                            self.last_known_total_session_tokens = estimated_total_tokens
-                        if token_info['total_tokens_in_session'] is None:
-                            usage_payload = self._usage_to_jsonable(final_message_snapshot.usage)
-                            print(f"Info ({self.agent_name}): Claude usage payload: {json.dumps(usage_payload, ensure_ascii=True)}")
+            self._dump_response_snapshot(current_tick, attempt_number, final_message_snapshot)
+            if final_message_snapshot:
+                if thinking_config and extracted_thinking_text is None:
+                    _response_text, extracted_thinking_text = self._extract_message_text_and_thinking(
+                        final_message_snapshot,
+                        thinking_enabled=True,
+                    )
 
-                    if not llm_text_response.strip():
-                        stop_reason = getattr(final_message_snapshot, "stop_reason", None)
-                        content_summary = self._summarize_final_message_blocks(final_message_snapshot)
-                        print(
-                            f"Warning ({self.agent_name}): Claude returned no text content. "
-                            f"stop_reason={stop_reason!r}, content_blocks={json.dumps(content_summary, ensure_ascii=True)}"
-                        )
+                usage_obj = self._read_value(final_message_snapshot, "usage")
+                if usage_obj:
+                    token_info['last_exchange_prompt_tokens'] = self._read_value(usage_obj, "input_tokens")
+                    token_info['last_exchange_completion_tokens'] = self._read_value(usage_obj, "output_tokens")
+                    token_info['last_exchange_cached_tokens'] = self._read_value(usage_obj, "cache_read_input_tokens") # type: ignore
+                    token_info['cache_creation_input_tokens'] = self._read_value(usage_obj, "cache_creation_input_tokens") # type: ignore
+                    estimated_total_tokens = self._estimate_total_session_tokens_from_usage(usage_obj)
+                    if estimated_total_tokens is not None:
+                        token_info['total_tokens_in_session'] = estimated_total_tokens
+                        self.last_known_total_session_tokens = estimated_total_tokens
+                    if token_info['total_tokens_in_session'] is None:
+                        usage_payload = self._usage_to_jsonable(usage_obj)
+                        print(f"Info ({self.agent_name}): Claude usage payload: {json.dumps(usage_payload, ensure_ascii=True)}")
 
-                # Ensure we always have a non-empty response to avoid API errors
                 if not llm_text_response.strip():
-                    llm_text_response = "[No response generated]"
+                    stop_reason = self._read_value(final_message_snapshot, "stop_reason")
+                    content_summary = self._summarize_final_message_blocks(final_message_snapshot)
+                    print(
+                        f"Warning ({self.agent_name}): Claude returned no text content. "
+                        f"stop_reason={stop_reason!r}, content_blocks={json.dumps(content_summary, ensure_ascii=True)}"
+                    )
+
+            self._raise_for_missing_stop_reason(final_message_snapshot)
+
+            if not llm_text_response.strip():
+                self._raise_for_empty_text_response(final_message_snapshot, token_info)
 
 
             self.history_messages.append({"role": "user", "content": user_prompt})
@@ -657,10 +844,14 @@ class ClaudeConnector(BaseLLMConnector):
             api_metadata = self._build_claude_api_metadata(
                 final_message_snapshot,
                 extra_metadata={
+                    "model_name": response_model_name,
                     "thinking_enabled": thinking_config is not None,
                     "output_config": output_config,
                 },
             )
+            if refusal_fallback_model is not None and api_metadata is not None:
+                api_metadata["configured_model_name"] = self.model_name
+                api_metadata["refusal_fallback_model"] = refusal_fallback_model
             self._append_turn_to_history_file(current_tick, 'user', user_prompt, None, None)
             self._append_turn_to_history_file(current_tick, 'model', llm_text_response, extracted_thinking_text, token_info, api_metadata)
 
@@ -722,6 +913,8 @@ class ClaudeConnector(BaseLLMConnector):
                 raise LLMTransientAPIError(err_msg, original_exception=e) 
             else: 
                 raise LLMPermanentAPIError(err_msg, original_exception=e) 
+        except LLMConnectorError:
+            raise
         except Exception as e: 
             print(f"DEBUG - Raw Claude Exception for {self.agent_name}: {self._get_error_debug_info(e)}")
             raise LLMConnectorError(f"Unexpected error in Claude _send_message_implementation for {self.agent_name}: {str(e)}", original_exception=e) 

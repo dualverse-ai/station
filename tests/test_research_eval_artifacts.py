@@ -22,19 +22,22 @@ from station.eval_research.evaluation_manager import (
     get_evaluation_review_info,
     get_evaluation_submission_payload,
 )
+from station.eval_research import evaluation_index
 from station.eval_research.coder_manager import ActiveCoderSession, ResearchCoderManager
 from station.eval_research.base_evaluator import ResearchTaskEvaluator
 from station.eval_research.auto_evaluator import AutoResearchEvaluator
 from station.eval_research.runtime_paths import (
+    LOCAL_PROBE_SNAPSHOT_FILENAME,
+    LINEAGE_ALIAS_CONFLICT_SUFFIX,
     SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME,
     SUBMIT_EVAL_CLI_SNAPSHOT_FILENAME,
     build_runtime_paths,
+    ensure_lineage_storage,
     ensure_runtime_layout,
     load_task_spec_markdown,
 )
 from station.eval_research.submit_eval_cli import submit_eval
 from station.rooms.research_center import ResearchCenter
-from scripts.migrate.migrate_research_eval_artifacts import migrate, needs_migration
 from scripts.set_scores_na import process_evaluation as set_scores_na_process_evaluation
 from scripts.void_eval import void_evaluation as void_evaluation_record
 
@@ -44,6 +47,120 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
         eval_dir = Path(root) / "evaluations"
         file_io_utils.ensure_dir_exists(str(eval_dir))
         return EvaluationManager(str(eval_dir))
+
+    def test_evaluation_update_does_not_rescan_all_evaluation_yaml(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = self._make_manager(temp_dir)
+            manager.create_evaluation(
+                eval_id="1",
+                author="Ariadne II",
+                title="Initial title",
+                content="Run the experiment.",
+                tick=1,
+                tags=[],
+                abstract="Initial abstract.",
+                lineage="ariadne",
+            )
+
+            with mock.patch.object(
+                evaluation_index,
+                "_iter_evaluation_files",
+                side_effect=AssertionError("unexpected evaluation YAML rescan"),
+            ):
+                updated = manager.update_evaluation(
+                    "1",
+                    lambda data: data.update({"title": "Updated title"}),
+                )
+
+            self.assertIsNotNone(updated)
+            self.assertEqual("Updated title", manager.get_evaluation("1")["title"])
+
+    def test_coder_launch_cleans_up_process_when_pid_update_fails(self):
+        original_data_path = constants.BASE_STATION_DATA_PATH
+        original_storage_path = constants.RESEARCH_STORAGE_BASE_PATH
+
+        class DummyStation:
+            station_id = "cleanup-test"
+
+        class FakeBackend:
+            supports_resume = False
+
+            def prepare_launch(self, **kwargs):
+                run_dir = Path(kwargs["run_dir"])
+                return SimpleNamespace(
+                    command=["fake-coder"],
+                    stdin_text=None,
+                    env_overrides={},
+                    transcript_path=str(run_dir / "transcript.jsonl"),
+                    stderr_path=str(run_dir / "stderr.txt"),
+                    transcript_format="jsonl",
+                    last_message_path=str(run_dir / "last_message.txt"),
+                )
+
+        class FakeProcess:
+            pid = 424242
+
+            def __init__(self):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                constants.BASE_STATION_DATA_PATH = str(Path(temp_dir) / "station_data")
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                eval_data = manager.create_evaluation(
+                    eval_id="1",
+                    author="Ariadne II",
+                    title="Cleanup launch",
+                    content="Run the experiment.",
+                    tick=1,
+                    tags=[],
+                    abstract="Cleanup launch test.",
+                    lineage="ariadne",
+                    backend="codex",
+                )
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                fake_process = FakeProcess()
+
+                with mock.patch.object(coder, "_detect_backend_executable", return_value="fake-coder"), \
+                    mock.patch(
+                        "station.eval_research.coder_manager.get_cli_worker_backend",
+                        return_value=FakeBackend(),
+                    ), \
+                    mock.patch(
+                        "station.eval_research.coder_manager.subprocess.Popen",
+                        return_value=fake_process,
+                    ), \
+                    mock.patch.object(
+                        manager,
+                        "update_evaluation",
+                        side_effect=RuntimeError("lock timeout"),
+                    ):
+                    with self.assertRaises(RuntimeError):
+                        coder.launch_for_evaluation(eval_data)
+
+                self.assertTrue(fake_process.terminated)
+                self.assertEqual({}, coder.active_sessions)
+        finally:
+            constants.BASE_STATION_DATA_PATH = original_data_path
+            constants.RESEARCH_STORAGE_BASE_PATH = original_storage_path
 
     def _create_eval_with_submission(self, manager: EvaluationManager, root: str, eval_id: str = "204") -> str:
         manager.create_evaluation(
@@ -127,15 +244,42 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 coder.active_sessions["204"] = session
 
                 with mock.patch("station.eval_research.coder_manager.os.killpg") as killpg:
-                    coder._check_codex_transcript_idle_timeouts()
+                    coder._check_cli_job_transcript_idle_timeouts()
 
                 killpg.assert_called_once_with(DummyProcess.pid, signal.SIGTERM)
                 self.assertTrue(session.transcript_idle_timeout_triggered)
                 self.assertIn("did not grow", session.transcript_idle_timeout_reason)
-                failure = coder._classify_no_report_failure(session, returncode=-15)
-                self.assertEqual(failure.category, "codex_transcript_idle_timeout")
+                failure = coder._classify_cli_job_failure(session.eval_id, session)
+                self.assertEqual(failure.category, "infra_transient")
+                self.assertTrue(failure.is_retryable_infra)
                 updated = manager.get_evaluation("204")
                 self.assertEqual(updated["coder"]["failure_category"], "codex_transcript_idle_timeout")
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_research_coder_runtime_env_uses_paths_station_data_root(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_SEED_BANK_ENABLED": constants.RESEARCH_SEED_BANK_ENABLED,
+        }
+
+        class DummyStation:
+            station_id = "branch-env-test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_multistart" / "4_job" / "station_data_s2"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_SEED_BANK_ENABLED = False
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                env = coder._build_runtime_env()
+                self.assertEqual(os.path.abspath(str(data_root)), env["STATION_BASE_DATA_PATH"])
+                self.assertNotIn("STATION_RESEARCH_ROOT", env)
         finally:
             for key, value in original_values.items():
                 setattr(constants, key, value)
@@ -350,6 +494,287 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 self.assertGreaterEqual(coder_state["next_resume_timestamp"], before_poll + 123)
                 self.assertLessEqual(coder_state["next_resume_timestamp"], after_poll + 123)
                 self.assertNotIn("401", coder.active_sessions)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_retryable_infra_failure_resets_resume_backoff_after_normal_progress(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_CODER_RESUME_BACKOFF_SECONDS": constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS,
+        }
+
+        class DummyStation:
+            station_id = "resume-backoff-reset-test"
+
+        class DummyProcess:
+            pid = 6790
+
+            def poll(self):
+                return 1
+
+        class DummyHandle:
+            def close(self):
+                pass
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                constants.BASE_STATION_DATA_PATH = str(Path(temp_dir) / "station_data")
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS = [123, 456]
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                manager.create_evaluation(
+                    eval_id="4010",
+                    author="Ariadne II",
+                    title="Resume backoff reset",
+                    content="Run it.",
+                    tick=1,
+                    tags=[],
+                    abstract="Resume backoff reset test.",
+                    lineage="ariadne",
+                )
+                manager.update_evaluation(
+                    "4010",
+                    lambda record: record.setdefault("coder", {}).update({"resume_count": 2}),
+                )
+                run_dir = Path(paths.coder_sessions_dir) / "codex_4010_spawn_2_deadbeef"
+                file_io_utils.ensure_dir_exists(str(run_dir))
+                transcript_path = run_dir / "transcript.jsonl"
+                stderr_path = run_dir / "stderr.txt"
+                file_io_utils.save_text(
+                    '{"type":"thread.started","thread_id":"resume-token-4010"}\n'
+                    '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"working"}}\n'
+                    '{"type":"error","message":"rate limit exceeded"}\n',
+                    str(transcript_path),
+                )
+                file_io_utils.save_text("", str(stderr_path))
+
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                coder.active_sessions["4010"] = ActiveCoderSession(
+                    eval_id="4010",
+                    session_id="codex_4010_spawn_2_deadbeef",
+                    run_dir=str(run_dir),
+                    backend="codex",
+                    transcript_format="jsonl",
+                    process=DummyProcess(),
+                    transcript_handle=DummyHandle(),
+                    stderr_handle=DummyHandle(),
+                    report_path=str(Path(paths.reports_dir) / "4010.md"),
+                    prompt_path=str(run_dir / "prompt.txt"),
+                    command=["codex", "exec"],
+                    debug_dir=None,
+                    dialogue_log_path=None,
+                    transcript_path=str(transcript_path),
+                    stderr_path=str(stderr_path),
+                    last_message_path=str(run_dir / "last_message.txt"),
+                    last_transcript_size=0,
+                    last_transcript_growth_timestamp=time.time(),
+                )
+
+                before_poll = time.time()
+                coder.poll()
+                after_poll = time.time()
+
+                updated = manager.get_evaluation("4010")
+                coder_state = updated["coder"]
+                self.assertEqual(updated["status"], "running")
+                self.assertEqual(coder_state["status"], "pending_resume")
+                self.assertEqual(coder_state["resume_count"], 0)
+                self.assertEqual(coder_state["resume_delay_seconds"], 123)
+                self.assertGreaterEqual(coder_state["next_resume_timestamp"], before_poll + 123)
+                self.assertLessEqual(coder_state["next_resume_timestamp"], after_poll + 123)
+                self.assertNotIn("4010", coder.active_sessions)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_retryable_infra_failure_resets_resume_backoff_after_progress_before_adjacent_failure_markers(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_CODER_RESUME_BACKOFF_SECONDS": constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS,
+        }
+
+        class DummyStation:
+            station_id = "resume-backoff-adjacent-failure-reset-test"
+
+        class DummyProcess:
+            pid = 6792
+
+            def poll(self):
+                return 1
+
+        class DummyHandle:
+            def close(self):
+                pass
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                constants.BASE_STATION_DATA_PATH = str(Path(temp_dir) / "station_data")
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS = [123, 456]
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                manager.create_evaluation(
+                    eval_id="4012",
+                    author="Ariadne II",
+                    title="Resume backoff adjacent failure reset",
+                    content="Run it.",
+                    tick=1,
+                    tags=[],
+                    abstract="Resume backoff adjacent failure reset test.",
+                    lineage="ariadne",
+                )
+                manager.update_evaluation(
+                    "4012",
+                    lambda record: record.setdefault("coder", {}).update({"resume_count": 2}),
+                )
+                run_dir = Path(paths.coder_sessions_dir) / "codex_4012_spawn_2_deadbeef"
+                file_io_utils.ensure_dir_exists(str(run_dir))
+                transcript_path = run_dir / "transcript.jsonl"
+                stderr_path = run_dir / "stderr.txt"
+                file_io_utils.save_text(
+                    '{"type":"thread.started","thread_id":"resume-token-4012"}\n'
+                    '{"type":"turn.started"}\n'
+                    '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"working"}}\n'
+                    '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","status":"completed"}}\n'
+                    '{"type":"error","message":"Selected model is at capacity. Please try a different model."}\n'
+                    '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}\n',
+                    str(transcript_path),
+                )
+                file_io_utils.save_text("", str(stderr_path))
+
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                coder.active_sessions["4012"] = ActiveCoderSession(
+                    eval_id="4012",
+                    session_id="codex_4012_spawn_2_deadbeef",
+                    run_dir=str(run_dir),
+                    backend="codex",
+                    transcript_format="jsonl",
+                    process=DummyProcess(),
+                    transcript_handle=DummyHandle(),
+                    stderr_handle=DummyHandle(),
+                    report_path=str(Path(paths.reports_dir) / "4012.md"),
+                    prompt_path=str(run_dir / "prompt.txt"),
+                    command=["codex", "exec"],
+                    debug_dir=None,
+                    dialogue_log_path=None,
+                    transcript_path=str(transcript_path),
+                    stderr_path=str(stderr_path),
+                    last_message_path=str(run_dir / "last_message.txt"),
+                    last_transcript_size=0,
+                    last_transcript_growth_timestamp=time.time(),
+                )
+
+                before_poll = time.time()
+                coder.poll()
+                after_poll = time.time()
+
+                updated = manager.get_evaluation("4012")
+                coder_state = updated["coder"]
+                self.assertEqual(updated["status"], "running")
+                self.assertEqual(coder_state["status"], "pending_resume")
+                self.assertEqual(coder_state["resume_count"], 0)
+                self.assertEqual(coder_state["resume_delay_seconds"], 123)
+                self.assertGreaterEqual(coder_state["next_resume_timestamp"], before_poll + 123)
+                self.assertLessEqual(coder_state["next_resume_timestamp"], after_poll + 123)
+                self.assertNotIn("4012", coder.active_sessions)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_retryable_infra_failure_does_not_reset_resume_backoff_for_old_progress(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_CODER_RESUME_BACKOFF_SECONDS": constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS,
+        }
+
+        class DummyStation:
+            station_id = "resume-backoff-old-progress-test"
+
+        class DummyProcess:
+            pid = 6791
+
+            def poll(self):
+                return 1
+
+        class DummyHandle:
+            def close(self):
+                pass
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                constants.BASE_STATION_DATA_PATH = str(Path(temp_dir) / "station_data")
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_CODER_RESUME_BACKOFF_SECONDS = [123, 456]
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                manager.create_evaluation(
+                    eval_id="4011",
+                    author="Ariadne II",
+                    title="Resume backoff old progress",
+                    content="Run it.",
+                    tick=1,
+                    tags=[],
+                    abstract="Resume backoff old progress test.",
+                    lineage="ariadne",
+                )
+                manager.update_evaluation(
+                    "4011",
+                    lambda record: record.setdefault("coder", {}).update({"resume_count": 1}),
+                )
+                run_dir = Path(paths.coder_sessions_dir) / "codex_4011_spawn_2_deadbeef"
+                file_io_utils.ensure_dir_exists(str(run_dir))
+                transcript_path = run_dir / "transcript.jsonl"
+                stderr_path = run_dir / "stderr.txt"
+                file_io_utils.save_text(
+                    '{"type":"thread.started","thread_id":"resume-token-4011"}\n'
+                    '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"old work"}}\n'
+                    '{"type":"turn.failed","error":{"message":"temporary backend hiccup"}}\n'
+                    '{"type":"turn.started"}\n'
+                    '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}\n',
+                    str(transcript_path),
+                )
+                file_io_utils.save_text("", str(stderr_path))
+
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                coder.active_sessions["4011"] = ActiveCoderSession(
+                    eval_id="4011",
+                    session_id="codex_4011_spawn_2_deadbeef",
+                    run_dir=str(run_dir),
+                    backend="codex",
+                    transcript_format="jsonl",
+                    process=DummyProcess(),
+                    transcript_handle=DummyHandle(),
+                    stderr_handle=DummyHandle(),
+                    report_path=str(Path(paths.reports_dir) / "4011.md"),
+                    prompt_path=str(run_dir / "prompt.txt"),
+                    command=["codex", "exec"],
+                    debug_dir=None,
+                    dialogue_log_path=None,
+                    transcript_path=str(transcript_path),
+                    stderr_path=str(stderr_path),
+                    last_message_path=str(run_dir / "last_message.txt"),
+                    last_transcript_size=0,
+                    last_transcript_growth_timestamp=time.time(),
+                )
+
+                before_poll = time.time()
+                coder.poll()
+                after_poll = time.time()
+
+                updated = manager.get_evaluation("4011")
+                coder_state = updated["coder"]
+                self.assertEqual(updated["status"], "running")
+                self.assertEqual(coder_state["status"], "pending_resume")
+                self.assertEqual(coder_state["resume_count"], 1)
+                self.assertEqual(coder_state["resume_delay_seconds"], 456)
+                self.assertGreaterEqual(coder_state["next_resume_timestamp"], before_poll + 456)
+                self.assertLessEqual(coder_state["next_resume_timestamp"], after_poll + 456)
+                self.assertNotIn("4011", coder.active_sessions)
         finally:
             for key, value in original_values.items():
                 setattr(constants, key, value)
@@ -597,6 +1022,34 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
             self.assertEqual(file_io_utils.load_text(str(Path(root) / "storage" / "stdout" / "204.log")), "official stdout\nATTEMPT_COMPLETE\nfooter\n")
             self.assertEqual(file_io_utils.load_text(str(Path(root) / "storage" / "report" / "204.md")), "# Coder Report\n\nFinal report.\n")
 
+    def test_finalize_removes_matching_eval_tmp_storage(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._make_manager(root)
+            submission_path = self._create_eval_with_submission(manager, root)
+            eval_tmp = Path(root) / "storage" / "tmp" / "ariadne" / "eval_204"
+            sibling_tmp = Path(root) / "storage" / "tmp" / "ariadne" / "eval_999"
+            file_io_utils.ensure_dir_exists(str(eval_tmp))
+            file_io_utils.ensure_dir_exists(str(sibling_tmp))
+            file_io_utils.save_text("scratch", str(eval_tmp / "probe.txt"))
+            file_io_utils.save_text("keep", str(sibling_tmp / "probe.txt"))
+
+            manager.register_attempt("204", submission_path)
+            manager.complete_attempt(
+                "204",
+                1,
+                success=True,
+                score=55.0,
+                stdout="stdout\n",
+                stderr="",
+                details={"Message": "scored"},
+                status="completed",
+            )
+            manager.finalize_evaluation("204", "# Coder Report\n\nFinal report.\n", final_status="completed")
+
+            self.assertFalse(eval_tmp.exists())
+            self.assertTrue(sibling_tmp.exists())
+            self.assertEqual(file_io_utils.load_text(str(sibling_tmp / "probe.txt")), "keep")
+
     def test_generated_submit_script_uses_artifact_snapshot_for_unmigrated_metadata(self):
         original_values = {
             "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
@@ -634,6 +1087,9 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 script_text = file_io_utils.load_text(paths.submit_script_path)
                 self.assertIn("_internal/submit_eval_cli_snapshot.py", script_text)
                 self.assertNotIn("station.eval_research.submit_eval_cli", script_text)
+                self.assertIn("export STATION_BASE_DATA_PATH=", script_text)
+                eval_tool_text = file_io_utils.load_text(paths.eval_tool_script_path)
+                self.assertIn("export STATION_BASE_DATA_PATH=", eval_tool_text)
 
                 result = subprocess.run(
                     [paths.submit_script_path, "7"],
@@ -655,12 +1111,138 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 self.assertEqual(attempt["stderr_path"], "storage/stderr/7.log")
                 stdout = file_io_utils.load_text(str(Path(paths.stdout_dir) / "7.log"))
                 self.assertIn("ATTEMPT_QUEUED", stdout)
+                self.assertIn("wait patiently for `ATTEMPT_COMPLETE`", stdout)
                 self.assertTrue((Path(paths.run_requests_dir) / "7_attempt_1.yaml").exists())
                 manager = EvaluationManager(paths.evaluations_dir)
                 self.assertIn("7", manager.get_running_instruction_eval_ids())
                 active_ids = {item["evaluation_id"] for item in manager.get_active_evaluations()}
                 self.assertIn("7", active_ids)
                 self.assertFalse(Path(paths.evaluation_index_path).exists())
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_generated_local_probe_refreshes_limit_and_applies_optional_timeout(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_MEMORY_LIMIT": constants.RESEARCH_EVAL_MEMORY_LIMIT,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_MEMORY_LIMIT = "128m"
+                paths = ensure_runtime_layout(constants)
+
+                probe_script = Path(paths.local_probe_script_path)
+                snapshot_path = (
+                    Path(paths.research_root)
+                    / SUBMIT_EVAL_CLI_SNAPSHOT_DIRNAME
+                    / LOCAL_PROBE_SNAPSHOT_FILENAME
+                )
+                self.assertTrue(probe_script.is_file())
+                self.assertTrue(os.access(probe_script, os.X_OK))
+                self.assertTrue(snapshot_path.is_file())
+                self.assertIn("_internal/local_probe_snapshot.py", probe_script.read_text(encoding="utf-8"))
+                self.assertIn("MEMORY_LIMIT = '128m'", snapshot_path.read_text(encoding="utf-8"))
+
+                completed = subprocess.run(
+                    [str(probe_script), "--", sys.executable, "-c", "print('probe-ok')"],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("probe-ok", completed.stdout)
+
+                timed_out = subprocess.run(
+                    [
+                        str(probe_script),
+                        "--timeout",
+                        "0.1",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(5)",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(timed_out.returncode, 124, timed_out.stderr)
+                self.assertIn("timeout exceeded", timed_out.stderr)
+
+                memory_limited = subprocess.run(
+                    [
+                        str(probe_script),
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "x = bytearray(256 * 1024 * 1024); print(len(x))",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertNotEqual(memory_limited.returncode, 0)
+
+                constants.RESEARCH_EVAL_MEMORY_LIMIT = "96m"
+                ensure_runtime_layout(constants)
+                refreshed_snapshot = snapshot_path.read_text(encoding="utf-8")
+                self.assertIn("MEMORY_LIMIT = '96m'", refreshed_snapshot)
+                self.assertNotIn("MEMORY_LIMIT = '128m'", refreshed_snapshot)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_generated_submit_script_records_cpu_only_when_gpu_managed(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_GPU_NUM": constants.RESEARCH_EVAL_GPU_NUM,
+            "RESEARCH_EVAL_USE_DIFF_GPU": constants.RESEARCH_EVAL_USE_DIFF_GPU,
+            "RESEARCH_EVAL_AVAILABLE_GPUS": constants.RESEARCH_EVAL_AVAILABLE_GPUS,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_GPU_NUM = 1
+                constants.RESEARCH_EVAL_USE_DIFF_GPU = False
+                constants.RESEARCH_EVAL_AVAILABLE_GPUS = [0, 1]
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                manager.create_evaluation(
+                    eval_id="10",
+                    author="Aletheia I",
+                    title="Snapshot CPU-only",
+                    content="Run without GPU.",
+                    tick=1,
+                    tags=["cpu"],
+                    abstract="Snapshot CPU-only attempt.",
+                    lineage="aletheia",
+                )
+                file_io_utils.save_text("def solution_batch():\n    return {}\n", str(Path(paths.submissions_dir) / "10.py"))
+
+                result = subprocess.run(
+                    [paths.submit_script_path, "10", "--cpu-only"],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                data = file_io_utils.load_yaml(str(Path(paths.evaluations_dir) / "10.yaml"))
+                self.assertTrue(data["attempts"][0]["cpu_only"])
+                run_request = file_io_utils.load_yaml(str(Path(paths.run_requests_dir) / "10_attempt_1.yaml"))
+                self.assertTrue(run_request["cpu_only"])
         finally:
             for key, value in original_values.items():
                 setattr(constants, key, value)
@@ -710,6 +1292,48 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
             for key, value in original_values.items():
                 setattr(constants, key, value)
 
+    def test_submit_cli_records_cpu_only_attempt_when_gpu_managed(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_GPU_NUM": constants.RESEARCH_EVAL_GPU_NUM,
+            "RESEARCH_EVAL_USE_DIFF_GPU": constants.RESEARCH_EVAL_USE_DIFF_GPU,
+            "RESEARCH_EVAL_AVAILABLE_GPUS": constants.RESEARCH_EVAL_AVAILABLE_GPUS,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_GPU_NUM = 1
+                constants.RESEARCH_EVAL_USE_DIFF_GPU = False
+                constants.RESEARCH_EVAL_AVAILABLE_GPUS = [0, 1]
+                paths = build_runtime_paths(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                manager.create_evaluation(
+                    eval_id="9",
+                    author="Aletheia I",
+                    title="CPU-only attempt",
+                    content="Run without GPU.",
+                    tick=1,
+                    tags=["cpu"],
+                    abstract="CPU-only attempt metadata.",
+                    lineage="aletheia",
+                )
+                file_io_utils.save_text("def solution_batch():\n    return {}\n", str(Path(paths.submissions_dir) / "9.py"))
+
+                self.assertEqual(submit_eval("9", cpu_only=True), 0)
+
+                data = file_io_utils.load_yaml(str(Path(paths.evaluations_dir) / "9.yaml"))
+                self.assertTrue(data["attempts"][0]["cpu_only"])
+                run_request = file_io_utils.load_yaml(str(Path(paths.run_requests_dir) / "9_attempt_1.yaml"))
+                self.assertTrue(run_request["cpu_only"])
+                stdout = file_io_utils.load_text(str(Path(paths.stdout_dir) / "9.log"))
+                self.assertIn("CPU-only mode requested", stdout)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
     def test_review_code_and_submission_payload_read_artifacts(self):
         with tempfile.TemporaryDirectory() as root:
             manager = self._make_manager(root)
@@ -734,7 +1358,8 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
 
             self.assertEqual(review["status"], "completed")
             self.assertIn("report text", review["message"])
-            self.assertIn("visible stdout", review["message"])
+            self.assertIn("Stdout/stderr are not shown here", review["message"])
+            self.assertNotIn("visible stdout", review["message"])
             self.assertNotIn("machine footer", review["message"])
             self.assertEqual(code["status"], "completed")
             self.assertIn("def solution_batch", code["code"])
@@ -759,6 +1384,7 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
         original_values = {
             "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
             "RESEARCH_EVAL_CPU_NUM": constants.RESEARCH_EVAL_CPU_NUM,
+            "RESEARCH_EVAL_GPU_NUM": constants.RESEARCH_EVAL_GPU_NUM,
             "RESEARCH_EVAL_USE_DIFF_GPU": constants.RESEARCH_EVAL_USE_DIFF_GPU,
             "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
         }
@@ -780,6 +1406,7 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 data_root = Path(temp_dir) / "station_data"
                 constants.BASE_STATION_DATA_PATH = str(data_root)
                 constants.RESEARCH_EVAL_CPU_NUM = None
+                constants.RESEARCH_EVAL_GPU_NUM = None
                 constants.RESEARCH_EVAL_USE_DIFF_GPU = False
                 constants.RESEARCH_STORAGE_BASE_PATH = None
 
@@ -872,6 +1499,265 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
             for key, value in original_values.items():
                 setattr(constants, key, value)
 
+    def test_coder_prompt_renders_local_probe_memory_limit(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_MEMORY_LIMIT": constants.RESEARCH_EVAL_MEMORY_LIMIT,
+        }
+
+        class DummyStation:
+            station_id = "prompt-local-probe-test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_MEMORY_LIMIT = "12g"
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+
+                prompt = coder._build_prompt(
+                    {
+                        "id": "124",
+                        "lineage": "axiom",
+                        "instruction": "Run a bounded probe.",
+                        "coder": {"max_attempts": 5},
+                    }
+                )
+
+                self.assertIn("configured official-attempt memory limit is `12g`", prompt)
+                self.assertIn(
+                    "bash local_probe.sh [--timeout SECONDS] -- <command>",
+                    prompt,
+                )
+                self.assertIn("same `12g` memory limit", prompt)
+                self.assertIn("If `--timeout` is omitted, no timeout is applied", prompt)
+                self.assertNotIn("less than 50% of available RAM", prompt)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_coder_prompt_uses_attempt_completion_not_score_as_stop_rule(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+        }
+
+        class DummyStation:
+            station_id = "prompt-stop-rule-test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+
+                prompt = coder._build_prompt(
+                    {
+                        "id": "125",
+                        "lineage": "axiom",
+                        "instruction": "Run a diagnostic-only analysis.",
+                        "coder": {"max_attempts": 5},
+                    }
+                )
+
+                self.assertIn("Do not use multiple official attempts for score optimization.", prompt)
+                self.assertIn(
+                    "Avoid repeated full-run official attempts by using quick end-to-end tests and runtime estimates",
+                    prompt,
+                )
+                self.assertIn("If the agent does not explicitly specify a compute budget", prompt)
+                self.assertIn("use the maximum compute allowed by the task specification", prompt)
+                self.assertIn("If the agent explicitly specifies a compute budget, you must respect it", prompt)
+                self.assertIn("requested versus actual compute afterward", prompt)
+                self.assertIn("periodically atomically checkpoint resumable state", prompt)
+                self.assertIn("so a later evaluation can continue after timeout", prompt)
+                self.assertIn("ATTEMPT_STATUS: completed", prompt)
+                self.assertIn("Retry only when there was an exception or the result is materially misaligned", prompt)
+                self.assertIn("A computational timeout is not itself a failed scientific result", prompt)
+                self.assertIn("do not resubmit", prompt)
+                self.assertIn("mark unfinished work as `UNDECIDED-AT-BUDGET`", prompt)
+                self.assertIn("If the attempt timed out computationally, write the report instead of resubmitting", prompt)
+                self.assertIn("the score may legitimately be `n.a.` for diagnostic or non-scorable work", prompt)
+                self.assertNotIn("`failed`, `timeout`, or `rejected`", prompt)
+                self.assertNotIn("A non-`n.a.` primary score", prompt)
+                self.assertNotIn("agent explicitly asked for optimization", prompt)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_coder_prompt_includes_lineage_memory_word_budget(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+        }
+
+        class DummyStation:
+            station_id = "prompt-memory-budget-test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                lineage_dir = Path(paths.storage_real_root) / "axiom"
+                file_io_utils.ensure_dir_exists(str(lineage_dir))
+                file_io_utils.save_text("alpha beta gamma\n", str(lineage_dir / "CODER.md"))
+                manager = EvaluationManager(paths.evaluations_dir)
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+
+                prompt = coder._build_prompt(
+                    {
+                        "id": "127",
+                        "lineage": "axiom",
+                        "instruction": "Use relevant lineage memory.",
+                        "coder": {"max_attempts": 5},
+                    }
+                )
+
+                self.assertIn("Lineage memory maintenance", prompt)
+                self.assertIn("Current `storage/axiom/CODER.md` word count at launch: 3.", prompt)
+                self.assertIn("future coder sessions working on submissions from the same lineage", prompt)
+                self.assertIn("at or below 5,000 words", prompt)
+                self.assertIn("Do not over-prune", prompt)
+                self.assertIn("around 5,000 words is acceptable", prompt)
+                self.assertIn("wc -w storage/axiom/CODER.md", prompt)
+                self.assertIn("storage/axiom/data/notes/", prompt)
+                self.assertIn("Prior evaluation inspection", prompt)
+                self.assertIn("bash eval_tool.sh preview <ID>", prompt)
+                self.assertIn("without printing coder prompts, raw code, stdout, or stderr", prompt)
+                self.assertIn("Read raw evaluation YAML, submission code, stdout, or stderr only when the preview is insufficient", prompt)
+                self.assertIn("Agents cannot see stdout/stderr in completion notifications or review", prompt)
+                self.assertIn("summarize them in the Coder Report", prompt)
+                self.assertIn("When the agent instruction asks for evidence, a diagnosis, or a direct comparison", prompt)
+                self.assertIn("local artifacts are supplementary and must not be the only place the answer appears", prompt)
+                self.assertIn("If the requested evidence was not measured, say so clearly", prompt)
+                self.assertIn("Include important stdout information or requested raw data here when relevant", prompt)
+                self.assertIn("State the total compute invested", prompt)
+                self.assertIn("whether the execution was faithful to the agent's requested compute budget", prompt)
+                self.assertIn("If the requested implementation or computation timed out", prompt)
+                self.assertIn("estimate how much total additional compute would likely be needed", prompt)
+                self.assertIn("requested-versus-actual compute gap", prompt)
+                self.assertIn("sleep {time}", prompt)
+                self.assertNotIn("sleep <module 'time'", prompt)
+                self.assertIn("Token conservation", prompt)
+                self.assertIn("Use targeted `rg`/`sed` reads", prompt)
+                self.assertIn("avoid broad dumps over all of `storage/`, `evaluations/`, `coder_sessions/`, or `research_center/`", prompt)
+                self.assertIn("Spend tokens when needed for correctness", prompt)
+                self.assertIn("print scientifically valuable results and debugging-relevant diagnostics", prompt)
+                self.assertIn("unexpected or interesting result that may be worth mentioning", prompt)
+                self.assertIn("For optimization or search runs", prompt)
+                self.assertIn("appeared converged, non-converged, or inconclusive", prompt)
+                self.assertIn("continuing the same search process in a later evaluation appears promising", prompt)
+                self.assertIn("do not give broader recommendations", prompt)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_research_coder_working_directory_can_run_eval_tool_preview(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+        }
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                eval_id = "128"
+                file_io_utils.save_yaml(
+                    {
+                        "id": eval_id,
+                        "title": "Eval tool reachable",
+                        "author": "Axiom I",
+                        "lineage": "axiom",
+                        "tags": ["tool"],
+                        "abstract": "Reachability abstract.",
+                        "status": "completed",
+                        "instruction": "Inspect this instruction.",
+                        "artifacts": {
+                            "report": os.path.join(constants.RESEARCH_STORAGE_DIR, "report", f"{eval_id}.md"),
+                        },
+                    },
+                    os.path.join(paths.evaluations_dir, f"{eval_id}{constants.RESEARCH_EVALUATION_FILE_EXTENSION}"),
+                    sort_keys=False,
+                )
+                file_io_utils.save_text("Reachable report.", os.path.join(paths.reports_dir, f"{eval_id}.md"))
+
+                result = subprocess.run(
+                    ["bash", "eval_tool.sh", "preview", eval_id],
+                    cwd=paths.research_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("# Research Evaluation Preview #128", result.stdout)
+                self.assertIn("Inspect this instruction.", result.stdout)
+                self.assertIn("Reachable report.", result.stdout)
+                self.assertIn("Stdout log: `storage/stdout/128.log`", result.stdout)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_coder_prompt_includes_cpu_only_tip_only_when_gpu_managed(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_GPU_NUM": constants.RESEARCH_EVAL_GPU_NUM,
+            "RESEARCH_EVAL_USE_DIFF_GPU": constants.RESEARCH_EVAL_USE_DIFF_GPU,
+            "RESEARCH_EVAL_AVAILABLE_GPUS": constants.RESEARCH_EVAL_AVAILABLE_GPUS,
+        }
+
+        class DummyStation:
+            station_id = "prompt-cpu-only-test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                manager = EvaluationManager(paths.evaluations_dir)
+                coder = ResearchCoderManager(DummyStation(), manager, paths=paths)
+                eval_data = {
+                    "id": "126",
+                    "lineage": "axiom",
+                    "instruction": "Run a CPU-only diagnostic.",
+                    "coder": {"max_attempts": 5},
+                }
+
+                constants.RESEARCH_EVAL_GPU_NUM = 1
+                constants.RESEARCH_EVAL_USE_DIFF_GPU = False
+                constants.RESEARCH_EVAL_AVAILABLE_GPUS = [0]
+                managed_prompt = coder._build_prompt(eval_data)
+
+                constants.RESEARCH_EVAL_GPU_NUM = None
+                constants.RESEARCH_EVAL_USE_DIFF_GPU = False
+                unmanaged_prompt = coder._build_prompt(eval_data)
+
+                self.assertIn("bash submit_eval.sh 126 --cpu-only", managed_prompt)
+                self.assertIn("hides CUDA devices", managed_prompt)
+                self.assertIn("Local probe commands may have no GPU/CUDA access", managed_prompt)
+                self.assertIn("Do not infer that the official attempt lacks GPU access", managed_prompt)
+                self.assertIn("do not pass `--cpu-only`", managed_prompt)
+                self.assertIn("let the scheduler allocate the GPU", managed_prompt)
+                self.assertNotIn("--cpu-only", unmanaged_prompt)
+                self.assertNotIn("Local probe commands may have no GPU/CUDA access", unmanaged_prompt)
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
     def test_research_task_spec_strips_coder_only_content_for_agents_and_keeps_it_for_coder_prompt(self):
         original_values = {
             "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
@@ -954,7 +1840,9 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                 constants.RESEARCH_EVAL_PYTHON_CONDA_ENV = "station"
                 paths = ensure_runtime_layout(constants)
 
-                evaluator = AutoResearchEvaluator(DummyStation(), enabled=False)
+                with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", None), \
+                     mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False):
+                    evaluator = AutoResearchEvaluator(DummyStation(), enabled=False)
                 evaluator.timeout = 10
                 eval_entry = {
                     constants.EVALUATION_ID_KEY: "321",
@@ -977,6 +1865,219 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
                     file_io_utils.load_text(str(Path(paths.tmp_storage) / "axiom" / "eval_321" / "sage" / "home" / "marker.txt")),
                     "ok",
                 )
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_python_sandbox_exposes_cross_lineage_root_when_enabled(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_PYTHON_CONDA_ENV": constants.RESEARCH_EVAL_PYTHON_CONDA_ENV,
+            "RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS": constants.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS,
+        }
+
+        class DummyAgentModule:
+            @staticmethod
+            def load_agent_data(author):
+                return {constants.AGENT_LINEAGE_KEY: "aster"}
+
+        class DummyStation:
+            station_id = "sandbox-cross-lineage-test"
+            agent_module = DummyAgentModule()
+
+            def sync_top_research_submission_config(self, submission):
+                pass
+
+        class CrossLineageEvaluator(ResearchTaskEvaluator):
+            def evaluate_submission(self, result, eval_id: str = None, author: str = None):
+                return result == "bridge seed", 1.0 if result == "bridge seed" else 0.0, {"result": result}
+
+            def get_expected_function_name(self):
+                return "solution_batch"
+
+            def get_task_description(self):
+                return "cross-lineage sandbox smoke test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_PYTHON_CONDA_ENV = "station"
+                constants.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS = True
+                paths = ensure_runtime_layout(constants)
+                other_file = Path(paths.lineages_root) / "heuron" / "witnesses" / "bridge_45.json"
+                file_io_utils.ensure_dir_exists(str(other_file.parent))
+                file_io_utils.save_text("bridge seed", str(other_file))
+
+                with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", None), \
+                     mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False):
+                    evaluator = AutoResearchEvaluator(DummyStation(), enabled=False)
+                evaluator.timeout = 10
+                eval_entry = {
+                    constants.EVALUATION_ID_KEY: "4243",
+                    constants.EVALUATION_AUTHOR_KEY: "Aster I",
+                    constants.EVALUATION_CONTENT_KEY: (
+                        "from pathlib import Path\n"
+                        "def solution_batch():\n"
+                        "    return Path('storage/lineages/heuron/witnesses/bridge_45.json').read_text(encoding='utf-8')\n"
+                    ),
+                }
+
+                result = evaluator._execute_submission(eval_entry, CrossLineageEvaluator())
+
+                self.assertTrue(result["success"], result.get("logs") or result.get("error"))
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_python_sandbox_exposes_legacy_top_level_storage_when_enabled(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_PYTHON_CONDA_ENV": constants.RESEARCH_EVAL_PYTHON_CONDA_ENV,
+            "RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS": constants.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS,
+        }
+
+        class DummyAgentModule:
+            @staticmethod
+            def load_agent_data(author):
+                return {constants.AGENT_LINEAGE_KEY: "aster"}
+
+        class DummyStation:
+            station_id = "sandbox-legacy-storage-test"
+            agent_module = DummyAgentModule()
+
+            def sync_top_research_submission_config(self, submission):
+                pass
+
+        class LegacyStorageEvaluator(ResearchTaskEvaluator):
+            def evaluate_submission(self, result, eval_id: str = None, author: str = None):
+                return result == "legacy parent artifact", 1.0 if result == "legacy parent artifact" else 0.0, {"result": result}
+
+            def get_expected_function_name(self):
+                return "solution_batch"
+
+            def get_task_description(self):
+                return "legacy top-level storage sandbox smoke test"
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_PYTHON_CONDA_ENV = "station"
+                constants.RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS = True
+                paths = ensure_runtime_layout(constants)
+                legacy_file = Path(paths.storage_real_root) / "axioma" / "hadamard_parent_interlock_n42.json"
+                file_io_utils.ensure_dir_exists(str(legacy_file.parent))
+                file_io_utils.save_text("legacy parent artifact", str(legacy_file))
+
+                with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", None), \
+                     mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False):
+                    evaluator = AutoResearchEvaluator(DummyStation(), enabled=False)
+                evaluator.timeout = 10
+                eval_entry = {
+                    constants.EVALUATION_ID_KEY: "4244",
+                    constants.EVALUATION_AUTHOR_KEY: "Aster I",
+                    constants.EVALUATION_CONTENT_KEY: (
+                        "from pathlib import Path\n"
+                        "def solution_batch():\n"
+                        "    return Path('storage/axioma/hadamard_parent_interlock_n42.json').read_text(encoding='utf-8')\n"
+                    ),
+                }
+
+                result = evaluator._execute_submission(eval_entry, LegacyStorageEvaluator())
+
+                self.assertTrue(result["success"], result.get("logs") or result.get("error"))
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_system_baseline_can_write_system_storage_only_during_startup_window(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+            "RESEARCH_EVAL_PYTHON_CONDA_ENV": constants.RESEARCH_EVAL_PYTHON_CONDA_ENV,
+            "RESEARCH_SYSTEM_BASELINE_WRITABLE_TICK_LIMIT": constants.RESEARCH_SYSTEM_BASELINE_WRITABLE_TICK_LIMIT,
+        }
+
+        class DummyAgentModule:
+            @staticmethod
+            def load_agent_data(author):
+                return {constants.AGENT_LINEAGE_KEY: "system"}
+
+        class DummyStation:
+            station_id = "system-baseline-write-test"
+            agent_module = DummyAgentModule()
+
+            def sync_top_research_submission_config(self, submission):
+                pass
+
+        class TinyEvaluator(ResearchTaskEvaluator):
+            def evaluate_submission(self, result, eval_id: str = None, author: str = None):
+                return True, 1.0, {}
+
+            def get_expected_function_name(self):
+                return "solution_batch"
+
+            def get_task_description(self):
+                return "system storage write smoke test"
+
+        def dir_mode(path: Path) -> int:
+            return path.stat().st_mode & 0o777
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                constants.RESEARCH_EVAL_PYTHON_CONDA_ENV = "station"
+                constants.RESEARCH_SYSTEM_BASELINE_WRITABLE_TICK_LIMIT = 5
+                paths = ensure_runtime_layout(constants)
+                system_path = Path(paths.system_storage)
+
+                with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", None), \
+                     mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False):
+                    evaluator = AutoResearchEvaluator(DummyStation(), enabled=False)
+                evaluator.timeout = 10
+                code = (
+                    "from pathlib import Path\n"
+                    "def solution_batch():\n"
+                    "    Path('storage/system/generated.txt').write_text('ok', encoding='utf-8')\n"
+                    "    return {'ok': True}\n"
+                )
+                startup_entry = {
+                    constants.EVALUATION_ID_KEY: "baseline-startup",
+                    constants.EVALUATION_AUTHOR_KEY: "System",
+                    constants.EVALUATION_CONTENT_KEY: code,
+                    constants.EVALUATION_SUBMITTED_TICK_KEY: 0,
+                    "current_tick": 0,
+                    "system_baseline": True,
+                }
+
+                startup_result = evaluator._execute_submission(startup_entry, TinyEvaluator())
+
+                self.assertTrue(startup_result["success"], startup_result.get("logs") or startup_result.get("error"))
+                self.assertEqual(file_io_utils.load_text(str(system_path / "generated.txt")), "ok")
+                self.assertEqual(dir_mode(system_path), 0o555)
+
+                late_entry = dict(startup_entry)
+                late_entry[constants.EVALUATION_ID_KEY] = "baseline-late"
+                late_entry["current_tick"] = 6
+                late_entry[constants.EVALUATION_CONTENT_KEY] = (
+                    "from pathlib import Path\n"
+                    "def solution_batch():\n"
+                    "    Path('storage/system/late.txt').write_text('late', encoding='utf-8')\n"
+                    "    return {'ok': True}\n"
+                )
+
+                late_result = evaluator._execute_submission(late_entry, TinyEvaluator())
+
+                self.assertFalse(late_result["success"])
+                self.assertFalse((system_path / "late.txt").exists())
+                self.assertEqual(dir_mode(system_path), 0o555)
         finally:
             for key, value in original_values.items():
                 setattr(constants, key, value)
@@ -1040,6 +2141,80 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
             for key, value in original_values.items():
                 setattr(constants, key, value)
 
+    def test_runtime_layout_migrates_split_lineage_storage_and_suffixes_conflicts(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                canonical = Path(ensure_lineage_storage(paths, "axiom"))
+                alias = Path(paths.storage_real_root) / "axiom"
+
+                (canonical / "data" / "canonical_only.txt").write_text("canonical", encoding="utf-8")
+                (canonical / "data" / "identical.txt").write_text("same", encoding="utf-8")
+                (canonical / "data" / "conflict.txt").write_text("canonical version", encoding="utf-8")
+
+                alias.unlink()
+                (alias / "data" / "nested").mkdir(parents=True)
+                (alias / "data" / "legacy_only.txt").write_text("legacy", encoding="utf-8")
+                (alias / "data" / "nested" / "artifact.json").write_text("{}", encoding="utf-8")
+                (alias / "data" / "identical.txt").write_text("same", encoding="utf-8")
+                (alias / "data" / "conflict.txt").write_text("legacy version", encoding="utf-8")
+
+                ensure_runtime_layout(constants)
+
+                self.assertTrue(alias.is_symlink())
+                self.assertEqual(alias.resolve(), canonical.resolve())
+                self.assertEqual((canonical / "data" / "canonical_only.txt").read_text(), "canonical")
+                self.assertEqual((canonical / "data" / "legacy_only.txt").read_text(), "legacy")
+                self.assertEqual((canonical / "data" / "nested" / "artifact.json").read_text(), "{}")
+                self.assertEqual((canonical / "data" / "identical.txt").read_text(), "same")
+                self.assertEqual((canonical / "data" / "conflict.txt").read_text(), "legacy version")
+
+                self.assertEqual(
+                    (canonical / "data" / f"conflict.txt{LINEAGE_ALIAS_CONFLICT_SUFFIX}").read_text(),
+                    "canonical version",
+                )
+                self.assertEqual(
+                    (canonical / "data" / f"identical.txt{LINEAGE_ALIAS_CONFLICT_SUFFIX}").read_text(),
+                    "same",
+                )
+
+                ensure_runtime_layout(constants)
+
+                self.assertTrue(alias.is_symlink())
+                self.assertFalse(
+                    (canonical / "data" / f"conflict.txt{LINEAGE_ALIAS_CONFLICT_SUFFIX}.2").exists()
+                )
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
+    def test_ensure_lineage_storage_rejects_wrong_symlink_target(self):
+        original_values = {
+            "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
+            "RESEARCH_STORAGE_BASE_PATH": constants.RESEARCH_STORAGE_BASE_PATH,
+        }
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                data_root = Path(temp_dir) / "station_data"
+                constants.BASE_STATION_DATA_PATH = str(data_root)
+                constants.RESEARCH_STORAGE_BASE_PATH = None
+                paths = ensure_runtime_layout(constants)
+                alias = Path(paths.storage_real_root) / "axiom"
+                alias.symlink_to(Path("lineages") / "other")
+
+                with self.assertRaisesRegex(RuntimeError, "points to"):
+                    ensure_lineage_storage(paths, "axiom")
+        finally:
+            for key, value in original_values.items():
+                setattr(constants, key, value)
+
     def test_research_center_init_cleans_only_empty_invalid_lineage_dirs(self):
         original_values = {
             "BASE_STATION_DATA_PATH": constants.BASE_STATION_DATA_PATH,
@@ -1097,384 +2272,44 @@ class ResearchEvaluationArtifactTests(unittest.TestCase):
             self.assertEqual(compact["204"][constants.EVALUATION_TAGS_KEY], ["n50", "native-c"])
             self.assertEqual(manager.get_top_submission()["evaluation_id"], "204")
 
-    def test_migration_writes_artifacts_and_strips_inline_blobs(self):
-        original_data_path = constants.BASE_STATION_DATA_PATH
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                data_root = Path(temp_dir) / "station_data"
-                research_root = data_root / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_RESEARCH
-                eval_dir = research_root / constants.RESEARCH_EVALUATIONS_SUBDIR_NAME
-                file_io_utils.ensure_dir_exists(str(eval_dir))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "9",
-                        "author": "Aletheia I",
-                        "lineage": "aletheia",
-                        "title": "Old inline eval",
-                        "tags": ["old"],
-                        "abstract": "Old inline blobs.",
-                        "instruction": "Run.",
-                        "submitted_tick": 1,
-                        "status": "completed",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "status": "completed",
-                                "submission_path": "storage/submission/9.py",
-                                "submission_snapshot": "print('old')\n",
-                                "stdout": "old stdout\n",
-                                "stdout_visible": "old stdout\n",
-                                "stderr": "",
-                                "primary_score": 1.0,
-                            }
-                        ],
-                        "final": {
-                            "status": "completed",
-                            "attempt": 1,
-                            "primary_score": 1.0,
-                            constants.EVALUATION_DETAILS_KEY: {"Message": "ok"},
-                            "sort_key": None,
-                            "submission_snapshot": "print('old')\n",
-                            "stdout": "old stdout\n",
-                            "stdout_visible": "old stdout\n",
-                            "stderr": "",
-                            "coder_report": "old report\n",
-                        },
-                        "notification": {"sent": True},
-                    },
-                    str(eval_dir / "9.yaml"),
-                    sort_keys=False,
+    def test_breakthrough_summary_uses_persisted_progress_records(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._make_manager(root)
+            for eval_id, track, score, tick in [
+                ("201", "d3", 0.95, 10),
+                ("202", "d3", 0.90, 20),
+                ("203", "d4", 0.80, 30),
+            ]:
+                submission_path = self._create_eval_with_submission(manager, root, eval_id=eval_id)
+                manager.update_evaluation(eval_id, lambda data, tick=tick: data.update({"submitted_tick": tick}))
+                manager.register_attempt(eval_id, submission_path)
+                manager.complete_attempt(
+                    eval_id,
+                    1,
+                    True,
+                    score,
+                    "stdout\n",
+                    "",
+                    {"Message": "scored"},
+                    progress_records=[
+                        {
+                            "track": f"dimension:{track}",
+                            "rank_key": [-score],
+                            "value": score,
+                            "label": f"{track} density",
+                            "metadata": {"dimension": track},
+                        }
+                    ],
+                    status="completed",
                 )
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "10",
-                        "author": "Aletheia I",
-                        "lineage": "aletheia",
-                        "title": "Attempt only eval",
-                        "tags": ["old"],
-                        "abstract": "Old attempt blobs.",
-                        "instruction": "Run.",
-                        "submitted_tick": 1,
-                        "status": "running",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "status": "failed",
-                                "submission_path": "storage/submission/10.py",
-                                "submission_snapshot": "print('attempt old')\n",
-                                "stdout": "attempt stdout\n",
-                                "stdout_visible": "attempt stdout\n",
-                                "stderr": "attempt stderr\n",
-                                "primary_score": "N/A",
-                            }
-                        ],
-                        "notification": {"sent": False},
-                    },
-                    str(eval_dir / "10.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "11",
-                        "author": "Aletheia I",
-                        "lineage": "aletheia",
-                        "title": "Empty final code eval",
-                        "tags": ["old"],
-                        "abstract": "Final has no code snapshot.",
-                        "instruction": "Run.",
-                        "submitted_tick": 1,
-                        "status": "blocked",
-                        "artifacts": {"submission": "storage/submission/11.py"},
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "status": "failed",
-                                "submission_path": "storage/submission/11.py",
-                                "stdout": "attempt stdout\n",
-                                "stdout_visible": "attempt stdout\n",
-                                "stderr": "",
-                                "primary_score": "N/A",
-                            }
-                        ],
-                        "final": {
-                            "status": "blocked",
-                            "attempt": 1,
-                            "primary_score": "N/A",
-                            constants.EVALUATION_DETAILS_KEY: "",
-                            "sort_key": None,
-                            "submission_snapshot": "",
-                            "stdout": "attempt stdout\n",
-                            "stdout_visible": "attempt stdout\n",
-                            "stderr": "",
-                            "coder_report": "blocked report\n",
-                        },
-                        "notification": {"sent": True},
-                    },
-                    str(eval_dir / "11.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_text("print('artifact exists')\n", str(research_root / "storage" / "submission" / "11.py"))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "12",
-                        "author": "Aletheia I",
-                        "lineage": "aletheia",
-                        "title": "Empty final stderr eval",
-                        "tags": ["old"],
-                        "abstract": "Final stderr is empty after an earlier failed attempt.",
-                        "instruction": "Run.",
-                        "submitted_tick": 1,
-                        "status": "partial",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "status": "timeout",
-                                "submission_path": "storage/submission/12.py",
-                                "submission_snapshot": "print('old')\n",
-                                "stdout": "old stdout\n",
-                                "stdout_visible": "old stdout\n",
-                                "stderr": "stale timeout stderr\n",
-                                "primary_score": "N/A",
-                            }
-                        ],
-                        "final": {
-                            "status": "partial",
-                            "attempt": 2,
-                            "primary_score": 0.0,
-                            constants.EVALUATION_DETAILS_KEY: {"Message": "partial"},
-                            "sort_key": None,
-                            "submission_snapshot": "print('final')\n",
-                            "stdout": "final stdout\n",
-                            "stdout_visible": "final stdout\n",
-                            "stderr": "",
-                            "coder_report": "final report\n",
-                        },
-                        "notification": {"sent": True},
-                    },
-                    str(eval_dir / "12.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_text("", str(research_root / "storage" / "stderr" / "12.log"))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "13",
-                        "author": "Aletheia I",
-                        "lineage": "aletheia",
-                        "title": "Trailing newline stderr eval",
-                        "tags": ["old"],
-                        "abstract": "Existing artifact has one trailing newline.",
-                        "instruction": "Run.",
-                        "submitted_tick": 1,
-                        "status": "completed",
-                        "attempts": [],
-                        "final": {
-                            "status": "completed",
-                            "attempt": 1,
-                            "primary_score": 1.0,
-                            constants.EVALUATION_DETAILS_KEY: {"Message": "ok"},
-                            "sort_key": None,
-                            "submission_snapshot": "print('newline')\n",
-                            "stdout": "newline stdout\n",
-                            "stderr": "warning line",
-                            "coder_report": "newline report\n",
-                        },
-                        "notification": {"sent": True},
-                    },
-                    str(eval_dir / "13.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_text("warning line\n", str(research_root / "storage" / "stderr" / "13.log"))
+                manager.finalize_evaluation(eval_id, "report\n")
 
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(migrate(apply=True, data_root=str(data_root)), 0)
-                migrated = file_io_utils.load_yaml(str(eval_dir / "9.yaml"))
-                final = migrated["final"]
-                for blob_key in ("submission_snapshot", "stdout", "stdout_visible", "stderr", "coder_report"):
-                    self.assertNotIn(blob_key, migrated["attempts"][0])
-                    self.assertNotIn(blob_key, final)
-                self.assertEqual(migrated["artifacts"]["submission"], "storage/submission/9.py")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "submission" / "9.py")), "print('old')\n")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stdout" / "9.log")), "old stdout\n")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "report" / "9.md")), "old report\n")
-
-                attempt_only = file_io_utils.load_yaml(str(eval_dir / "10.yaml"))
-                for blob_key in ("submission_snapshot", "stdout", "stdout_visible", "stderr", "coder_report"):
-                    self.assertNotIn(blob_key, attempt_only["attempts"][0])
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "submission" / "10.py")), "print('attempt old')\n")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stdout" / "10.log")), "attempt stdout\n")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stderr" / "10.log")), "attempt stderr\n")
-
-                empty_code = file_io_utils.load_yaml(str(eval_dir / "11.yaml"))
-                self.assertNotIn("submission", empty_code["final"]["artifacts"])
-                self.assertEqual(get_evaluation_code_info("11", str(eval_dir))["status"], "pending")
-                self.assertEqual(get_evaluation_submission_payload("11", str(eval_dir))["code"], "Code not available")
-                self.assertIn("attempt stdout", get_evaluation_submission_payload("11", str(eval_dir))["logs"])
-
-                empty_final_stderr = file_io_utils.load_yaml(str(eval_dir / "12.yaml"))
-                self.assertEqual(empty_final_stderr["final"]["artifacts"]["stderr"], "storage/stderr/12.log")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stderr" / "12.log")), "")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stdout" / "12.log")), "final stdout\n")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "report" / "12.md")), "final report\n")
-
-                trailing_newline = file_io_utils.load_yaml(str(eval_dir / "13.yaml"))
-                self.assertEqual(trailing_newline["final"]["artifacts"]["stderr"], "storage/stderr/13.log")
-                self.assertEqual(file_io_utils.load_text(str(research_root / "storage" / "stderr" / "13.log")), "warning line\n")
-        finally:
-            constants.BASE_STATION_DATA_PATH = original_data_path
-
-    def test_migration_check_uses_sql_index_for_all_candidates(self):
-        original_data_path = constants.BASE_STATION_DATA_PATH
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                data_root = Path(temp_dir) / "station_data"
-                research_root = data_root / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_RESEARCH
-                eval_dir = research_root / constants.RESEARCH_EVALUATIONS_SUBDIR_NAME
-                file_io_utils.ensure_dir_exists(str(eval_dir))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "1",
-                        "author": "System",
-                        "title": "Already migrated",
-                        "status": "completed",
-                        "artifacts": {
-                            "submission": "storage/submission/1.py",
-                            "stdout": "storage/stdout/1.log",
-                            "stderr": "storage/stderr/1.log",
-                            "report": "storage/report/1.md",
-                        },
-                        "attempts": [],
-                    },
-                    str(eval_dir / "1.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "2",
-                        "author": "Aletheia I",
-                        "title": "Still legacy",
-                        "status": "completed",
-                        "attempts": [],
-                        "final": {
-                            "status": "completed",
-                            "attempt": 1,
-                            "submission_snapshot": "print('legacy')\n",
-                            "stdout": "legacy stdout\n",
-                            "stderr": "",
-                            "coder_report": "legacy report\n",
-                        },
-                    },
-                    str(eval_dir / "2.yaml"),
-                    sort_keys=False,
-                )
-
-                self.assertTrue(needs_migration(data_root=str(data_root)))
-                with mock.patch(
-                    "station.eval_research.evaluation_index._iter_evaluation_files",
-                    side_effect=AssertionError("unexpected evaluation YAML rescan"),
-                ):
-                    self.assertTrue(needs_migration(data_root=str(data_root)))
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(migrate(apply=True, data_root=str(data_root)), 0)
-                self.assertFalse(needs_migration(data_root=str(data_root)))
-        finally:
-            constants.BASE_STATION_DATA_PATH = original_data_path
-
-    def test_migration_script_preflights_before_apply(self):
-        original_data_path = constants.BASE_STATION_DATA_PATH
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                data_root = Path(temp_dir) / "station_data"
-                research_root = data_root / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_RESEARCH
-                eval_dir = research_root / constants.RESEARCH_EVALUATIONS_SUBDIR_NAME
-                script_path = Path(__file__).resolve().parents[1] / "scripts" / "migrate" / "migrate_research_eval_artifacts.py"
-                file_io_utils.ensure_dir_exists(str(eval_dir))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "15",
-                        "author": "Aletheia I",
-                        "title": "Preflight script migration",
-                        "status": "completed",
-                        "attempts": [],
-                        "final": {
-                            "status": "completed",
-                            "attempt": 1,
-                            "submission_snapshot": "print('preflight')\n",
-                            "stdout": "preflight stdout\n",
-                            "stderr": "",
-                            "coder_report": "preflight report\n",
-                        },
-                    },
-                    str(eval_dir / "15.yaml"),
-                    sort_keys=False,
-                )
-
-                result = subprocess.run(
-                    [sys.executable, str(script_path), "--data-root", str(data_root)],
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-
-                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-                self.assertLess(result.stdout.index("DRY-RUN:"), result.stdout.index("APPLY:"))
-                self.assertEqual(
-                    file_io_utils.load_text(str(research_root / "storage" / "submission" / "15.py")),
-                    "print('preflight')\n",
-                )
-        finally:
-            constants.BASE_STATION_DATA_PATH = original_data_path
-
-    def test_migration_preserves_existing_artifact_on_inline_mismatch(self):
-        original_data_path = constants.BASE_STATION_DATA_PATH
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                data_root = Path(temp_dir) / "station_data"
-                research_root = data_root / constants.ROOMS_DIR_NAME / constants.SHORT_ROOM_NAME_RESEARCH
-                eval_dir = research_root / constants.RESEARCH_EVALUATIONS_SUBDIR_NAME
-                artifact_path = research_root / "storage" / "submission" / "14.py"
-                file_io_utils.ensure_dir_exists(str(eval_dir))
-                file_io_utils.save_yaml(
-                    {
-                        "schema_version": 2,
-                        "id": "14",
-                        "author": "Aletheia I",
-                        "title": "Mismatched artifact",
-                        "status": "completed",
-                        "attempts": [],
-                        "final": {
-                            "status": "completed",
-                            "attempt": 1,
-                            "submission_snapshot": "print('inline')\n",
-                            "stdout": "final stdout\n",
-                            "stderr": "",
-                            "coder_report": "final report\n",
-                        },
-                    },
-                    str(eval_dir / "14.yaml"),
-                    sort_keys=False,
-                )
-                file_io_utils.save_text("print('artifact')\n", str(artifact_path))
-
-                output = io.StringIO()
-                with contextlib.redirect_stdout(output):
-                    self.assertEqual(migrate(apply=True, data_root=str(data_root)), 0)
-
-                migrated = file_io_utils.load_yaml(str(eval_dir / "14.yaml"))
-                self.assertNotIn("submission_snapshot", migrated["final"])
-                self.assertEqual(migrated["final"]["artifacts"]["submission"], "storage/submission/14.py")
-                self.assertEqual(file_io_utils.load_text(str(artifact_path)), "print('artifact')\n")
-                self.assertIn("artifacts_existing_with_inline_mismatch=1", output.getvalue())
-        finally:
-            constants.BASE_STATION_DATA_PATH = original_data_path
+            summary = manager.get_latest_breakthrough_summary()
+            self.assertIn("global", summary["frontiers"])
+            self.assertEqual(summary["frontiers"]["dimension:d3"]["evaluation_id"], "202")
+            self.assertEqual(summary["frontiers"]["dimension:d3"]["value"], 0.90)
+            self.assertEqual(summary["frontiers"]["dimension:d4"]["evaluation_id"], "203")
+            self.assertEqual(summary["last_breakthrough_tick"], 30)
 
 
 if __name__ == "__main__":

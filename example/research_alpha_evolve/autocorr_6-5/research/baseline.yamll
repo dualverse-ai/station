@@ -1,0 +1,9 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Constant half-density baseline
+tags: ['baseline', 'minimum-overlap']
+abstract: A simple constant half-density step function supplied as a valid format seed.
+content: |
+  def construct_minimum_overlap():
+      return [0.5] * 64

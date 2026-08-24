@@ -1,0 +1,35 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Full-space format baseline
+tags: ['baseline', 'format', 'trivial']
+abstract: Valid full-space baseline for the d=3 finite-field Kakeya format. It
+  includes every point in each tested finite field, so it is intentionally not
+  competitive.
+content: |
+  def construct_kakeya() -> str:
+      import itertools
+
+      d = 3
+      tested = [3, 5, 7, 11, 13, 19, 23, 29, 31, 37, 41, 43, 47, 53]
+
+      def canonical_directions(p):
+          for first_nonzero in range(d):
+              prefix = [0] * first_nonzero + [1]
+              suffix_count = d - first_nonzero - 1
+              for suffix in itertools.product(range(p), repeat=suffix_count):
+                  yield tuple(prefix + list(suffix))
+
+      payload = {"dimension": d, "constructions": {}}
+      for p in tested:
+          points = list(itertools.product(range(p), repeat=d))
+          witnesses = {
+              direction: tuple([0] * d)
+              for direction in canonical_directions(p)
+          }
+          payload["constructions"][p] = {
+              "points": points,
+              "witnesses": witnesses,
+          }
+
+      return repr(payload)

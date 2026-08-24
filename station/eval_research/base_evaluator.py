@@ -18,8 +18,21 @@ Abstract base class for research task evaluators.
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple, Union, Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Tuple, Union, Optional, Dict, Any, List
 import numpy as np
+
+
+@dataclass
+class SeedBatchEvaluation:
+    """Task-owned per-candidate evaluation for an optional Research Seed Bank."""
+
+    seeds: List[Any]
+    scores: np.ndarray
+    valid: np.ndarray
+    sort_keys: List[tuple]
+    details: List[Any]
+    errors: List[Optional[str]]
 
 
 class ResearchTaskEvaluator(ABC):
@@ -101,6 +114,61 @@ class ResearchTaskEvaluator(ABC):
         - None for no special formatting (uses str())
         """
         return None
+
+    def evaluate_seed_batch(
+        self,
+        result,
+        eval_id: str = None,
+        author: str = None,
+    ) -> SeedBatchEvaluation:
+        """Evaluate and canonicalize every member of a seed-enabled submission.
+
+        Seed-enabled task templates must override this method. The coder returns
+        solutions only; the task evaluator computes all candidate metadata.
+        """
+        raise NotImplementedError(
+            "This task enabled RESEARCH_SEED_BANK_ENABLED but its evaluator does "
+            "not implement evaluate_seed_batch()."
+        )
+
+    def evaluate_seed_batch_with_formatting(
+        self,
+        result,
+        eval_id: str = None,
+        author: str = None,
+    ) -> SeedBatchEvaluation:
+        batch = self.evaluate_seed_batch(result, eval_id, author)
+        if not isinstance(batch, SeedBatchEvaluation):
+            raise TypeError("evaluate_seed_batch() must return SeedBatchEvaluation")
+        return SeedBatchEvaluation(
+            seeds=list(batch.seeds),
+            scores=np.asarray(batch.scores),
+            valid=np.asarray(batch.valid, dtype=bool),
+            sort_keys=[tuple(key) for key in batch.sort_keys],
+            details=[self._format_secondary_metrics(item) for item in batch.details],
+            errors=list(batch.errors),
+        )
+
+    def get_progress_records(
+        self,
+        *,
+        result: Any,
+        success: bool,
+        score: Any,
+        details: Any,
+        sort_key: Any,
+        eval_id: str = None,
+        author: str = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Optionally expose task-defined breakthrough tracks.
+
+        Each returned record should contain a stable ``track`` and a ``rank_key``
+        where larger is better, matching the normal sort_key convention. The
+        Research Center persists normalized records under final.progress_records.
+        Existing tasks can ignore this hook.
+        """
+        return []
     
     def _format_secondary_metrics(self, raw_details: Union[str, Dict[str, Any]]) -> Union[str, Dict[str, Tuple[str, Any]]]:
         """

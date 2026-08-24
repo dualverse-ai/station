@@ -1,6 +1,6 @@
-"""Parallel tick runner.
+"""Concurrent tick runner.
 
-Parallel mode has two phases:
+Each tick has two phases:
 
 1. Prepare every agent observation before any agent action is committed.
 2. Send all initial observations to LLM providers concurrently. Supported
@@ -76,10 +76,10 @@ class ParallelTickRunner:
 
         current_tick = self.station._get_current_tick()
         self.orchestrator.current_agent_index_in_turn_order = 0
-        tick_timing.record_tick_start(current_tick, constants.SYNC_MODE_PARALLEL)
+        tick_timing.record_tick_start(current_tick)
         self.orchestrator._push_log_event(
             "tick_event",
-            {"type": "prepare", "tick": current_tick, "sync_mode": constants.SYNC_MODE_PARALLEL},
+            {"type": "prepare", "tick": current_tick},
         )
 
         self._cleanup_stale_parallel_state()
@@ -117,7 +117,6 @@ class ParallelTickRunner:
             tick_timing.record_tick_end(
                 current_tick,
                 new_tick_after_empty,
-                constants.SYNC_MODE_PARALLEL,
                 metadata={"empty_turn_order": True},
             )
             self.orchestrator._push_log_event(
@@ -142,7 +141,6 @@ class ParallelTickRunner:
                 "tick": current_tick,
                 "turn_order": turn_order,
                 "start_index": 0,
-                "sync_mode": constants.SYNC_MODE_PARALLEL,
             },
         )
 
@@ -151,7 +149,6 @@ class ParallelTickRunner:
         with tick_timing.time_phase(
             current_tick,
             "prepare_all_station_responses",
-            constants.SYNC_MODE_PARALLEL,
             metadata={"agent_count": len(turn_order)},
         ):
             prepared_turns, all_success, life_limit_handlers = self._prepare_observations(current_tick, turn_order, state)
@@ -170,7 +167,6 @@ class ParallelTickRunner:
             with tick_timing.time_phase(
                 current_tick,
                 "wait_agent_responses_parallel",
-                constants.SYNC_MODE_PARALLEL,
                 metadata={"agent_count": len(prepared_turns)},
             ):
                 initial_results = self._collect_initial_llm_responses(current_tick, prepared_turns, state)
@@ -185,7 +181,6 @@ class ParallelTickRunner:
             with tick_timing.time_phase(
                 current_tick,
                 "commit_initial_responses",
-                constants.SYNC_MODE_PARALLEL,
                 metadata={"agent_count": len(prepared_turns)},
             ):
                 for turn in prepared_turns:
@@ -196,8 +191,8 @@ class ParallelTickRunner:
                         all_success = False
                         continue
 
-                    # Match sequential semantics: connector history is persisted by
-                    # send_message before Station mutates agent state. This matters for
+                    # Connector history is persisted before Station mutates agent
+                    # state. This matters for
                     # actions such as ascension, where the agent module moves the
                     # current identity's history file to the new recursive identity.
                     if result.staged_turn:
@@ -228,7 +223,6 @@ class ParallelTickRunner:
                     with tick_timing.time_phase(
                         current_tick,
                         "commit_agent_response",
-                        constants.SYNC_MODE_PARALLEL,
                         metadata={"agent_name": turn.agent_name},
                     ):
                         handler_wrapper, actions_summary, submit_error = self.station.submit_response(
@@ -270,12 +264,26 @@ class ParallelTickRunner:
             with tick_timing.time_phase(
                 current_tick,
                 "internal_actions_parallel",
-                constants.SYNC_MODE_PARALLEL,
                 metadata={"agent_count": len(internal_handlers)},
             ):
                 internal_token_info = self._run_internal_handlers_parallel(current_tick, internal_handlers, state)
             for agent_name, token_info in internal_token_info.items():
                 self._update_token_budget_from_info(agent_name, token_info, current_tick)
+
+        compaction_agents: List[str] = []
+        for turn in prepared_turns:
+            if turn.agent_name not in compaction_agents:
+                compaction_agents.append(turn.agent_name)
+        for agent_name, _handler, _prompt in internal_handlers:
+            if agent_name not in compaction_agents:
+                compaction_agents.append(agent_name)
+        maybe_compact = getattr(self.orchestrator, "maybe_run_context_compaction_after_turn", None)
+        for agent_name in compaction_agents:
+            if callable(maybe_compact):
+                maybe_compact(agent_name, current_tick)
+            if self.orchestrator.is_paused:
+                self.station.save_next_agent_index_to_config(0)
+                return True
 
         if self.orchestrator.is_paused:
             self.station.save_next_agent_index_to_config(0)
@@ -288,7 +296,7 @@ class ParallelTickRunner:
         if not all_success:
             self.orchestrator._push_log_event(
                 "tick_event",
-                {"type": "completed_with_agent_errors", "tick": current_tick, "sync_mode": constants.SYNC_MODE_PARALLEL},
+                {"type": "completed_with_agent_errors", "tick": current_tick},
             )
 
         finished = self._finish_tick_boundary(current_tick)
@@ -367,7 +375,6 @@ class ParallelTickRunner:
             with tick_timing.time_phase(
                 current_tick,
                 "prepare_station_response",
-                constants.SYNC_MODE_PARALLEL,
                 metadata={"agent_name": agent_name},
             ):
                 connector = self.orchestrator.agent_llm_connectors.get(agent_name)
@@ -444,7 +451,6 @@ class ParallelTickRunner:
         with tick_timing.time_phase(
             current_tick,
             "wait_agent_response",
-            constants.SYNC_MODE_PARALLEL,
             metadata={"agent_name": turn.agent_name},
         ):
             response_text, can_continue, staged_turn, token_info = self._send_llm_staged(
@@ -492,16 +498,9 @@ class ParallelTickRunner:
         connector: Any = None,
         persist_to_disk: bool = False,
     ) -> Tuple[Optional[str], bool, Optional[StagedLLMTurn], Optional[Dict[str, Any]]]:
-        connector = connector or self.orchestrator.agent_llm_connectors.get(agent_name)
+        connector = connector or self.orchestrator._get_current_connector_for_agent(agent_name)
         if not connector:
-            err_msg = f"SYSTEM_ERROR: No LLM connector for {agent_name}."
-            self.orchestrator._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error": err_msg})
-            self.station._log_dialogue_entry(agent_name, {
-                "tick": current_tick,
-                "speaker": "Station",
-                "type": "llm_connector_error",
-                "error": err_msg,
-            })
+            self.orchestrator._pause_for_unavailable_connector(agent_name, current_tick)
             return None, False, None, None
 
         # Stream prompt text; web_interface sanitizes it to the selected dashboard agent.
@@ -748,6 +747,18 @@ class ParallelTickRunner:
                             agent_name=turn.agent_name,
                             op_id=op_id,
                         )
+                if result.accepted:
+                    try:
+                        from station.rooms.research_center import ResearchCenter
+
+                        cooldown_ticks = ResearchCenter._get_submission_cooldown_ticks(
+                            simulated_agent_data,
+                            constants,
+                        )
+                    except Exception:
+                        cooldown_ticks = 0
+                    if cooldown_ticks > 0:
+                        simulated_agent_data[constants.AGENT_LAST_RESEARCH_SUBMISSION_TICK_KEY] = current_tick
                 continue
 
             if (
@@ -823,8 +834,6 @@ class ParallelTickRunner:
         ):
             return current_location
         if target_room_full_name == constants.ROOM_RESEARCH_CENTER and self.station.is_holiday_tick(current_tick):
-            return current_location
-        if target_room_full_name == constants.ROOM_TOKEN_MANAGEMENT:
             return current_location
         return target_room_full_name
 
@@ -969,7 +978,6 @@ class ParallelTickRunner:
                 with tick_timing.time_phase(
                     current_tick,
                     "wait_internal_agent_response",
-                    constants.SYNC_MODE_PARALLEL,
                     metadata={"agent_name": agent_name, "internal_loop_step": loop_step_count},
                 ):
                     response_text, can_continue, staged_turn, token_info = self._send_llm_staged(
@@ -986,8 +994,7 @@ class ParallelTickRunner:
                     break
 
                 # Persist the internal LLM turn before handler.step mutates any
-                # room/agent state. This preserves the same ordering as
-                # sequential connector.send_message -> handler.step.
+                # room/agent state, preserving the required history-before-mutation ordering.
                 if staged_turn and not override_active:
                     staged_turns_to_flush.append(staged_turn)
                     self._append_staged_turns(agent_name, staged_turns_to_flush, current_tick)
@@ -997,7 +1004,6 @@ class ParallelTickRunner:
                     with tick_timing.time_phase(
                         current_tick,
                         "commit_internal_action_step",
-                        constants.SYNC_MODE_PARALLEL,
                         metadata={"agent_name": agent_name, "internal_loop_step": loop_step_count},
                     ):
                         next_prompt, executed_strings = handler_wrapper.step(response_text)
@@ -1150,7 +1156,6 @@ class ParallelTickRunner:
         tick_timing.record_tick_end(
             current_tick,
             new_station_tick,
-            constants.SYNC_MODE_PARALLEL,
             metadata={"auto_paused": self.orchestrator.is_paused},
         )
         self.orchestrator._push_log_event(
@@ -1170,6 +1175,9 @@ class ParallelTickRunner:
                 },
             )
 
+        if self.orchestrator.maybe_pause_after_configured_tick_end(current_tick):
+            return True
+
         self.station.check_stagnation()
         return True
 
@@ -1188,7 +1196,6 @@ class ParallelTickRunner:
                 with tick_timing.time_phase(
                     current_tick,
                     "wait_research_tick_boundary",
-                    constants.SYNC_MODE_PARALLEL,
                 ):
                     while self.station.should_wait_for_research_evaluations_at_tick_boundary() and self.orchestrator.is_running:
                         time.sleep(1)
@@ -1219,7 +1226,6 @@ class ParallelTickRunner:
                 with tick_timing.time_phase(
                     current_tick,
                     "wait_external_tick_boundary",
-                    constants.SYNC_MODE_PARALLEL,
                 ):
                     while self.station.should_wait_for_external_reports_at_tick_boundary() and self.orchestrator.is_running:
                         time.sleep(1)
@@ -1233,37 +1239,6 @@ class ParallelTickRunner:
                         "status": "external_wait_resolved",
                         "tick": current_tick,
                         "message": "External reports at tick boundary have completed",
-                    },
-                )
-
-        if hasattr(self.station, "should_wait_for_theory_evaluations_at_tick_boundary"):
-            if self.station.should_wait_for_theory_evaluations_at_tick_boundary():
-                self.orchestrator._enter_waiting_state({"theory_tick_boundary": "Theory evaluations at tick limit"})
-                self.orchestrator._push_log_event(
-                    "orchestrator_status",
-                    {
-                        "status": "waiting_for_theory_at_tick_boundary",
-                        "tick": current_tick,
-                        "message": "Waiting for theory evaluations that have reached their tick limit",
-                    },
-                )
-                with tick_timing.time_phase(
-                    current_tick,
-                    "wait_theory_tick_boundary",
-                    constants.SYNC_MODE_PARALLEL,
-                ):
-                    while self.station.should_wait_for_theory_evaluations_at_tick_boundary() and self.orchestrator.is_running:
-                        time.sleep(1)
-                        if not self.orchestrator.is_waiting:
-                            self.orchestrator._enter_waiting_state({"theory_tick_boundary": "Theory evaluations at tick limit"})
-                if self.orchestrator.is_waiting:
-                    self.orchestrator._exit_waiting_state()
-                self.orchestrator._push_log_event(
-                    "orchestrator_status",
-                    {
-                        "status": "theory_wait_resolved",
-                        "tick": current_tick,
-                        "message": "Theory evaluations at tick boundary have completed",
                     },
                 )
 
@@ -1281,7 +1256,6 @@ class ParallelTickRunner:
                 with tick_timing.time_phase(
                     current_tick,
                     "wait_archive_survey_tick_boundary",
-                    constants.SYNC_MODE_PARALLEL,
                 ):
                     while self.station.should_wait_for_archive_surveys_at_tick_boundary() and self.orchestrator.is_running:
                         time.sleep(1)

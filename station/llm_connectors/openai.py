@@ -41,7 +41,8 @@ from .base import (
 
 class OpenAIConnector(BaseLLMConnector):
     DEFAULT_REASONING_EFFORT = "xhigh"
-    SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+    GPT_5_6_DEFAULT_REASONING_EFFORT = "max"
+    SUPPORTED_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
     def __init__(self,
                  model_name: str,
@@ -61,6 +62,7 @@ class OpenAIConnector(BaseLLMConnector):
         self.tiktoken_encoder = None
 
         # Store custom API params and extract OpenAI-specific parameters
+        self.model_name = model_name
         self.custom_api_params = custom_api_params or {}
         self.verbosity = self.custom_api_params.get('verbosity')
         self.prompt_cache_retention = self.custom_api_params.get('prompt_cache_retention', '24h')
@@ -181,6 +183,12 @@ class OpenAIConnector(BaseLLMConnector):
     def _should_use_streaming_on_attempt(self, attempt_number: int) -> bool:
         """Use streaming for retries, explicit force-streaming, or when an HTTP proxy is configured."""
         return attempt_number > 0 or constants.OPENAI_FORCE_STREAMING or self._active_http_proxy_configured()
+
+    def _should_use_responses_streaming_on_attempt(self, attempt_number: int) -> bool:
+        """Try Responses API streaming first, then non-streaming on the retry."""
+        if constants.OPENAI_FORCE_STREAMING:
+            return True
+        return attempt_number % 2 == 0
 
     def _refresh_runtime_config_before_internal_fallback(self, reason: str) -> None:
         try:
@@ -531,16 +539,23 @@ class OpenAIConnector(BaseLLMConnector):
         if raw_effort is None:
             raw_effort = self.custom_api_params.get("reasoning_effort")
         if raw_effort is None:
-            return self.DEFAULT_REASONING_EFFORT
+            return self._default_reasoning_effort_for_model()
 
         normalized_effort = str(raw_effort).strip().lower()
         if normalized_effort in self.SUPPORTED_REASONING_EFFORTS:
             return normalized_effort
 
+        default_effort = self._default_reasoning_effort_for_model()
         print(
             f"Warning ({self.agent_name}): Unsupported OpenAI reasoning effort "
-            f"'{raw_effort}'. Falling back to '{self.DEFAULT_REASONING_EFFORT}'."
+            f"'{raw_effort}'. Falling back to '{default_effort}'."
         )
+        return default_effort
+
+    def _default_reasoning_effort_for_model(self) -> str:
+        model_name = str(getattr(self, "model_name", "") or "").strip().lower()
+        if model_name.startswith("gpt-5.6-"):
+            return self.GPT_5_6_DEFAULT_REASONING_EFFORT
         return self.DEFAULT_REASONING_EFFORT
 
     def _build_reasoning_config(self) -> Dict[str, str]:
@@ -627,15 +642,22 @@ class OpenAIConnector(BaseLLMConnector):
         force_non_stream: bool = False,
     ) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
         """Handle reasoning models using the Responses API."""
-        # Use streaming for retries, explicit force-streaming, or when an HTTP proxy is configured.
-        if not force_non_stream and self._should_use_streaming_on_attempt(attempt_number):
-            if attempt_number > 0:
-                print(f"Info ({self.agent_name}): Using streaming for retry attempt {attempt_number} to avoid timeout issues")
-            elif self._active_http_proxy_configured():
-                print(f"Info ({self.agent_name}): Using streaming mode on first attempt because an HTTP proxy is configured")
-            else:
+        use_streaming = (
+            not force_non_stream
+            and self._should_use_responses_streaming_on_attempt(attempt_number)
+        )
+        non_stream_fallback = force_non_stream or not use_streaming
+        if use_streaming:
+            if constants.OPENAI_FORCE_STREAMING:
                 print(f"Info ({self.agent_name}): Using streaming mode (forced via OPENAI_FORCE_STREAMING)")
+            elif attempt_number == 0:
+                print(f"Info ({self.agent_name}): Using streaming mode by default for Responses API")
+            else:
+                print(f"Info ({self.agent_name}): Using streaming mode for Responses API retry attempt {attempt_number}")
             return self._send_message_with_responses_api_stream(user_prompt, current_tick, token_info, attempt_number=attempt_number)
+
+        if not force_non_stream:
+            print(f"Info ({self.agent_name}): Using non-streaming Responses API fallback on retry attempt {attempt_number}")
         
         try:
             # Build input for Responses API
@@ -674,9 +696,7 @@ class OpenAIConnector(BaseLLMConnector):
                 user_prompt,
                 current_tick,
                 attempt_number,
-                mode="non_stream" if force_non_stream else (
-                    "stream" if self._should_use_streaming_on_attempt(attempt_number) else "non_stream"
-                ),
+                mode="non_stream",
                 api_family="responses",
                 payload=api_params,
             )
@@ -843,7 +863,7 @@ class OpenAIConnector(BaseLLMConnector):
                 f"Warning ({self.agent_name}): Responses API failed for reasoning model '{self.model_name}': "
                 f"{err_type} {e} | repr={err_repr} | request_id={err_request_id} | body={err_body}"
             )
-            if force_non_stream or self._should_defer_responses_error_to_outer_retry(e):
+            if non_stream_fallback or self._should_defer_responses_error_to_outer_retry(e):
                 self._raise_responses_api_error(e, "non-streaming")
             if self._is_reasoning_model(self.model_name):
                 self._refresh_runtime_config_before_internal_fallback("responses_non_stream_failed")

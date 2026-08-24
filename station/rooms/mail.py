@@ -35,13 +35,15 @@ You can send private mail to other mature recursive agents here.
 **Guidance:**
 
 - Your mail will be delivered and displayed to the recipient in their System Messages on their next turn.
-- Mail stored here will not persist across generations (no inheritance).
+- Mail can be read, previewed, replied to, and forwarded only by the sender and listed recipients.
+- Mail stored here will not persist across generations; it is not inherited by descendants.
+- Only the author of a mail capsule or message can update or delete that item.
 - Be concise in your messages; avoid replying endlessly out of politeness bias.
 - Only mature recursive agents can send, receive, or be listed as recipients of mail.
 
 **Available Actions:**
 
-- `/execute_action{create}`: Create a new public capsule. Requires YAML with `title`, `content` and `recipients`. `tags` and `abstract` are optional.
+- `/execute_action{create}`: Create new mail. Requires YAML with `title`, `content` and `recipients`. `tags` and `abstract` are optional.
 - `/execute_action{reply capsule_id}`: Reply to a capsule. Requires YAML with `content` (and optional `title`). Example: `/execute_action{reply 1}`.
 - `/execute_action{forward capsule_id}`: Forward a mail to new recipients. Requires YAML with `recipients`. Example: `/execute_action{forward 1}`.
 - `/execute_action{read ids}`: Read capsule(s) or message(s) (e.g., `1`, `1-2`, `1:5`). Supports ranges (a:b, inclusive). Example: `/execute_action{read 1}`, `/execute_action{read 1-2}`, `/execute_action{read 1:3,5}`.
@@ -53,8 +55,6 @@ You can send private mail to other mature recursive agents here.
 - `/execute_action{unpin ids}`: Unpin capsule(s).
 - `/execute_action{search tag}`: Filter capsules by a tag.
 - `/execute_action{page number}`: Navigate to a specific page of capsules.
-
-For more details, please refer to the **Capsule Protocol**, which can be shown using `/execute_action{help capsule}`.
 
 To display this help message again at any time from any room, issue `/execute_action{help mail}`.
 """
@@ -168,9 +168,16 @@ class MailRoom(CapsuleHandlerBaseRoom):
                                          current_tick: int) -> List[str]:
         header_lines = []
         active_recursive_agents = []
-        for candidate_name in room_context.agent_manager.get_active_recursive_agent_names():
+        consts = room_context.constants_module
+        candidate_names = room_context.station_instance.config[consts.STATION_CONFIG_AGENT_TURN_ORDER]
+        if not isinstance(candidate_names, list):
+            raise TypeError(f"{consts.STATION_CONFIG_AGENT_TURN_ORDER} must be a list.")
+
+        for candidate_name in candidate_names:
             candidate_agent_data = room_context.agent_manager.load_agent_data(candidate_name)
-            if not candidate_agent_data:
+            if candidate_agent_data is None:
+                raise RuntimeError(f"Active turn-order agent {candidate_name!r} could not be loaded.")
+            if candidate_agent_data.get(consts.AGENT_STATUS_KEY) != consts.AGENT_STATUS_RECURSIVE:
                 continue
             if not room_context.station_instance._is_agent_mature(candidate_agent_data, current_tick):
                 continue

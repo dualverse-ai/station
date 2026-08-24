@@ -35,6 +35,8 @@ from collections import defaultdict
 
 from station import constants
 from station import file_io_utils
+from station.eval_archive import evaluation_index as archive_evaluation_index
+from station.eval_research import breakthroughs as research_breakthroughs
 from station.eval_research.evaluation_manager import EvaluationManager
 
 
@@ -77,23 +79,19 @@ class LineageEvolutionManager:
         
         # Build set of excluded ancestors
         excluded_ancestors = set()
-        
-        # Get all agent files
-        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
-        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
-        
-        # Add already succeeded agents
-        for agent_file_name in agent_files:
-            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
-            agent_data = self.agent_module.load_agent_data(agent_name, include_ascended=True, include_ended=True)
-            if agent_data and agent_data.get(constants.AGENT_IS_ASCENDED_KEY):
+
+        agent_records = self._load_agent_records()
+
+        for agent_name, agent_data in agent_records:
+            if agent_data.get(constants.AGENT_IS_ASCENDED_KEY):
                 excluded_ancestors.add(agent_name)
-        
-        # Add already assigned ancestors (but not for current guest)
-        for agent_file_name in agent_files:
-            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
-            agent_data = self.agent_module.load_agent_data(agent_name)
-            if agent_data and agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST:
+
+            # Add already assigned ancestors (but not for current guest)
+            if (
+                not agent_data.get(constants.AGENT_SESSION_ENDED_KEY)
+                and not agent_data.get(constants.AGENT_IS_ASCENDED_KEY)
+                and agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST
+            ):
                 ancestor = agent_data.get(constants.AGENT_POTENTIAL_ANCESTOR_NAME_KEY)
                 if ancestor and agent_name != guest_name:
                     excluded_ancestors.add(ancestor)
@@ -119,18 +117,11 @@ class LineageEvolutionManager:
         """
         inheritable = []
         
-        # Get all agent files
-        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
-        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
-        
-        for agent_file_name in agent_files:
-            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
-            # Load with include_ended=True, but not include_ascended (we don't inherit from guests)
-            agent_data = self.agent_module.load_agent_data(agent_name, include_ascended=False, include_ended=True)
-            
+        for agent_name, agent_data in self._load_agent_records():
             if (agent_data and 
                 agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE and
                 agent_data.get(constants.AGENT_SESSION_ENDED_KEY) and
+                not agent_data.get(constants.AGENT_IS_ASCENDED_KEY) and
                 (bypass_model_check or agent_data.get(constants.AGENT_MODEL_NAME_KEY) == guest_model_name) and
                 not agent_data.get(constants.AGENT_SUCCEEDED_BY_KEY) and
                 agent_name not in excluded_ancestors):
@@ -171,6 +162,7 @@ class LineageEvolutionManager:
         self._breakthrough_data = None
         self._paper_data = None
         self._lifespan_data = None
+        self._agent_records = None
     
     def _clear_cache(self):
         """Clear all cached data."""
@@ -179,6 +171,32 @@ class LineageEvolutionManager:
         self._breakthrough_data = None
         self._paper_data = None
         self._lifespan_data = None
+        self._agent_records = None
+
+    def _load_agent_records(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Load all agent records once for one selection pass."""
+        if self._agent_records is not None:
+            return self._agent_records
+
+        records: List[Tuple[str, Dict[str, Any]]] = []
+        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
+        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
+
+        for agent_file_name in agent_files:
+            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
+            try:
+                agent_data = self.agent_module.load_agent_data(
+                    agent_name,
+                    include_ascended=True,
+                    include_ended=True,
+                )
+            except TypeError:
+                agent_data = self.agent_module.load_agent_data(agent_name)
+            if isinstance(agent_data, dict):
+                records.append((agent_name, agent_data))
+
+        self._agent_records = records
+        return records
     
     def _load_all_data(self):
         """Load all evaluation data once for efficiency."""
@@ -199,67 +217,15 @@ class LineageEvolutionManager:
     def _load_all_breakthroughs(self) -> Dict[str, int]:
         """Load and compute all breakthrough data at once."""
         lineage_breakthroughs = defaultdict(int)
-        all_evaluations = self._collect_scored_evaluations()
-        
-        # Sort by evaluation ID
-        all_evaluations.sort(key=lambda x: x[0])
-        
-        # Track breakthroughs using sort_keys when available
-        current_sota_key = None
-        for eval_data in all_evaluations:
-            eval_id, author_lineage, score = eval_data[:3]
-            sort_key = eval_data[3] if len(eval_data) > 3 else None
-            
-            # Use sort_key if available, otherwise fall back to score
-            if sort_key is not None:
-                comparison_key = tuple(sort_key) if isinstance(sort_key, (list, tuple)) else (sort_key,)
-            else:
-                comparison_key = (score,)
-            
-            # Check if this is a new SOTA
-            if current_sota_key is None or comparison_key > current_sota_key:
-                lineage_breakthroughs[author_lineage] += 1
-                current_sota_key = comparison_key
-                
+        for event in research_breakthroughs.get_breakthrough_events(self.eval_manager.evaluations_dir):
+            lineage = self._extract_lineage_from_agent_name(event.agent_name) or str(event.lineage or "").strip()
+            if lineage:
+                lineage_breakthroughs[lineage] += 1
         return dict(lineage_breakthroughs)
     
     def _load_all_papers(self) -> Dict[str, int]:
         """Load and compute all high-quality paper counts at once."""
-        lineage_papers = defaultdict(int)
-        
-        if os.path.exists(self.archive_evaluations_dir):
-            for filename in os.listdir(self.archive_evaluations_dir):
-                if filename.endswith('.yaml'):
-                    try:
-                        filepath = os.path.join(self.archive_evaluations_dir, filename)
-                        eval_data = file_io_utils.load_yaml(filepath)
-                        
-                        if not eval_data or eval_data.get('result') != 'accepted':
-                            continue
-                        
-                        # Extract score
-                        extracted_result = eval_data.get('extracted_result', {})
-                        score = extracted_result.get('score')
-                        if score is None:
-                            continue
-                        
-                        try:
-                            score = float(score)
-                        except (TypeError, ValueError):
-                            continue
-                        
-                        # Check if high quality
-                        if score >= 8.0:
-                            author = eval_data.get('agent_name', '')
-                            if author:
-                                author_lineage = self._extract_lineage_from_agent_name(author)
-                                if author_lineage:
-                                    lineage_papers[author_lineage] += 1
-                    
-                    except Exception:
-                        continue
-                        
-        return dict(lineage_papers)
+        return archive_evaluation_index.count_high_quality_papers_by_lineage(score_threshold=8.0)
     
     def _load_all_lifespans(self) -> Dict[str, float]:
         """Load and compute all lineage lifespans at once."""
@@ -273,27 +239,21 @@ class LineageEvolutionManager:
         except Exception:
             current_tick = 0
         
-        # Get all agent files
-        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
-        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
-        
-        for agent_file_name in agent_files:
-            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
-            agent_data = self.agent_module.load_agent_data(agent_name, include_ascended=False, include_ended=True)
-            
-            if agent_data:
-                lineage = agent_data.get(constants.AGENT_LINEAGE_KEY)
-                if lineage and agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE:
-                    tick_ascend = agent_data.get(constants.AGENT_TICK_ASCEND_KEY)
-                    tick_exit = agent_data.get(constants.AGENT_TICK_EXIT_KEY)
+        for _, agent_data in self._load_agent_records():
+            if agent_data.get(constants.AGENT_IS_ASCENDED_KEY):
+                continue
+            lineage = agent_data.get(constants.AGENT_LINEAGE_KEY)
+            if lineage and agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE:
+                tick_ascend = agent_data.get(constants.AGENT_TICK_ASCEND_KEY)
+                tick_exit = agent_data.get(constants.AGENT_TICK_EXIT_KEY)
+                
+                if tick_ascend is not None:
+                    if tick_exit is not None:
+                        lifespan = tick_exit - tick_ascend
+                    else:
+                        lifespan = current_tick - tick_ascend
                     
-                    if tick_ascend is not None:
-                        if tick_exit is not None:
-                            lifespan = tick_exit - tick_ascend
-                        else:
-                            lifespan = current_tick - tick_ascend
-                        
-                        lineage_lifespans[lineage] += lifespan
+                    lineage_lifespans[lineage] += lifespan
                         
         return dict(lineage_lifespans)
     
@@ -356,45 +316,27 @@ class LineageEvolutionManager:
         NOTE: This tracks global SOTA across all lineages, not per-lineage SOTA.
         Only counts when this lineage achieves a new global best.
         """
-        all_evaluations = self._collect_scored_evaluations()
-        
-        # Sort by evaluation ID to process chronologically
-        all_evaluations.sort(key=lambda x: x[0])
-        
-        # Second pass: count breakthroughs for the target lineage
-        current_sota = 0.0
-        breakthroughs = 0
-        
-        for eval_id, author_lineage, score in all_evaluations:
-            if score > current_sota:
-                # New global SOTA achieved
-                if author_lineage == lineage_name:
-                    # This lineage achieved the breakthrough
-                    breakthroughs += 1
-                current_sota = score
-                
-        return breakthroughs
+        self._load_all_data()
+        return self._breakthrough_data.get(lineage_name, 0)
 
     def _collect_scored_evaluations(self) -> List[Tuple[int, str, float, Optional[Tuple]]]:
-        """Collect successful Research Center evaluations through the public evaluation manager API."""
+        """Collect successful Research Center evaluations from the SQLite read model."""
+        from station.eval_research import evaluation_index
+
         all_evaluations: List[Tuple[int, str, float, Optional[Tuple]]] = []
 
-        for eval_id in self.eval_manager.get_all_evaluation_ids():
+        for row in evaluation_index.list_successful_score_rows(self.eval_manager.evaluations_dir):
             try:
-                numeric_eval_id = int(str(eval_id))
+                numeric_eval_id = int(row.get("eval_id_num") or row.get("eval_id"))
             except (TypeError, ValueError):
                 continue
 
-            summary = self.eval_manager.get_result_summary(str(eval_id))
-            if not summary or not summary.get("success"):
-                continue
-
-            author = summary.get("author", "")
+            author = row.get("author", "")
             if not author:
                 continue
 
             try:
-                score = float(summary.get("score"))
+                score = float(row.get("score"))
             except (TypeError, ValueError):
                 continue
 
@@ -402,7 +344,7 @@ class LineageEvolutionManager:
             if not author_lineage:
                 continue
 
-            sort_key = summary.get("sort_key")
+            sort_key = row.get("sort_key")
             if isinstance(sort_key, list):
                 sort_key = tuple(sort_key)
             all_evaluations.append((numeric_eval_id, author_lineage, score, sort_key))
@@ -415,91 +357,16 @@ class LineageEvolutionManager:
         Count archive papers with score >= 8.0 for a lineage.
         Adapted from lineage_selector.py analyze_lineage_high_quality_papers method.
         """
-        count = 0
-        
-        if os.path.exists(self.archive_evaluations_dir):
-            for filename in os.listdir(self.archive_evaluations_dir):
-                if filename.endswith('.yaml'):
-                    try:
-                        filepath = os.path.join(self.archive_evaluations_dir, filename)
-                        eval_data = file_io_utils.load_yaml(filepath)
-                        
-                        if not eval_data:
-                            continue
-                        
-                        # Check if paper was accepted
-                        result = eval_data.get('result')
-                        if result != 'accepted':
-                            continue
-                        
-                        # Extract score from extracted_result
-                        extracted_result = eval_data.get('extracted_result', {})
-                        score = extracted_result.get('score')
-                        if score is None:
-                            continue
-                        
-                        try:
-                            score = float(score)
-                        except (TypeError, ValueError):
-                            continue
-                        
-                        # Check if high quality (>= 8.0)
-                        if score >= 8.0:
-                            # Extract author and check lineage
-                            author = eval_data.get('agent_name', '')
-                            if author:
-                                author_lineage = self._extract_lineage_from_agent_name(author)
-                                if author_lineage == lineage_name:
-                                    count += 1
-                    
-                    except Exception as e:
-                        # Skip problematic files
-                        continue
-                        
-        return count
+        self._load_all_data()
+        return self._paper_data.get(lineage_name, 0)
     
     def _compute_lineage_total_lifespan(self, lineage_name: str) -> float:
         """
         Compute total lifespan in ticks for all agents in a lineage.
         Adapted from lineage_selector.py analyze_lineage_lifespans method.
         """
-        total = 0.0
-        
-        # Get current tick from station config
-        config_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.STATION_CONFIG_FILENAME)
-        try:
-            config_data = file_io_utils.load_yaml(config_path)
-            current_tick = config_data.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
-        except Exception:
-            current_tick = 0
-        
-        # Get all agent files
-        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
-        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
-        
-        for agent_file_name in agent_files:
-            agent_name = agent_file_name.replace(constants.YAML_EXTENSION, "")
-            agent_data = self.agent_module.load_agent_data(agent_name, include_ascended=False, include_ended=True)
-            
-            if (agent_data and
-                agent_data.get(constants.AGENT_LINEAGE_KEY) == lineage_name and
-                agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE):
-                
-                # Get tick information
-                tick_ascend = agent_data.get(constants.AGENT_TICK_ASCEND_KEY)
-                tick_exit = agent_data.get(constants.AGENT_TICK_EXIT_KEY)
-                
-                if tick_ascend is not None:
-                    if tick_exit is not None:
-                        # Agent has exited
-                        lifespan = tick_exit - tick_ascend
-                    else:
-                        # Agent still active
-                        lifespan = current_tick - tick_ascend
-                    
-                    total += lifespan
-                        
-        return total
+        self._load_all_data()
+        return self._lifespan_data.get(lineage_name, 0.0)
     
     def select_lineage(self, 
                       guest_model_name: str,
@@ -587,7 +454,7 @@ class LineageEvolutionManager:
                     lineage_to_agent[lineage] = agent_name
                     
             # Add "Empty" option (create new lineage)
-            empty_utility = getattr(constants, 'LINEAGE_EVOLUTION_EMPTY_UTILITY', 0.0)
+            empty_utility = getattr(constants, 'LINEAGE_EVOLUTION_EMPTY_UTILITY', -5.0)
             lineage_utilities["Empty"] = empty_utility
             
             # Apply softmax selection
@@ -711,7 +578,7 @@ def main():
         print("-" * 40)
         
         # Add Empty option
-        empty_utility = getattr(constants, 'LINEAGE_EVOLUTION_EMPTY_UTILITY', 0.0)
+        empty_utility = getattr(constants, 'LINEAGE_EVOLUTION_EMPTY_UTILITY', -5.0)
         scores = list(lineage_scores.values()) + [empty_utility]
         names = list(lineage_scores.keys()) + ["Empty (New Lineage)"]
         

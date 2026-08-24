@@ -14,12 +14,121 @@ import json
 import os
 import shutil
 import time
+import tomllib
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 from station import constants
 from station import runtime_api_config
 from station.eval_research.evaluation_helpers import resolve_conda_env
+
+
+DEFAULT_CODEX_PROVIDER_DOMAIN = "api.openai.com"
+CODEX_ALT_PROVIDER_NAME = "alt"
+
+
+def _provider_domain_from_base_url(raw_base_url: object) -> Optional[str]:
+    value = str(raw_base_url or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = urlparse(value if "://" in value else f"//{value}")
+        hostname = parsed.hostname
+    except (TypeError, ValueError):
+        return None
+    if not hostname:
+        return None
+    try:
+        return hostname.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return None
+
+
+def get_codex_provider_domains(runtime_env: Optional[Dict[str, str]] = None) -> List[str]:
+    """Return every trusted Codex API hostname available to restricted workers."""
+
+    env = runtime_env if runtime_env is not None else os.environ
+    domains = {DEFAULT_CODEX_PROVIDER_DOMAIN}
+
+    for env_name in ("CODEX_BASE_URL", "OPENAI_BASE_URL"):
+        explicit_domain = _provider_domain_from_base_url(env.get(env_name))
+        if explicit_domain:
+            domains.add(explicit_domain)
+
+    codex_home = str(env.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    config_path = os.path.join(os.path.expanduser(codex_home), "config.toml")
+    try:
+        with open(config_path, "rb") as handle:
+            config = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return sorted(domains)
+
+    top_level_domain = _provider_domain_from_base_url(config.get("openai_base_url"))
+    if top_level_domain:
+        domains.add(top_level_domain)
+
+    providers = config.get("model_providers")
+    if isinstance(providers, dict):
+        for provider in providers.values():
+            if not isinstance(provider, dict):
+                continue
+            domain = _provider_domain_from_base_url(provider.get("base_url"))
+            if domain:
+                domains.add(domain)
+
+    return sorted(domains)
+
+
+def build_codex_restricted_web_config_args(
+    runtime_env: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Build the shared provider-only network policy for non-web Codex workers."""
+
+    domain_rules = ", ".join(
+        f"{json.dumps(domain)} = \"allow\""
+        for domain in get_codex_provider_domains(runtime_env)
+    )
+    return [
+        "--config",
+        'web_search="disabled"',
+        "--config",
+        "sandbox_workspace_write.network_access=true",
+        "--config",
+        "features.network_proxy.enabled=true",
+        "--config",
+        f"features.network_proxy.domains={{ {domain_rules} }}",
+    ]
+
+
+def build_codex_alt_provider_config_args(
+    runtime_env: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Build an explicit Codex provider from the dedicated CODEX_* environment."""
+
+    env = runtime_env if runtime_env is not None else os.environ
+    api_key = str(env.get("CODEX_API_KEY") or "").strip()
+    base_url = str(env.get("CODEX_BASE_URL") or "").strip()
+    if not api_key and not base_url:
+        return []
+    if not api_key or not base_url:
+        missing = "CODEX_API_KEY" if not api_key else "CODEX_BASE_URL"
+        raise ValueError(
+            "Incomplete Codex API override: CODEX_API_KEY and CODEX_BASE_URL "
+            f"must be set together (missing {missing})."
+        )
+
+    provider_config = (
+        f"model_providers.{CODEX_ALT_PROVIDER_NAME}={{ "
+        f'name="Alt", base_url={json.dumps(base_url)}, '
+        'env_key="CODEX_API_KEY", wire_api="responses" }'
+    )
+    return [
+        "--config",
+        f'model_provider="{CODEX_ALT_PROVIDER_NAME}"',
+        "--config",
+        provider_config,
+    ]
 
 
 def _extend_add_dir_args(command: List[str], workspace_root: str, dir_paths: List[str]) -> None:
@@ -210,6 +319,7 @@ class BaseCliWorkerBackend:
         workspace_root: Optional[str] = None,
         research_root: Optional[str] = None,
         extra_allowed_roots: Optional[List[str]] = None,
+        network_access: bool = False,
     ) -> PreparedCliWorkerLaunch:
         raise NotImplementedError
 
@@ -225,6 +335,7 @@ class BaseCliWorkerBackend:
         workspace_root: Optional[str] = None,
         research_root: Optional[str] = None,
         extra_allowed_roots: Optional[List[str]] = None,
+        network_access: bool = False,
     ) -> PreparedCliWorkerLaunch:
         raise NotImplementedError(f"{self.backend_name} backend does not support resume")
 
@@ -239,10 +350,21 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
     supports_resume = True
 
     @staticmethod
-    def _build_env_overrides() -> Dict[str, Optional[str]]:
+    def _build_env_overrides(
+        runtime_env: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Optional[str]]:
+        if build_codex_alt_provider_config_args(runtime_env):
+            return {
+                "OPENAI_BASE_URL": None,
+                "OPENAI_API_KEY": None,
+                "CODEX_ACCESS_TOKEN": None,
+                "CODEX_AUTH": None,
+            }
+        # Preserve the pre-existing no-override behavior exactly: when neither
+        # dedicated CODEX_* variable is set, remove inherited OPENAI_* values.
         return {
-            "OPENAI_BASE_URL": _env_override_or_unset("CODEX_BASE_URL"),
-            "OPENAI_API_KEY": _env_override_or_unset("CODEX_API_KEY"),
+            "OPENAI_BASE_URL": None,
+            "OPENAI_API_KEY": None,
         }
 
     def prepare_launch(
@@ -256,11 +378,22 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
         workspace_root: Optional[str] = None,
         research_root: Optional[str] = None,
         extra_allowed_roots: Optional[List[str]] = None,
+        network_access: bool = False,
+        runtime_env: Optional[Dict[str, str]] = None,
     ) -> PreparedCliWorkerLaunch:
         resolved_workspace_root = _resolve_workspace_root(workspace_root, research_root)
         last_message_path = os.path.join(run_dir, "last_message.txt")
-        command = [
-            executable,
+        command = [executable]
+        command.extend(build_codex_alt_provider_config_args(runtime_env))
+        if network_access:
+            command.extend([
+                "--search",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+            ])
+        else:
+            command.extend(build_codex_restricted_web_config_args(runtime_env))
+        command.extend([
             "exec",
             "--skip-git-repo-check",
             "--sandbox",
@@ -270,7 +403,7 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
             "--json",
             "--output-last-message",
             last_message_path,
-        ]
+        ])
         if model_name:
             command.extend(["--model", model_name])
 
@@ -285,7 +418,7 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
             stderr_path=os.path.join(run_dir, "stderr.txt"),
             last_message_path=last_message_path,
             transcript_format=self.transcript_format,
-            env_overrides=self._build_env_overrides(),
+            env_overrides=self._build_env_overrides(runtime_env),
         )
 
     def prepare_resume_launch(
@@ -300,16 +433,27 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
         workspace_root: Optional[str] = None,
         research_root: Optional[str] = None,
         extra_allowed_roots: Optional[List[str]] = None,
+        network_access: bool = False,
+        runtime_env: Optional[Dict[str, str]] = None,
     ) -> PreparedCliWorkerLaunch:
         resolved_workspace_root = _resolve_workspace_root(workspace_root, research_root)
         last_message_path = os.path.join(run_dir, "last_message.txt")
-        command = [
-            executable,
+        command = [executable]
+        command.extend(build_codex_alt_provider_config_args(runtime_env))
+        if network_access:
+            command.extend([
+                "--search",
+                "--config",
+                "sandbox_workspace_write.network_access=true",
+            ])
+        else:
+            command.extend(build_codex_restricted_web_config_args(runtime_env))
+        command.extend([
             "--cd",
             resolved_workspace_root,
             "--sandbox",
             "workspace-write",
-        ]
+        ])
         # `codex exec resume --add-dir ...` is rejected by the resume
         # subcommand parser, but the same workspace flags are accepted as
         # top-level Codex options before `exec resume`.
@@ -335,7 +479,7 @@ class CodexCliWorkerBackend(BaseCliWorkerBackend):
             stderr_path=os.path.join(run_dir, "stderr.txt"),
             last_message_path=last_message_path,
             transcript_format=self.transcript_format,
-            env_overrides=self._build_env_overrides(),
+            env_overrides=self._build_env_overrides(runtime_env),
         )
 
     def extract_resume_token(self, transcript_path: str) -> Optional[str]:
@@ -384,6 +528,7 @@ class ClaudeCliWorkerBackend(BaseCliWorkerBackend):
         workspace_root: Optional[str] = None,
         research_root: Optional[str] = None,
         extra_allowed_roots: Optional[List[str]] = None,
+        network_access: bool = False,
     ) -> PreparedCliWorkerLaunch:
         resolved_workspace_root = _resolve_workspace_root(workspace_root, research_root)
         command = [

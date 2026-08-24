@@ -9,13 +9,10 @@ request/session/report state under station_data/rooms/archive/surveyor.
 from __future__ import annotations
 
 import os
-import signal
-import shutil
 import subprocess
 import threading
 import time
 import traceback
-import uuid
 from dataclasses import dataclass
 from queue import Queue
 from typing import Any, Callable, Dict, List, Optional
@@ -27,12 +24,22 @@ from station import capsule as capsule_module
 from station import constants
 from station import file_io_utils
 from station import index_paths
+from station import supervisor_utils
+from station.eval_archive.archive_preview import build_archive_preview
+from station.eval_archive.survey_worker import (
+    ActiveSurveySession,
+    build_archive_survey_prompt,
+    ensure_survey_source_link,
+)
 from station.workers.cli import (
     apply_codex_proxy_overrides,
     build_cli_worker_runtime_env,
-    check_cli_worker_transcript_growth_timeout,
     detect_cli_worker_executable,
-    get_cli_worker_backend,
+)
+from station.workers.job_manager import (
+    CliJobLaunchSpec,
+    CliJobManager,
+    CliJobState,
 )
 from station.eval_research.runtime_paths import get_research_root, load_task_spec_markdown
 from station.rooms.mail import format_new_mail_notification
@@ -57,6 +64,8 @@ SURVEY_REPORT_MAIL_NOTICE = (
     "of this report. Other agents cannot read this mail, but you may share report content with "
     "them if needed."
 )
+SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_KEY = "mail_read_status_repaired"
+SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_TIMESTAMP_KEY = "mail_read_status_repaired_timestamp"
 
 
 @dataclass(frozen=True)
@@ -70,31 +79,10 @@ class ArchiveSurveyorPaths:
     submission_lock_path: str
     archive_link: str
     research_link: str
+    question_link: str
     archive_target: str
     research_target: str
-
-
-@dataclass
-class ActiveSurveySession:
-    survey_id: str
-    session_id: str
-    run_dir: str
-    backend: str
-    transcript_format: str
-    process: subprocess.Popen
-    transcript_handle: Any
-    stderr_handle: Any
-    prompt_path: str
-    command: List[str]
-    transcript_path: str
-    stderr_path: str
-    last_message_path: Optional[str]
-    report_path: str
-    draft_path: str
-    last_transcript_size: int = 0
-    last_transcript_growth_timestamp: float = 0.0
-    transcript_idle_timeout_triggered: bool = False
-    transcript_idle_timeout_reason: Optional[str] = None
+    question_target: str
 
 
 @dataclass
@@ -103,6 +91,7 @@ class ArchiveSurveyValidationResult:
     messages: List[str]
     prompt: Optional[str] = None
     error: Optional[str] = None
+    question_room_access: bool = False
 
 
 @dataclass
@@ -130,47 +119,41 @@ def _get_archive_capsules_root(consts_module=constants) -> str:
     )
 
 
-def has_published_archive_papers(consts_module=constants) -> bool:
-    archive_capsules_dir = _get_archive_capsules_root(consts_module)
-    if not os.path.isdir(archive_capsules_dir):
-        return False
+def _get_question_capsules_root(consts_module=constants) -> str:
+    return os.path.join(
+        consts_module.BASE_STATION_DATA_PATH,
+        consts_module.CAPSULES_DIR_NAME,
+        consts_module.QUESTION_CAPSULES_SUBDIR_NAME,
+    )
 
-    try:
-        filenames = os.listdir(archive_capsules_dir)
-    except OSError as exc:
-        print(f"ArchiveSurveyor: Could not inspect archive papers in {archive_capsules_dir}: {exc}")
-        return False
 
-    for filename in filenames:
-        if not (filename.startswith("archive_") and filename.endswith(consts_module.YAML_EXTENSION)):
-            continue
-        capsule_data = file_io_utils.load_yaml(os.path.join(archive_capsules_dir, filename))
-        if not isinstance(capsule_data, dict):
-            continue
-        if capsule_data.get(consts_module.CAPSULE_IS_DELETED_KEY, False):
-            continue
+def _agent_has_question_room_access(
+    agent_data: Dict[str, Any],
+    current_tick: int,
+    station_instance: Any = None,
+    consts_module=constants,
+) -> bool:
+    if station_instance and hasattr(station_instance, "_is_agent_question_room_allowed"):
+        return bool(station_instance._is_agent_question_room_allowed(agent_data, current_tick))
+
+    if agent_data.get(consts_module.AGENT_STATUS_KEY) != consts_module.AGENT_STATUS_RECURSIVE:
+        return False
+    if supervisor_utils.is_supervisor(agent_data, consts_module):
         return True
-    return False
+
+    birth_tick = agent_data.get(consts_module.AGENT_TICK_BIRTH_KEY)
+    if birth_tick is None:
+        return False
+    try:
+        agent_age = int(current_tick) - int(birth_tick)
+    except (TypeError, ValueError):
+        return False
+    tenured_threshold = getattr(consts_module, "MIN_AGENT_AGE_BEFORE_LEAVE", None)
+    return tenured_threshold is not None and tenured_threshold > 0 and agent_age >= int(tenured_threshold)
 
 
 def _ensure_symlink(link_path: str, target_path: str) -> None:
-    if os.path.lexists(link_path):
-        if os.path.islink(link_path) and os.path.realpath(link_path) != os.path.realpath(target_path):
-            try:
-                os.unlink(link_path)
-            except OSError as exc:
-                print(f"ArchiveSurveyor: Could not replace symlink {link_path}: {exc}")
-                return
-        else:
-            return
-
-    try:
-        relative_target = os.path.relpath(target_path, os.path.dirname(link_path))
-        os.symlink(relative_target, link_path)
-    except FileExistsError:
-        pass
-    except OSError as exc:
-        print(f"ArchiveSurveyor: Warning - could not create symlink {link_path}: {exc}")
+    ensure_survey_source_link(link_path, target_path)
 
 
 def ensure_archive_surveyor_layout(consts_module=constants) -> ArchiveSurveyorPaths:
@@ -178,9 +161,11 @@ def ensure_archive_surveyor_layout(consts_module=constants) -> ArchiveSurveyorPa
     surveyor_root = os.path.join(archive_room_root, consts_module.ARCHIVE_SURVEYOR_SUBDIR_NAME)
     archive_target = _get_archive_capsules_root(consts_module)
     research_target = get_research_root(consts_module)
+    question_target = _get_question_capsules_root(consts_module)
 
     file_io_utils.ensure_dir_exists(surveyor_root)
     file_io_utils.ensure_dir_exists(archive_target)
+    file_io_utils.ensure_dir_exists(question_target)
 
     paths = ArchiveSurveyorPaths(
         archive_room_root=archive_room_root,
@@ -192,8 +177,10 @@ def ensure_archive_surveyor_layout(consts_module=constants) -> ArchiveSurveyorPa
         submission_lock_path=os.path.join(surveyor_root, ".submission.lock"),
         archive_link=os.path.join(surveyor_root, consts_module.ARCHIVE_SURVEY_ARCHIVE_LINK_NAME),
         research_link=os.path.join(surveyor_root, consts_module.ARCHIVE_SURVEY_RESEARCH_LINK_NAME),
+        question_link=os.path.join(surveyor_root, consts_module.ARCHIVE_SURVEY_QUESTION_LINK_NAME),
         archive_target=archive_target,
         research_target=research_target,
+        question_target=question_target,
     )
     for dir_path in (paths.requests_dir, paths.reports_dir, paths.sessions_dir):
         file_io_utils.ensure_dir_exists(dir_path)
@@ -202,6 +189,7 @@ def ensure_archive_surveyor_layout(consts_module=constants) -> ArchiveSurveyorPa
         file_io_utils.save_text(SURVEYOR_AGENTS_MD_CONTENT, agents_md_path)
     _ensure_symlink(paths.archive_link, paths.archive_target)
     _ensure_symlink(paths.research_link, paths.research_target)
+    _ensure_symlink(paths.question_link, paths.question_target)
     return paths
 
 
@@ -266,6 +254,7 @@ def queue_archive_survey_request(
     tick: int,
     backend: Optional[str] = None,
     model_name: Optional[str] = None,
+    question_room_access: bool = False,
     parallel_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     paths = ensure_archive_surveyor_layout()
@@ -279,6 +268,7 @@ def queue_archive_survey_request(
             "author": author,
             "lineage": (lineage or "unknown").lower(),
             "prompt": prompt,
+            "question_room_access": bool(question_room_access),
             "submitted_tick": tick,
             "submitted_timestamp": now,
             "status": SURVEY_STATUS_QUEUED,
@@ -294,7 +284,16 @@ def queue_archive_survey_request(
                 "active_pid": None,
                 "status": SURVEY_STATUS_QUEUED,
                 "spawn_count": 0,
-                "max_spawns": constants.ARCHIVE_SURVEY_MAX_SPAWNS,
+                "max_spawns": getattr(
+                    constants,
+                    "RESEARCH_CODER_MAX_SPAWNS",
+                    constants.ARCHIVE_SURVEY_MAX_SPAWNS,
+                ),
+                "resume_token": None,
+                "resume_count": 0,
+                "max_resumes": constants.ARCHIVE_SURVEY_MAX_RESUMES,
+                "resume_delay_seconds": 0,
+                "next_resume_timestamp": None,
                 "started_timestamp": None,
                 "completed_timestamp": None,
                 "exit_code": None,
@@ -390,13 +389,6 @@ def validate_archive_survey_request(
             error="missing_prompt",
         )
 
-    if not has_published_archive_papers(consts_module):
-        return ArchiveSurveyValidationResult(
-            ok=False,
-            messages=["Archive survey failed: no archive papers found, so no survey is needed."],
-            error="no_archive",
-        )
-
     max_active = int(getattr(consts_module, "ARCHIVE_SURVEY_MAX_ACTIVE_PER_AGENT", 1))
     active_ids = get_active_survey_ids_for_author(agent_name)
     if max_active >= 0 and len(active_ids) >= max_active:
@@ -409,7 +401,18 @@ def validate_archive_survey_request(
             error="active_limit",
         )
 
-    return ArchiveSurveyValidationResult(ok=True, messages=[], prompt=prompt)
+    question_room_access = _agent_has_question_room_access(
+        agent_data,
+        current_tick,
+        station_instance=station_instance,
+        consts_module=consts_module,
+    )
+    return ArchiveSurveyValidationResult(
+        ok=True,
+        messages=[],
+        prompt=prompt,
+        question_room_access=question_room_access,
+    )
 
 
 def mark_archive_survey_committed(survey_id: str) -> bool:
@@ -541,6 +544,7 @@ class ArchiveSurveySubmissionService(FastLaneSubmissionService):
             lineage=agent_data.get(consts.AGENT_LINEAGE_KEY),
             prompt=str(validation.prompt or ""),
             tick=request.current_tick,
+            question_room_access=bool(validation.question_room_access),
             parallel_metadata={
                 "run_id": request.run_id,
                 "op_id": request.op_id,
@@ -600,10 +604,12 @@ class ArchiveSurveySubmissionService(FastLaneSubmissionService):
                 )
 
 
-class AutoArchiveSurveyor:
+class AutoArchiveSurveyor(CliJobManager):
     _active_instances: Dict[int, "AutoArchiveSurveyor"] = {}
+    fresh_attempt_after_resume_exhaustion = True
 
     def __init__(self, station_instance, enabled: Optional[bool] = None, log_queue: Optional[Queue] = None):
+        super().__init__()
         station_id = id(station_instance)
         if station_id in self._active_instances and self._active_instances[station_id].is_running:
             print("AutoArchiveSurveyor: WARNING - another surveyor is already running for this station")
@@ -619,8 +625,6 @@ class AutoArchiveSurveyor:
         self.is_running = False
         self.surveyor_thread: Optional[threading.Thread] = None
         self._wake_event = threading.Event()
-        self.active_sessions: Dict[str, ActiveSurveySession] = {}
-
         self._active_instances[station_id] = self
 
     def _push_log_event(self, event_type: str, data: Dict[str, Any]) -> None:
@@ -631,6 +635,17 @@ class AutoArchiveSurveyor:
         except Exception as exc:
             print(f"AutoArchiveSurveyor: failed to queue log event: {exc}")
 
+    @classmethod
+    def _resume_backoff_schedule(cls) -> Any:
+        return getattr(constants, "RESEARCH_CODER_RESUME_BACKOFF_SECONDS", [])
+
+    def _pause_station(self, reason: str) -> None:
+        orchestrator = getattr(self.station, "orchestrator", None)
+        if orchestrator and hasattr(orchestrator, "pause_due_to_research_issue"):
+            orchestrator.pause_due_to_research_issue(reason)
+            return
+        print(f"AutoArchiveSurveyor: Unable to pause orchestrator directly. Reason: {reason}")
+
     def start_surveyor_loop(self) -> bool:
         if not self.enabled:
             print("AutoArchiveSurveyor: archive surveyor is disabled")
@@ -639,7 +654,7 @@ class AutoArchiveSurveyor:
             return True
         self.is_running = True
         self._wake_event.clear()
-        self._recover_stale_requests()
+        self._recover_stale_requests(restart_recovery=True)
         self.surveyor_thread = threading.Thread(target=self._surveyor_loop, daemon=True)
         self.surveyor_thread.start()
         print("AutoArchiveSurveyor: surveyor loop started")
@@ -650,18 +665,10 @@ class AutoArchiveSurveyor:
             return
         self.is_running = False
         self._wake_event.set()
-        for survey_id, session in list(self.active_sessions.items()):
-            self._terminate_session_process(session, force=False)
-            self._mark_requeued_after_shutdown(survey_id)
-            try:
-                session.transcript_handle.close()
-            except Exception:
-                pass
-            try:
-                session.stderr_handle.close()
-            except Exception:
-                pass
-        self.active_sessions.clear()
+        self.stop_active_cli_jobs(
+            force=False,
+            after_terminate=lambda survey_id, _session: self._mark_requeued_after_shutdown(survey_id),
+        )
         if self.surveyor_thread and self.surveyor_thread.is_alive():
             self.surveyor_thread.join(timeout=5)
         station_id = id(self.station)
@@ -756,11 +763,61 @@ class AutoArchiveSurveyor:
             "queued_jobs": queued_jobs,
         }
 
+    def get_lightweight_job_statistics(self) -> Dict[str, Any]:
+        """Return dashboard job counts without scanning historical requests."""
+        now = time.time()
+        running_jobs = []
+        for survey_id in sorted(self.active_sessions):
+            record = _load_request(self.paths, survey_id) or {}
+            session = record.get("session") or {}
+            started = session.get("started_timestamp") or record.get("submitted_timestamp") or now
+            running_jobs.append({
+                "evaluation_id": f"Archive Survey #{survey_id}",
+                "job_id": f"archive_survey_{survey_id}",
+                "job_type": "archive_survey",
+                "agent_name": record.get("author", ""),
+                "title": record.get("title") or f"Archive Survey #{survey_id}",
+                "status": SURVEY_STATUS_RUNNING,
+                "top_level_status": SURVEY_STATUS_RUNNING,
+                "execution_source": "surveyor",
+                "system_baseline": False,
+                "elapsed_seconds": max(0, int(now - started)),
+                "started_timestamp": started,
+            })
+        queued_jobs = []
+        try:
+            pending_entries = _load_pending_entries(self.paths)
+        except Exception:
+            pending_entries = []
+        active_ids = set(self.active_sessions)
+        for entry in pending_entries:
+            survey_id = str(entry.get("id") or entry.get("survey_id") or "").strip()
+            if not survey_id or survey_id in active_ids:
+                continue
+            queued_jobs.append({
+                "evaluation_id": f"Archive Survey #{survey_id}",
+                "job_id": f"archive_survey_{survey_id}",
+                "job_type": "archive_survey",
+                "agent_name": "",
+                "title": f"Archive Survey #{survey_id}",
+                "status": SURVEY_STATUS_QUEUED,
+                "top_level_status": SURVEY_STATUS_QUEUED,
+                "execution_source": "surveyor",
+                "system_baseline": False,
+                "elapsed_seconds": 0,
+            })
+        return {
+            "running_count": len(running_jobs),
+            "queued_count": len(queued_jobs),
+            "running_jobs": running_jobs,
+            "queued_jobs": queued_jobs,
+        }
+
     def _surveyor_loop(self) -> None:
         while self.is_running:
             try:
-                self._poll_sessions()
-                self._recover_stale_requests()
+                self.poll_cli_jobs()
+                self._recover_stale_requests(restart_recovery=False)
                 self._repair_pending_notifications()
                 self._launch_queued_surveys()
                 self._wake_event.wait(self.check_interval)
@@ -809,7 +866,10 @@ class AutoArchiveSurveyor:
             if not survey_id or survey_id in seen:
                 continue
             record = _load_request(self.paths, survey_id)
-            if isinstance(record, dict) and str(record.get("status", "")).lower() == SURVEY_STATUS_QUEUED:
+            session = record.get("session") or {} if isinstance(record, dict) else {}
+            status = str(record.get("status", "")).lower() if isinstance(record, dict) else ""
+            session_status = str(session.get("status", "")).lower()
+            if status == SURVEY_STATUS_QUEUED or (status == SURVEY_STATUS_RUNNING and session_status == "pending_resume"):
                 ids.append(survey_id)
                 seen.add(survey_id)
 
@@ -817,12 +877,15 @@ class AutoArchiveSurveyor:
             if survey_id in seen:
                 continue
             record = _load_request(self.paths, survey_id)
-            if isinstance(record, dict) and str(record.get("status", "")).lower() == SURVEY_STATUS_QUEUED:
+            session = record.get("session") or {} if isinstance(record, dict) else {}
+            status = str(record.get("status", "")).lower() if isinstance(record, dict) else ""
+            session_status = str(session.get("status", "")).lower()
+            if status == SURVEY_STATUS_QUEUED or (status == SURVEY_STATUS_RUNNING and session_status == "pending_resume"):
                 ids.append(survey_id)
                 seen.add(survey_id)
         return sorted(ids, key=lambda value: (0, int(value)) if str(value).isdigit() else (1, str(value)))
 
-    def _recover_stale_requests(self) -> None:
+    def _recover_stale_requests(self, *, restart_recovery: bool = False) -> None:
         for survey_id in _iter_request_ids(self.paths):
             if survey_id in self.active_sessions:
                 continue
@@ -830,11 +893,29 @@ class AutoArchiveSurveyor:
             if not isinstance(record, dict):
                 continue
             status = str(record.get("status", "")).lower()
+            if status == SURVEY_STATUS_BLOCKED:
+                if restart_recovery and not self._load_report_text(survey_id).strip():
+                    self._mark_queued(
+                        survey_id,
+                        "Recovered after restart: unfinished Archive Surveyor request requeued.",
+                        reset_attempt_counters=True,
+                    )
+                continue
+            # Historical failures predate coder-style blocked/restart
+            # recovery.  Never reopen them automatically on upgrade.
+            if status == SURVEY_STATUS_FAILED:
+                continue
             if status != SURVEY_STATUS_RUNNING:
                 continue
             session = record.get("session") or {}
             pid = session.get("active_pid")
             if self._pid_exists(pid):
+                continue
+
+            # While the station remains alive, a pending same-session resume
+            # is left for the normal launcher.  Across station restart, match
+            # the Research Coder and restart from a fresh queued session.
+            if str(session.get("status", "")).lower() == "pending_resume" and not restart_recovery:
                 continue
 
             report_text = self._load_report_text(survey_id)
@@ -843,14 +924,11 @@ class AutoArchiveSurveyor:
                 self._deliver_report_if_needed(survey_id)
                 continue
 
-            spawn_count = int(session.get("spawn_count", 0))
-            max_spawns = int(session.get("max_spawns", constants.ARCHIVE_SURVEY_MAX_SPAWNS))
-            if spawn_count < max_spawns:
-                self._mark_queued(survey_id, "Recovered stale Surveyor session with no final report.")
-            else:
-                reason = f"Archive Surveyor exited without a final report after {spawn_count} spawn(s)."
-                self._mark_failed(survey_id, reason)
-                self._send_failure_notification_if_needed(survey_id, reason)
+            self._mark_queued(
+                survey_id,
+                "Recovered stale Surveyor session with no final report; fresh session requeued.",
+                reset_attempt_counters=restart_recovery,
+            )
 
     def _repair_pending_notifications(self) -> None:
         for survey_id in _iter_request_ids(self.paths):
@@ -858,15 +936,9 @@ class AutoArchiveSurveyor:
             if not isinstance(record, dict):
                 continue
             if str(record.get("status", "")).lower() != SURVEY_STATUS_COMPLETED:
-                if str(record.get("status", "")).lower() == SURVEY_STATUS_FAILED:
-                    notification = record.get("notification") or {}
-                    if not notification.get("sent"):
-                        reason = str(record.get("error") or (record.get("session") or {}).get("last_error") or "Unknown error.")
-                        self._send_failure_notification_if_needed(survey_id, reason)
                 continue
             notification = record.get("notification") or {}
             if notification.get("sent"):
-                self._repair_sent_report_mail_read_status(record)
                 continue
             self._deliver_report_if_needed(survey_id)
 
@@ -884,21 +956,33 @@ class AutoArchiveSurveyor:
                 reason = f"Failed to launch Archive Surveyor for request {survey_id}: {exc}"
                 print(f"AutoArchiveSurveyor: {reason}")
                 traceback.print_exc()
-                self._mark_failed(survey_id, reason)
-                self._send_failure_notification_if_needed(survey_id, reason)
+                self._mark_blocked(survey_id, reason)
                 continue
             if launched:
                 _remove_pending_entry(self.paths, survey_id)
 
-    def _claim_launch(self, survey_id: str, session_id: str, backend: str, model_name: Optional[str]) -> Optional[Dict[str, Any]]:
+    def _claim_launch(
+        self,
+        survey_id: str,
+        session_id: str,
+        backend: str,
+        model_name: Optional[str],
+        *,
+        use_resume: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         lock = filelock.FileLock(_request_path(self.paths, survey_id) + ".lock", timeout=60)
         with lock:
             record = _load_request(self.paths, survey_id)
             if not isinstance(record, dict):
                 return None
-            if str(record.get("status", "")).lower() != SURVEY_STATUS_QUEUED:
-                return None
             session = record.setdefault("session", {})
+            record_status = str(record.get("status", "")).lower()
+            session_status = str(session.get("status", "")).lower()
+            if use_resume:
+                if record_status != SURVEY_STATUS_RUNNING or session_status != "pending_resume":
+                    return None
+            elif record_status != SURVEY_STATUS_QUEUED:
+                return None
             if bool(session.get("active")):
                 return None
             session["backend"] = backend
@@ -906,171 +990,177 @@ class AutoArchiveSurveyor:
             session["active"] = True
             session["session_id"] = session_id
             session["active_pid"] = None
-            session["status"] = SURVEY_STATUS_RUNNING
-            session["spawn_count"] = int(session.get("spawn_count", 0)) + 1
+            session["status"] = "resuming" if use_resume else SURVEY_STATUS_RUNNING
+            if use_resume:
+                session["resume_count"] = int(session.get("resume_count", 0)) + 1
+            else:
+                session["spawn_count"] = int(session.get("spawn_count", 0)) + 1
             session["started_timestamp"] = time.time()
             session["completed_timestamp"] = None
             session["exit_code"] = None
             session["last_error"] = None
+            session["next_resume_timestamp"] = None
+            session["resume_delay_seconds"] = 0
             record["status"] = SURVEY_STATUS_RUNNING
             _save_request(self.paths, survey_id, record)
             return dict(record)
 
     def _launch_survey(self, survey_id: str) -> bool:
-        record = _load_request(self.paths, survey_id)
-        if not isinstance(record, dict):
-            return False
-        session_state = record.get("session", {}) or {}
-        backend = str(session_state.get("backend") or constants.ARCHIVE_SURVEY_BACKEND).lower()
-        model_name = session_state.get("model_name")
+        return self.launch_cli_job(survey_id)
 
+    def _load_cli_job_state(self, job_id: str) -> CliJobState:
+        record = _load_request(self.paths, job_id) or {}
+        session = record.get("session", {}) or {}
+        top_status = str(record.get("status", "")).strip().lower()
+        worker_status = str(session.get("status", "")).strip().lower()
+        return CliJobState(
+            backend=str(session.get("backend") or constants.ARCHIVE_SURVEY_BACKEND).lower(),
+            spawn_count=int(session.get("spawn_count", 0)),
+            resume_count=int(session.get("resume_count", 0)),
+            max_spawns=int(session.get("max_spawns", constants.ARCHIVE_SURVEY_MAX_SPAWNS)),
+            max_resumes=int(session.get("max_resumes", constants.ARCHIVE_SURVEY_MAX_RESUMES)),
+            resume_token=str(session.get("resume_token") or "").strip() or None,
+            next_resume_timestamp=session.get("next_resume_timestamp"),
+            fresh_launch_eligible=top_status == SURVEY_STATUS_QUEUED,
+            resume_launch_eligible=(
+                top_status == SURVEY_STATUS_RUNNING and worker_status == "pending_resume"
+            ),
+        )
+
+    def _claim_cli_job_launch(self, job_id, session_id, decision):
+        state = self._load_cli_job_state(job_id)
+        return self._claim_launch(
+            job_id,
+            session_id,
+            state.backend,
+            (_load_request(self.paths, job_id) or {}).get("session", {}).get("model_name"),
+            use_resume=decision.is_resume,
+        )
+
+    def _build_cli_job_launch_spec(self, job_id, session_id, decision, claimed):
+        session_state = claimed.get("session", {}) or {}
+        backend = str(session_state.get("backend") or constants.ARCHIVE_SURVEY_BACKEND).lower()
+        surveyor_root = os.path.abspath(self.paths.surveyor_root)
+        station_data_root = os.path.abspath(os.path.join(surveyor_root, os.pardir, os.pardir, os.pardir))
         env = build_cli_worker_runtime_env(constants.RESEARCH_EVAL_PYTHON_CONDA_ENV)
+        env["STATION_BASE_DATA_PATH"] = station_data_root
         if backend == "codex":
             apply_codex_proxy_overrides(env)
-        executable = detect_cli_worker_executable(backend, env)
-        next_spawn = int(session_state.get("spawn_count", 0)) + 1
-        session_token = uuid.uuid4().hex[:8]
-        session_id = f"{backend}_{survey_id}_spawn_{next_spawn}_{session_token}"
-        claimed = self._claim_launch(survey_id, session_id, backend, model_name)
-        if not claimed:
-            return False
-
-        run_dir = os.path.abspath(os.path.join(self.paths.sessions_dir, session_id))
-        file_io_utils.ensure_dir_exists(run_dir)
-        prompt = self._build_prompt(claimed)
-        prompt_path = os.path.join(run_dir, "prompt.txt")
-        file_io_utils.save_text(prompt, prompt_path)
-
-        backend_runner = get_cli_worker_backend(backend)
         index_db_path = index_paths.get_station_index_database_path(constants.BASE_STATION_DATA_PATH)
-        prepared = backend_runner.prepare_launch(
-            executable=executable,
-            workspace_root=os.path.abspath(self.paths.surveyor_root),
-            run_dir=run_dir,
-            model_name=model_name,
-            storage_root=self.paths.surveyor_root,
-            prompt=prompt,
-            extra_allowed_roots=[os.path.dirname(index_db_path)],
-        )
-        launch_env = dict(env)
-        for key, value in (prepared.env_overrides or {}).items():
-            if value is None:
-                launch_env.pop(key, None)
-            else:
-                launch_env[key] = value
-
-        transcript_handle = open(prepared.transcript_path, "w", encoding="utf-8")
-        stderr_handle = open(prepared.stderr_path, "w", encoding="utf-8")
-        try:
-            if prepared.stdin_text is not None:
-                process = subprocess.Popen(
-                    prepared.command,
-                    cwd=os.path.abspath(self.paths.surveyor_root),
-                    env=launch_env,
-                    stdin=subprocess.PIPE,
-                    stdout=transcript_handle,
-                    stderr=stderr_handle,
-                    text=True,
-                    start_new_session=True,
-                )
-                assert process.stdin is not None
-                process.stdin.write(prepared.stdin_text)
-                process.stdin.close()
-            else:
-                process = subprocess.Popen(
-                    prepared.command,
-                    cwd=os.path.abspath(self.paths.surveyor_root),
-                    env=launch_env,
-                    stdout=transcript_handle,
-                    stderr=stderr_handle,
-                    text=True,
-                    start_new_session=True,
-                )
-        except Exception:
-            transcript_handle.close()
-            stderr_handle.close()
-            raise
-
-        def mark_pid(record_local: Dict[str, Any]) -> None:
-            session_local = record_local.setdefault("session", {})
-            session_local["active_pid"] = process.pid
-
-        self._update_request(survey_id, mark_pid)
-        self.active_sessions[survey_id] = ActiveSurveySession(
-            survey_id=survey_id,
-            session_id=session_id,
-            run_dir=run_dir,
+        return CliJobLaunchSpec(
+            executable=detect_cli_worker_executable(backend, env),
+            run_dir=os.path.abspath(os.path.join(self.paths.sessions_dir, session_id)),
             backend=backend,
-            transcript_format=prepared.transcript_format,
-            process=process,
-            transcript_handle=transcript_handle,
-            stderr_handle=stderr_handle,
-            prompt_path=prompt_path,
-            command=prepared.command,
-            transcript_path=prepared.transcript_path,
-            stderr_path=prepared.stderr_path,
-            last_message_path=prepared.last_message_path,
-            report_path=self._report_path(survey_id),
-            draft_path=self._draft_path(survey_id),
-            last_transcript_size=0,
-            last_transcript_growth_timestamp=time.time(),
+            model_name=session_state.get("model_name"),
+            workspace_root=surveyor_root,
+            storage_root=self.paths.surveyor_root,
+            prompt=self._build_prompt(claimed),
+            env=env,
+            extra_allowed_roots=(os.path.dirname(index_db_path),),
         )
+
+    def _make_active_cli_job_session(self, job_id, base_session, decision, claimed, launch_metadata):
+        return ActiveSurveySession(
+            **vars(base_session),
+            survey_id=job_id,
+            report_path=self._report_path(job_id),
+            draft_path=self._draft_path(job_id),
+        )
+
+    def _mark_cli_job_pid(self, job_id: str, pid: int) -> None:
+        self._update_request(
+            job_id,
+            lambda record: record.setdefault("session", {}).update({"active_pid": pid}),
+        )
+
+    def _on_cli_job_started(self, job_id, session, decision):
         self._push_log_event(
             "archive_surveyor_started",
-            {"survey_id": survey_id, "session_id": session_id, "backend": backend, "pid": process.pid},
+            {
+                "survey_id": job_id,
+                "session_id": session.session_id,
+                "backend": session.backend,
+                "pid": session.process.pid,
+                "launch_mode": decision.mode,
+            },
         )
-        print(f"AutoArchiveSurveyor: Started survey {survey_id} (session={session_id}, pid={process.pid})")
-        return True
+        print(
+            f"AutoArchiveSurveyor: Started survey {job_id} "
+            f"(session={session.session_id}, pid={session.process.pid}, mode={decision.mode})"
+        )
 
-    def _poll_sessions(self) -> None:
+    def _on_cli_job_process_exited(self, job_id, session, returncode):
+        print(
+            f"AutoArchiveSurveyor: Surveyor process exited for request {job_id} "
+            f"(session={session.session_id}, returncode={returncode})"
+        )
+
+    def _cli_job_completion_ready(self, job_id, session):
+        return bool(self._load_report_text(job_id).strip())
+
+    def _on_cli_job_completed(self, job_id, session, returncode):
+        self._mark_completed(job_id, exit_code=returncode, error=None)
+        self._deliver_report_if_needed(job_id)
+
+    def _cli_job_missing_report_reason(self, job_id, session):
+        reason = session.transcript_idle_timeout_reason or f"Archive Surveyor exited without producing reports/{job_id}.md."
+        if file_io_utils.file_exists(session.draft_path):
+            reason += f" Only reports/{job_id}.draft.md exists."
+        return reason
+
+    def _schedule_cli_job_resume(self, job_id, session, failure):
+        def schedule_resume(record: Dict[str, Any]) -> None:
+            state = record.setdefault("session", {})
+            state["active"] = False
+            state["active_pid"] = None
+            state["status"] = "pending_resume"
+            state["resume_token"] = failure.resume_token
+            state["resume_count"] = failure.resume_count
+            state["resume_delay_seconds"] = failure.delay_seconds
+            state["next_resume_timestamp"] = failure.next_resume_timestamp
+            state["exit_code"] = failure.returncode
+            state["last_error"] = failure.reason
+            record["status"] = SURVEY_STATUS_RUNNING
+
+        self._update_request(job_id, schedule_resume)
+        self._push_log_event(
+            "archive_surveyor_retryable_infra_failure",
+            {
+                "survey_id": job_id,
+                "session_id": getattr(session, "session_id", None),
+                "reason": failure.reason,
+                "launch_mode": "resume",
+                "resume_count": failure.resume_count,
+                "max_resumes": self._load_cli_job_state(job_id).max_resumes,
+                "resume_delay_seconds": failure.delay_seconds,
+                "next_resume_timestamp": failure.next_resume_timestamp,
+            },
+        )
+
+    def _schedule_cli_job_fresh_attempt(self, job_id, session, failure):
+        self._mark_queued(job_id, failure.reason)
+        record = _load_request(self.paths, job_id) or {}
+        file_io_utils.append_yaml_line(
+            {
+                "id": job_id,
+                "author": record.get("author", "Unknown"),
+                "submitted_tick": record.get("submitted_tick"),
+                "requeued_timestamp": time.time(),
+            },
+            self.paths.pending_file,
+        )
+
+    def _on_cli_job_attempts_exhausted(
+        self,
+        job_id,
+        session,
+        failure,
+    ):
+        reason = failure.reason if session else f"Archive Surveyor request #{job_id} exhausted automatic recovery."
+        self._mark_blocked(job_id, reason)
+
+    def _before_cli_job_poll(self) -> None:
         self._check_session_timeouts()
-        self._check_codex_transcript_idle_timeouts()
-        finished: List[str] = []
-        for survey_id, session in list(self.active_sessions.items()):
-            returncode = session.process.poll()
-            if returncode is None:
-                continue
-            finished.append(survey_id)
-            session.transcript_handle.close()
-            session.stderr_handle.close()
-            print(
-                f"AutoArchiveSurveyor: Surveyor process exited for request {survey_id} "
-                f"(session={session.session_id}, returncode={returncode})"
-            )
-
-            report_text = self._load_report_text(survey_id)
-            if report_text.strip():
-                self._mark_completed(survey_id, exit_code=returncode, error=None)
-                self._deliver_report_if_needed(survey_id)
-                continue
-
-            record = _load_request(self.paths, survey_id) or {}
-            session_state = record.get("session", {}) or {}
-            spawn_count = int(session_state.get("spawn_count", 0))
-            max_spawns = int(session_state.get("max_spawns", constants.ARCHIVE_SURVEY_MAX_SPAWNS))
-            reason = (
-                session.transcript_idle_timeout_reason
-                or f"Archive Surveyor exited without producing reports/{survey_id}.md."
-            )
-            if file_io_utils.file_exists(session.draft_path):
-                reason += f" Only reports/{survey_id}.draft.md exists."
-            if spawn_count < max_spawns:
-                self._mark_queued(survey_id, reason)
-                file_io_utils.append_yaml_line(
-                    {
-                        "id": survey_id,
-                        "author": record.get("author", "Unknown"),
-                        "submitted_tick": record.get("submitted_tick"),
-                        "requeued_timestamp": time.time(),
-                    },
-                    self.paths.pending_file,
-                )
-            else:
-                self._mark_failed(survey_id, reason)
-                self._send_failure_notification_if_needed(survey_id, reason)
-
-        for survey_id in finished:
-            self.active_sessions.pop(survey_id, None)
 
     def _check_session_timeouts(self) -> None:
         if self.timeout_seconds <= 0:
@@ -1081,64 +1171,30 @@ class AutoArchiveSurveyor:
             started = float((record.get("session") or {}).get("started_timestamp") or 0)
             if started <= 0 or now - started < self.timeout_seconds:
                 continue
-            self._terminate_session_process(session, force=False)
+            self._terminate_cli_job_process(session, force=False)
             self._push_log_event("archive_surveyor_timeout", {"survey_id": survey_id, "timeout_seconds": self.timeout_seconds})
 
-    def _check_codex_transcript_idle_timeouts(self) -> None:
-        for survey_id, session in list(self.active_sessions.items()):
-            if session.transcript_idle_timeout_triggered:
-                continue
-            result = check_cli_worker_transcript_growth_timeout(
-                backend=session.backend,
-                transcript_path=session.transcript_path,
-                last_size=session.last_transcript_size,
-                last_growth_timestamp=session.last_transcript_growth_timestamp,
-            )
-            if not result.applies:
-                continue
-            session.last_transcript_size = result.current_size
-            session.last_transcript_growth_timestamp = result.last_growth_timestamp
-            if not result.timed_out:
-                continue
+    def _cli_job_idle_timeout_reason(self, job_id, session, idle_seconds, timeout_seconds):
+        return (
+            f"Codex CLI transcript for Archive Survey #{job_id} did not grow for "
+            f"{idle_seconds} seconds, exceeding the configured CLI worker "
+            f"transcript idle timeout of {timeout_seconds} seconds."
+        )
 
-            reason = (
-                f"Codex CLI transcript for Archive Survey #{survey_id} did not grow for "
-                f"{int(result.idle_seconds)} seconds, exceeding the configured CLI worker "
-                f"transcript idle timeout of {int(result.timeout_seconds)} seconds."
-            )
-            session.transcript_idle_timeout_triggered = True
-            session.transcript_idle_timeout_reason = reason
-            self._terminate_session_process(session, force=False)
-            self._push_log_event(
-                "archive_surveyor_codex_transcript_idle_timeout",
-                {
-                    "survey_id": survey_id,
-                    "session_id": session.session_id,
-                    "idle_seconds": result.idle_seconds,
-                    "timeout_seconds": result.timeout_seconds,
-                },
-            )
-
-            def mutator(record: Dict[str, Any]) -> None:
-                session_state = record.setdefault("session", {})
-                session_state["last_error"] = reason
-
-            self._update_request(survey_id, mutator)
-
-    def _terminate_session_process(self, session: ActiveSurveySession, *, force: bool = False) -> None:
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        try:
-            os.killpg(session.process.pid, sig)
-            return
-        except Exception as exc:
-            print(f"AutoArchiveSurveyor: failed to signal process group for {session.session_id}: {exc}")
-        try:
-            if force:
-                session.process.kill()
-            else:
-                session.process.terminate()
-        except Exception as exc:
-            print(f"AutoArchiveSurveyor: failed to signal process {session.process.pid}: {exc}")
+    def _on_cli_job_idle_timeout(self, job_id, session, reason, idle_seconds, timeout_seconds):
+        self._push_log_event(
+            "archive_surveyor_codex_transcript_idle_timeout",
+            {
+                "survey_id": job_id,
+                "session_id": session.session_id,
+                "idle_seconds": idle_seconds,
+                "timeout_seconds": timeout_seconds,
+            },
+        )
+        self._update_request(
+            job_id,
+            lambda record: record.setdefault("session", {}).update({"last_error": reason}),
+        )
 
     def _update_request(self, survey_id: str, mutator) -> Optional[Dict[str, Any]]:
         lock = filelock.FileLock(_request_path(self.paths, survey_id) + ".lock", timeout=60)
@@ -1150,7 +1206,13 @@ class AutoArchiveSurveyor:
             _save_request(self.paths, survey_id, record)
             return record
 
-    def _mark_queued(self, survey_id: str, reason: str) -> None:
+    def _mark_queued(
+        self,
+        survey_id: str,
+        reason: str,
+        *,
+        reset_attempt_counters: bool = False,
+    ) -> None:
         def mutator(record: Dict[str, Any]) -> None:
             session = record.setdefault("session", {})
             session["active"] = False
@@ -1158,12 +1220,31 @@ class AutoArchiveSurveyor:
             session["status"] = SURVEY_STATUS_QUEUED
             session["completed_timestamp"] = time.time()
             session["last_error"] = reason
+            session["resume_token"] = None
+            session["resume_count"] = 0
+            session["next_resume_timestamp"] = None
+            session["resume_delay_seconds"] = 0
+            if reset_attempt_counters:
+                session["spawn_count"] = 0
+                notification = record.setdefault("notification", {})
+                notification["sent"] = False
+                notification["sent_timestamp"] = None
+                notification["message"] = None
+                notification["mail_capsule_id"] = None
+                notification["mail_numeric_id"] = None
+                record.pop("completed_tick", None)
+                record.pop("completed_timestamp", None)
             record["status"] = SURVEY_STATUS_QUEUED
+            record.pop("error", None)
 
         self._update_request(survey_id, mutator)
 
     def _mark_requeued_after_shutdown(self, survey_id: str) -> None:
-        self._mark_queued(survey_id, "Recovered during station shutdown: Archive Surveyor request requeued.")
+        self._mark_queued(
+            survey_id,
+            "Recovered during station shutdown: Archive Surveyor request requeued.",
+            reset_attempt_counters=True,
+        )
         record = _load_request(self.paths, survey_id) or {}
         file_io_utils.append_yaml_line(
             {
@@ -1190,20 +1271,23 @@ class AutoArchiveSurveyor:
 
         self._update_request(survey_id, mutator)
 
-    def _mark_failed(self, survey_id: str, reason: str) -> None:
+    def _mark_blocked(self, survey_id: str, reason: str) -> None:
         def mutator(record: Dict[str, Any]) -> None:
             session = record.setdefault("session", {})
             session["active"] = False
             session["active_pid"] = None
-            session["status"] = SURVEY_STATUS_FAILED
+            session["status"] = SURVEY_STATUS_BLOCKED
             session["completed_timestamp"] = time.time()
             session["last_error"] = reason
-            record["status"] = SURVEY_STATUS_FAILED
+            record["status"] = SURVEY_STATUS_BLOCKED
             record["completed_tick"] = self.station._get_current_tick() if hasattr(self.station, "_get_current_tick") else None
             record["completed_timestamp"] = time.time()
             record["error"] = reason
 
         self._update_request(survey_id, mutator)
+        self._pause_station(
+            f"Archive Surveyor request #{survey_id} exhausted automatic recovery and requires restart/manual intervention: {reason}"
+        )
 
     def _create_mail_capsule(self, author: str, survey_id: str, report_text: str) -> Optional[Dict[str, Any]]:
         current_tick = self.station._get_current_tick() if hasattr(self.station, "_get_current_tick") else 0
@@ -1235,71 +1319,6 @@ class AutoArchiveSurveyor:
 
     def _format_report_mail_content(self, report_text: str) -> str:
         return f"{SURVEY_REPORT_MAIL_NOTICE}\n\n{report_text}"
-
-    def _mail_read_item_ids(self, mail_capsule_id: Optional[str], mail_numeric_id: Any) -> List[str]:
-        item_ids: List[str] = []
-        if mail_capsule_id:
-            item_ids.append(str(mail_capsule_id))
-
-        try:
-            numeric_id = int(mail_numeric_id)
-        except (TypeError, ValueError):
-            numeric_id = None
-
-        mail_capsule = None
-        if numeric_id is not None:
-            mail_capsule = capsule_module.get_capsule(
-                numeric_id,
-                constants.CAPSULE_TYPE_MAIL,
-                None,
-                include_deleted_messages=True,
-            )
-
-        if mail_capsule and mail_capsule.get(constants.CAPSULE_MESSAGES_KEY):
-            for message in mail_capsule.get(constants.CAPSULE_MESSAGES_KEY, []):
-                message_id = message.get(constants.MESSAGE_ID_KEY)
-                if message_id:
-                    item_ids.append(str(message_id))
-        elif mail_capsule_id:
-            item_ids.append(f"{mail_capsule_id}-1")
-
-        return list(dict.fromkeys(item_ids))
-
-    def _mark_mail_read_in_agent_data(self, agent_data: Dict[str, Any], item_ids: List[str]) -> None:
-        if not item_ids:
-            return
-
-        rooms = getattr(self.station, "rooms", {}) or {}
-        mail_room = rooms.get(constants.ROOM_MAIL) if hasattr(rooms, "get") else None
-        room_context = getattr(self.station, "room_context", None)
-        if not mail_room or not room_context or not hasattr(mail_room, "_set_agent_read_status"):
-            return
-
-        for item_id in item_ids:
-            mail_room._set_agent_read_status(agent_data, item_id, True, room_context)
-
-    def _mark_mail_read_for_author(self, author: str, mail_read_item_ids: List[str]) -> bool:
-        agent_module = getattr(self.station, "agent_module", None)
-        update_agent = getattr(agent_module, "update_agent_with_function", None) if agent_module else None
-        if not callable(update_agent):
-            return False
-
-        def update_func(agent_data: Dict[str, Any]) -> None:
-            self._mark_mail_read_in_agent_data(agent_data, mail_read_item_ids)
-
-        return bool(update_agent(author, update_func))
-
-    def _repair_sent_report_mail_read_status(self, record: Dict[str, Any]) -> bool:
-        author = str(record.get("author") or "").strip()
-        notification = record.get("notification") or {}
-        if not author:
-            return False
-        mail_capsule_id = notification.get("mail_capsule_id")
-        mail_numeric_id = notification.get("mail_numeric_id")
-        if not mail_capsule_id and mail_numeric_id is None:
-            return False
-        read_item_ids = self._mail_read_item_ids(mail_capsule_id, mail_numeric_id)
-        return self._mark_mail_read_for_author(author, read_item_ids)
 
     def _deliver_mail_via_mail_room(self, author: str, mail_numeric_id: Any) -> Optional[str]:
         try:
@@ -1366,7 +1385,6 @@ class AutoArchiveSurveyor:
             return False
         notification = record.setdefault("notification", {})
         if notification.get("sent"):
-            self._repair_sent_report_mail_read_status(record)
             return True
 
         author = record.get("author")
@@ -1407,53 +1425,24 @@ class AutoArchiveSurveyor:
             notification_local["message"] = message
             notification_local["mail_capsule_id"] = mail_capsule_id
             notification_local["mail_numeric_id"] = mail_numeric_id
+            notification_local[SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_KEY] = True
+            notification_local[SURVEY_NOTIFICATION_MAIL_READ_REPAIRED_TIMESTAMP_KEY] = time.time()
 
         self._update_request(survey_id, mark_sent)
         self._push_log_event("archive_surveyor_completed", {"survey_id": survey_id, "author": author})
         return True
 
-    def _send_failure_notification_if_needed(self, survey_id: str, reason: str) -> bool:
-        record = _load_request(self.paths, survey_id)
-        if not isinstance(record, dict):
-            return False
-        if str(record.get("parallel_commit_status") or "").lower() == "provisional":
-            return False
-        notification = record.setdefault("notification", {})
-        if notification.get("sent"):
-            return True
-        author = record.get("author")
-        if not author:
-            return False
-        message = (
-            f"Your Archive Surveyor request #{survey_id} failed.\n\n"
-            f"Status: failed\n"
-            f"Error: {reason}"
-        )
-        try:
-            sent = self.station.agent_module.add_pending_notification_atomic(str(author), message)
-        except Exception as exc:
-            print(f"AutoArchiveSurveyor: failed to notify survey failure for {author}: {exc}")
-            sent = False
-        if not sent:
-            return False
-
-        def mark_sent(record_local: Dict[str, Any]) -> None:
-            notification_local = record_local.setdefault("notification", {})
-            notification_local["sent"] = True
-            notification_local["sent_timestamp"] = time.time()
-            notification_local["message"] = message
-
-        self._update_request(survey_id, mark_sent)
-        return True
-
     def _load_archive_preview(self) -> str:
+        return build_archive_preview(self.paths.archive_target)
+
+    def _load_question_preview(self) -> str:
         try:
-            archive_capsules_dir = self.paths.archive_target
-            if not os.path.isdir(archive_capsules_dir):
-                return "No archive papers currently available."
+            question_capsules_dir = self.paths.question_target
+            if not os.path.isdir(question_capsules_dir):
+                return "No Question Room problems currently available."
             capsule_files = []
-            for filename in os.listdir(archive_capsules_dir):
-                if not (filename.startswith("archive_") and filename.endswith(constants.YAML_EXTENSION)):
+            for filename in os.listdir(question_capsules_dir):
+                if not (filename.startswith("question_") and filename.endswith(constants.YAML_EXTENSION)):
                     continue
                 try:
                     capsule_id = int(filename.split("_", 1)[1].split(".", 1)[0])
@@ -1464,114 +1453,39 @@ class AutoArchiveSurveyor:
 
             previews: List[str] = []
             for capsule_id, filename in capsule_files:
-                capsule_data = file_io_utils.load_yaml(os.path.join(archive_capsules_dir, filename))
+                capsule_data = file_io_utils.load_yaml(os.path.join(question_capsules_dir, filename))
                 if not isinstance(capsule_data, dict):
                     continue
                 if capsule_data.get(constants.CAPSULE_IS_DELETED_KEY, False):
                     continue
                 title = capsule_data.get(constants.CAPSULE_TITLE_KEY, "Untitled")
                 author = capsule_data.get(constants.CAPSULE_AUTHOR_NAME_KEY, "Unknown")
-                created_tick = capsule_data.get(constants.CAPSULE_CREATED_AT_TICK_KEY, "N/A")
+                status = capsule_data.get(constants.QUESTION_STATUS_KEY, constants.QUESTION_STATUS_PENDING)
+                net_upvote = capsule_data.get(constants.QUESTION_NET_UPVOTE_KEY, 0)
                 abstract = capsule_data.get(constants.CAPSULE_ABSTRACT_KEY, "")
+                solved_by = capsule_data.get(constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY)
+                solved_line = f"\nSolved By: {solved_by}" if solved_by else ""
                 preview = (
-                    f"**Archive #{capsule_id}: {title}**\n"
-                    f"Author: {author}, Created at Tick: {created_tick}\n"
+                    f"**Question #{capsule_id}: {title}**\n"
+                    f"Author: {author}, Status: {status}, Net Upvote: {net_upvote}{solved_line}\n"
                     f"Abstract: {abstract if abstract else '(No abstract available.)'}"
                 )
                 previews.append(preview)
-            return "\n\n---\n\n".join(previews) if previews else "No archive papers currently available."
+            return "\n\n---\n\n".join(previews) if previews else "No Question Room problems currently available."
         except Exception as exc:
-            print(f"AutoArchiveSurveyor: failed to load archive preview: {exc}")
-            return "Error loading archive preview."
+            print(f"AutoArchiveSurveyor: failed to load Question Room preview: {exc}")
+            return "Error loading Question Room preview."
 
     def _build_prompt(self, record: Dict[str, Any]) -> str:
         survey_id = str(record.get("id"))
         task_spec = load_task_spec_markdown(constants).strip() or "No research task spec is available."
-        archive_preview = self._load_archive_preview()
-        agent_prompt = str(record.get("prompt", "")).strip()
-        surveyor_root_abs = os.path.abspath(self.paths.surveyor_root)
-
-        return f"""You are the Archive Surveyor for Station survey request #{survey_id}.
-
-This is a non-interactive research-survey session. You cannot ask follow-up questions. Make reasonable assumptions, inspect the local archive/evaluation records as needed, and finish by writing exactly one Markdown report.
-
-You are a PhD-level evidence-synthesis researcher answering a question from an agent working in a challenging open research task. Your job is to answer the requesting agent's archive-related question using Station-local evidence.
-
-Role boundary:
-- The requesting agent is responsible for proposing ideas, hypotheses, paradigms, experiments, and next research directions.
-- You may identify evidence gaps, tensions, duplicate risks, assumptions, underexplored areas, and technical details that the agent should consider.
-- Do not brainstorm, propose, recommend, or generate any new research idea, paradigm, experiment, or next project. If the agent asks you for ideas, state that you are not allowed to do so; still answer any valid archive-synthesis or gap-analysis parts of the request and provide surrounding evidence/context where useful.
-
-Working directory:
-`{surveyor_root_abs}`
-
-Available local sources:
-- `archive_papers/`: read-only source surface symlinked to all published Archive capsules. The CLI is not granted write access to its real path.
-- `research_center/`: read-only source surface symlinked to the Research Center room. The CLI is not granted write access to its real path. It includes:
-  - `research_task.md`
-  - `eval_tool.sh`
-  - `evaluations/`
-  - `coder_sessions/`
-  - `storage/report/`
-  - `storage/stdout/`
-  - `storage/stderr/`
-  - `storage/submission/`
-
-Normal work cycle:
-1. Read the agent request and the Research Task Spec below.
-2. Scan the Archive Preview for relevant Archive IDs by title and abstract.
-3. Read each relevant archive paper in full before relying on it. Archive paper files are YAML files named by ID; for example, run `cat archive_papers/archive_7.yaml` for Archive #7, or generally `cat archive_papers/archive_{{ID}}.yaml`.
-4. If the agent asks about a specific topic, direction, method, or question, also mention relevant Research Center evaluations even when they were not cited by any archive paper. Start by searching evaluation abstracts with `bash research_center/eval_tool.sh search "keyword1|keyword2"`. This uses a case-insensitive Python regex against abstracts only and prints candidate Eval IDs, titles, and abstracts. For an AND query, use a regex such as `(?=.*keyword1)(?=.*keyword2)`. Preview relevant matches with `bash research_center/eval_tool.sh preview {{ID}}`. This preview prints the evaluation metadata, abstract, agent instruction, coder prompt when available, and Coder Report without raw code or logs.
-5. For a general request such as a broad Station landscape survey, the archive is usually sufficient; use evaluation-level scanning only when the agent asks for a specific topic/question or when archive evidence is clearly too sparse.
-6. Draft the complete report at `reports/{survey_id}.draft.md`. The final report should be 1000 to 5000 words unless the request is clearly too narrow for that length.
-7. Review the draft for completeness, citation accuracy, and formatting.
-8. Finalize by atomically renaming the draft with `mv reports/{survey_id}.draft.md reports/{survey_id}.md`.
-9. After the rename, do not modify either file. Exit the session.
-
-Guidelines:
-- Your overall goal is to help the agent understand the accumulated knowledge of the Station so the agent can make its own research decisions.
-- You should do your own analysis and integration on the research task to assist the agent, not just retrieve relevant information from the archive. For example, analyze common themes, duplicate risk, assumptions, evidence gaps, underexplored regimes, and areas where existing work appears weak or saturated.
-- You may synthesize strategic and technical context, including technical details that have been missed, but keep the output grounded in existing Station evidence.
-- Preserve the agent's responsibility for idea generation. Do not present your own new research ideas, experiments, paradigms, or next-step recommendations.
-- Do not over-claim; always make scoped claims backed up by citations.
-- "Novel" means novel with respect to Station archive papers and Station evaluation records, not only with respect to your pretrained knowledge.
-- You should try to restrict your response to what the agent asks and be clear in your response.
-
-Rules:
-- Do not propose any new idea, experiment, paradigm, or concrete research direction, even if the agent asks for one.
-- Cite Station evidence precisely as `Archive #ID` and `Eval #ID`.
-- Prefer `eval_tool.sh preview` before raw code. Only read raw code and artifacts when there are ambiguities or errors in parsing.
-- Distinguish evidence-backed claims from hypotheses, guesses, or ideas.
-- Do not modify archive papers, Research Center evaluations, research storage, or any Station state.
-- The source surfaces `archive_papers/` and `research_center/` are for reading only. Do not write through these symlinks.
-- Only write the final report files under `reports/` as specified by the normal work cycle.
-- Do not use `/execute_action{{...}}`; that syntax is for in-station agents, not for you.
-- Do not use internet access. This survey is about the Station archive and Station research history.
-
-Required report format:
-
-# Archive Survey Report #{survey_id}
-
-## Request
-Briefly restate the agent's request.
-
-## Executive Summary
-Concise answer to the main question.
-
-## Main Content
-Answer the request in whatever subsections are useful. Choose sections based on the agent's prompt, such as prior work, duplicate-risk analysis, evidence gaps, frontier summary, or assumptions to challenge.
-
-## Limitations
-State missing evidence or uncertainty.
-
-Use the context below.
-
-=== RESEARCH TASK SPEC ===
-{task_spec}
-
-=== ARCHIVE PREVIEW ===
-{archive_preview}
-
-=== AGENT REQUEST ===
-{agent_prompt}
-"""
+        question_room_access = bool(record.get("question_room_access", False))
+        return build_archive_survey_prompt(
+            survey_id=survey_id,
+            requester_prompt=str(record.get("prompt", "")).strip(),
+            workspace_root=self.paths.surveyor_root,
+            task_spec=task_spec,
+            archive_preview=self._load_archive_preview(),
+            question_room_access=question_room_access,
+            question_preview=self._load_question_preview() if question_room_access else "",
+        )

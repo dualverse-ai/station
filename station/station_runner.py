@@ -20,7 +20,7 @@ import tempfile
 import shutil
 import copy
 from contextlib import contextmanager
-from queue import Queue, Empty as QueueEmpty
+from queue import Queue
 from typing import Dict, List, Optional, Any, Tuple
 
 from station.station import Station
@@ -28,8 +28,8 @@ from station import constants
 from station.constants import _load_config_overrides
 from station import file_io_utils
 from station import backup_utils
+from station import context_compaction
 from station import runtime_api_config
-from station import tick_timing
 from station.system_messages import build_station_level_system_prompt
 from station.llm_connectors import (
     BaseLLMConnector, create_llm_connector,
@@ -37,7 +37,34 @@ from station.llm_connectors import (
     LLMContextOverflowError, LLMCorruptedThoughtSignatureError
 )
 from station.llm_connectors.presets import build_model_preset_lookup
-from station.base_room import InternalActionHandler, LoggingInternalActionHandlerWrapper
+from station.base_room import LoggingInternalActionHandlerWrapper
+
+
+DEPLOYMENT_LOG_MAX_BYTES = 256 * 1024 * 1024
+DEPLOYMENT_LOG_CHECK_INTERVAL_TICKS = 100
+DEPLOYMENT_LOG_FILENAMES = (
+    "error.log",
+    "nginx_error.log",
+    "access.log",
+    "nginx_access.log",
+)
+
+
+def truncate_oversized_deployment_logs(
+    deployment_dir: str = "deployment",
+    max_bytes: int = DEPLOYMENT_LOG_MAX_BYTES,
+) -> List[str]:
+    """Truncate oversized deployment logs in place so active writers stay valid."""
+    truncated = []
+    for filename in DEPLOYMENT_LOG_FILENAMES:
+        path = os.path.join(deployment_dir, filename)
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) > max_bytes:
+                os.truncate(path, 0)
+                truncated.append(path)
+        except OSError as exc:
+            print(f"Orchestrator: Could not inspect or truncate deployment log {path}: {exc}")
+    return truncated
 
 
 class Orchestrator:
@@ -51,8 +78,10 @@ class Orchestrator:
 
         self.station = station_instance
         self.station.orchestrator = self
+        self._last_deployment_log_check_tick: Optional[int] = None
+        self._check_deployment_log_sizes(self.station._get_current_tick(), force=True)
         self.is_running: bool = False # True when the main_loop thread is active and processing
-        self.is_prepared: bool = False # True when agent turn order loaded and connectors initialized
+        self.is_prepared: bool = False # True when agent turn order loaded and connector configs validated
         self.orchestrator_thread: Optional[threading.Thread] = None
         self.agent_turn_order: List[str] = []
         self.current_tick_processed_agents: set[str] = set()
@@ -74,6 +103,7 @@ class Orchestrator:
         self.is_waiting: bool = False
         self.waiting_reasons: Dict[str, str] = {}
         self.wait_check_interval: float = 2.0  # seconds between auto-resume checks
+        self._check_wait_conditions_before_next_tick: bool = False
 
         self.current_agent_index_in_turn_order: int = 0
 
@@ -83,24 +113,23 @@ class Orchestrator:
         self.research_submission_service = None
         self.archive_survey_submission_service = None
 
-        if constants.SYNC_MODE == constants.SYNC_MODE_PARALLEL:
-            self._cleanup_parallel_sync_on_startup()
-            if constants.RESEARCH_CENTER_ENABLED and getattr(constants, "PARALLEL_RESEARCH_FAST_LANE_ENABLED", True):
-                from station.eval_research.submission_service import ResearchSubmissionService
+        self._cleanup_parallel_sync_on_startup()
+        if constants.RESEARCH_CENTER_ENABLED and getattr(constants, "PARALLEL_RESEARCH_FAST_LANE_ENABLED", True):
+            from station.eval_research.submission_service import ResearchSubmissionService
 
-                self.research_submission_service = ResearchSubmissionService(
-                    self.station,
-                    log_event_func=self._push_log_event,
-                )
-                self.research_submission_service.start()
-            if getattr(constants, "ARCHIVE_SURVEY_ENABLED", False) and getattr(constants, "PARALLEL_ARCHIVE_SURVEY_FAST_LANE_ENABLED", True):
-                from station.eval_archive.surveyor import ArchiveSurveySubmissionService
+            self.research_submission_service = ResearchSubmissionService(
+                self.station,
+                log_event_func=self._push_log_event,
+            )
+            self.research_submission_service.start()
+        if getattr(constants, "ARCHIVE_SURVEY_ENABLED", False) and getattr(constants, "PARALLEL_ARCHIVE_SURVEY_FAST_LANE_ENABLED", True):
+            from station.eval_archive.surveyor import ArchiveSurveySubmissionService
 
-                self.archive_survey_submission_service = ArchiveSurveySubmissionService(
-                    self.station,
-                    log_event_func=self._push_log_event,
-                )
-                self.archive_survey_submission_service.start()
+            self.archive_survey_submission_service = ArchiveSurveySubmissionService(
+                self.station,
+                log_event_func=self._push_log_event,
+            )
+            self.archive_survey_submission_service.start()
 
         if auto_prepare_on_init:
             self.prepare_for_run()
@@ -132,10 +161,6 @@ class Orchestrator:
         if getattr(constants, "AUTO_EVAL_EXTERNAL_REPORT", False) and getattr(constants, "EXTERNAL_COUNTER_ENABLED", False):
             self.station.start_auto_external_reporter(log_queue=self.log_event_queue)
 
-        # Start auto theory evaluator if enabled
-        if getattr(constants, "AUTO_EVAL_THEORY", False) and getattr(constants, "THEORY_ROOM_ENABLED", False):
-            self.station.start_auto_theory_evaluator(log_queue=self.log_event_queue)
-
         # Initialize stagnation protocol if enabled
         if constants.STAGNATION_ENABLED and constants.RESEARCH_CENTER_ENABLED:
             self.station.init_stagnation_protocol()
@@ -163,6 +188,21 @@ class Orchestrator:
                 self.log_event_queue.put_nowait(log_message)
             except Exception as e:
                 print(f"Orchestrator: Error putting log event on queue: {e}")
+
+    def _check_deployment_log_sizes(self, current_tick: int, force: bool = False) -> None:
+        if not force:
+            if current_tick % DEPLOYMENT_LOG_CHECK_INTERVAL_TICKS != 0:
+                return
+            if self._last_deployment_log_check_tick == current_tick:
+                return
+
+        self._last_deployment_log_check_tick = current_tick
+        truncated = truncate_oversized_deployment_logs()
+        if truncated:
+            print(
+                "Orchestrator: Truncated oversized deployment logs: "
+                + ", ".join(truncated)
+            )
 
     def _cleanup_parallel_sync_on_startup(self) -> None:
         try:
@@ -194,22 +234,24 @@ class Orchestrator:
         """
         print("Orchestrator: AUTO_START waiting for pending background jobs...")
 
-        # Wait for any running/pending research evaluations to complete
+        # Wait only when Research work has reached the configured tick-boundary limit.
         if constants.AUTO_EVAL_RESEARCH and constants.RESEARCH_CENTER_ENABLED:
             while True:
-                if not self.station.has_pending_research_evaluations():
+                if not self.station.should_wait_for_research_evaluations_at_tick_boundary():
                     break
                 time.sleep(2)
 
         if getattr(constants, "AUTO_EVAL_EXTERNAL_REPORT", False) and getattr(constants, "EXTERNAL_COUNTER_ENABLED", False):
             while True:
+                if self.station.has_failed_requeued_external_reports():
+                    message = (
+                        "AUTO_START stopped waiting because an External report already exhausted "
+                        "its retry budget; the station remains paused for operator action."
+                    )
+                    print(f"Orchestrator: {message}")
+                    self._push_log_event("orchestrator_info", {"message": message})
+                    return
                 if not self.station.has_pending_external_reports():
-                    break
-                time.sleep(2)
-
-        if getattr(constants, "AUTO_EVAL_THEORY", False) and getattr(constants, "THEORY_ROOM_ENABLED", False):
-            while True:
-                if not self.station.has_pending_theory_evaluations():
                     break
                 time.sleep(2)
 
@@ -230,27 +272,37 @@ class Orchestrator:
         self._push_log_event("orchestrator_info", {"message": "AUTO_START starting processing loop"})
         self.start_processing_loop()
 
-    def _try_init_agents_and_launch(self) -> None:
-        if not getattr(self.station, "is_new_station", False):
-            return
-
+    def _init_agent_spawn_is_allowed(self, *, require_new_station: bool) -> bool:
         current_tick = self.station.config.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
         if current_tick > 1:
-            return
+            return False
+        if self.agent_turn_order or self.station.config.get(constants.STATION_CONFIG_AGENT_TURN_ORDER):
+            return False
+        agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
+        if os.path.isdir(agents_dir):
+            active_agents = self.station.agent_module.get_all_active_agent_names()
+            if active_agents:
+                return False
+        if require_new_station and not getattr(self.station, "is_new_station", False):
+            init_agents_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.INIT_AGENTS_FILENAME)
+            if not file_io_utils.file_exists(init_agents_path):
+                return False
+        return True
 
+    def _spawn_init_agents_from_file(self) -> int:
         init_agents_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.INIT_AGENTS_FILENAME)
         if not file_io_utils.file_exists(init_agents_path):
-            return
+            return 0
 
         init_agents = file_io_utils.load_yaml(init_agents_path)
         if not isinstance(init_agents, list) or not init_agents:
             print(f"Warning: init_agents.yaml at {init_agents_path} is empty or not a list.")
-            return
+            return 0
 
         preset_lookup = build_model_preset_lookup()
         if not preset_lookup:
             print("Warning: No model presets available; init agents will be skipped.")
-            return
+            return 0
 
         spawned = 0
         for display_name in init_agents:
@@ -297,9 +349,33 @@ class Orchestrator:
         if spawned and not self.is_prepared:
             self.prepare_for_run()
 
-        if spawned and self.is_prepared and self.agent_turn_order and not self.is_running:
+        return spawned
+
+    def _try_init_agents_and_launch(self) -> None:
+        if os.environ.get("STATION_MULTISTART_BRANCH") == "1":
+            return
+        if not self._init_agent_spawn_is_allowed(require_new_station=True):
+            return
+
+        spawned = self._spawn_init_agents_from_file()
+        if (
+            spawned
+            and self.is_prepared
+            and self.agent_turn_order
+            and not self.is_running
+        ):
             print("Orchestrator: Launching station after init agents spawn.")
             self.start_processing_loop()
+
+    def try_init_agents_for_multistart_branch(self) -> int:
+        if os.environ.get("STATION_MULTISTART_BRANCH") != "1":
+            return 0
+        if not self._init_agent_spawn_is_allowed(require_new_station=False):
+            return 0
+        spawned = self._spawn_init_agents_from_file()
+        if spawned and self.is_prepared:
+            self._load_agent_turn_order()
+        return spawned
 
     @contextmanager
     def _agent_response_context(self, agent_name):
@@ -331,6 +407,7 @@ class Orchestrator:
         config_turn_order = list(self.station.config.get(constants.STATION_CONFIG_AGENT_TURN_ORDER, []))
         
         verified_runtime_order: List[str] = []
+        pruned_from_config: List[str] = []
         if config_turn_order:
             for agent_name_in_config in config_turn_order:
                 # Check if agent file actually exists AND is loadable as an active agent
@@ -339,6 +416,7 @@ class Orchestrator:
                 if self.station.agent_module.load_agent_data(agent_name_in_config):
                     verified_runtime_order.append(agent_name_in_config)
                 else:
+                    pruned_from_config.append(agent_name_in_config)
                     # Agent in config is not active (missing file, or ended/ascended)
                     print(f"Orchestrator: Agent '{agent_name_in_config}' from config is not active or file missing. Pruning from runtime order.")
                     self._push_log_event("orchestrator_warning", {"message": f"Agent '{agent_name_in_config}' from config pruned (inactive/missing)."})
@@ -362,13 +440,14 @@ class Orchestrator:
                 self._push_log_event("connector_status", {"agent_name": removed_agent_name, "status": "removed_cleaned_up", "reason": "No longer in active turn order (e.g., ascended, ended)."})
                 print(f"Orchestrator: Cleaned up connector for removed agent: {removed_agent_name}")
 
-        if agents_removed:
+        agents_departed = sorted(agents_removed | set(pruned_from_config))
+        if agents_departed:
             # Analyze departure reasons and handle based on user requirements
             ascended_agents = []
             other_departed_agents = []
             respawned_agents = []
             
-            for agent_name in agents_removed:
+            for agent_name in agents_departed:
                 departure_reason = self.station.get_agent_departure_reason(agent_name)
                 
                 if departure_reason == 'ascended':
@@ -430,7 +509,9 @@ class Orchestrator:
                 self._push_log_event("orchestrator_status", {
                     "status": "paused_agent_departure",
                     "reason": self.pause_reason_message,
-                    "departed_agents": list(agents_removed),
+                    "departed_agents": agents_departed,
+                    "runtime_removed_agents": sorted(agents_removed),
+                    "config_pruned_agents": pruned_from_config,
                     "ascended_agents": ascended_agents,
                     "other_departed_agents": other_departed_agents,
                     "respawned_agents": respawned_agents
@@ -445,7 +526,9 @@ class Orchestrator:
                 # No pause needed - log the successful handling
                 self._push_log_event("orchestrator_status", {
                     "status": "agent_departure_handled",
-                    "departed_agents": list(agents_removed),
+                    "departed_agents": agents_departed,
+                    "runtime_removed_agents": sorted(agents_removed),
+                    "config_pruned_agents": pruned_from_config,
                     "ascended_agents": ascended_agents,
                     "respawned_agents": respawned_agents,
                     "message": "Agent departures handled successfully without pausing"
@@ -471,13 +554,8 @@ class Orchestrator:
 
         agents_added = new_runtime_order_set - previous_runtime_order_set
         for added_agent_name in agents_added:
-            print(f"Orchestrator: Agent '{added_agent_name}' detected as new to runtime order. Initializing connector...")
-            self._push_log_event("orchestrator_info", {"message": f"Agent {added_agent_name} new to runtime order. Initializing connector."})
-            # --- MODIFICATION: Immediately initialize connector for newly added agents ---
-            if not self.initialize_connector_for_agent(added_agent_name, force_reinitialize=True): # Force reinitialize if it somehow existed but wasn't active
-                print(f"Orchestrator: CRITICAL - Failed to initialize connector for newly added agent {added_agent_name}. This agent may not function correctly.")
-                self._push_log_event("connector_error", {"agent_name": added_agent_name, "message": "Failed to initialize connector upon being added to turn order."})
-            # --- END OF MODIFICATION ---
+            print(f"Orchestrator: Agent '{added_agent_name}' detected as new to runtime order. Connector will initialize on first LLM use.")
+            self._push_log_event("orchestrator_info", {"message": f"Agent {added_agent_name} new to runtime order. Connector initialization deferred."})
 
 
         self._push_log_event("orchestrator_info", {"message": f"Runtime agent turn order updated: {self.agent_turn_order}"})
@@ -534,7 +612,7 @@ class Orchestrator:
         # self.current_agent_index_in_turn_order should already be pointing to the agent
         # whose LLM call just failed, or if it was incremented, it's pointing to the next.
         # For retry, we want the index of the *current failing agent*.
-        # The call to _get_llm_response happens before current_agent_index_in_turn_order is incremented for the turn.
+        # Connector failures happen before the tick commit path advances any agent state.
         index_to_save = self.current_agent_index_in_turn_order 
         try:
             if self.agent_turn_order[self.current_agent_index_in_turn_order] != agent_name:
@@ -584,27 +662,41 @@ class Orchestrator:
     def initialize_connectors_for_active_agents(self) -> bool:
         # This method now iterates self.agent_turn_order which should be up-to-date
         # from a preceding _load_agent_turn_order() call if called by prepare_for_run.
-        self._push_log_event("orchestrator_info", {"message": "Initializing/Verifying LLM connectors for current turn order..."})
+        # Connector construction is intentionally lazy because building a connector
+        # parses the agent's full LLM history.
+        self._push_log_event("orchestrator_info", {"message": "Validating LLM connector configs for current turn order..."})
 
         if not self.agent_turn_order:
-             self._push_log_event("orchestrator_info", {"message": "No agents in current turn order to initialize connectors for."})
+             self._push_log_event("orchestrator_info", {"message": "No agents in current turn order to validate connector configs for."})
              return True 
 
         all_successful = True
-        newly_initialized_count = 0
         for agent_name in self.agent_turn_order:
-            was_present_before = agent_name in self.agent_llm_connectors
-            # Force reinitialize if it wasn't present, to ensure it gets set up.
-            # If it was present, initialize_connector_for_agent won't re-init unless force_reinitialize=True.
-            if not self.initialize_connector_for_agent(agent_name, force_reinitialize=not was_present_before):
+            if not self._validate_connector_config_for_agent(agent_name):
                 all_successful = False
-            elif not was_present_before and agent_name in self.agent_llm_connectors:
-                newly_initialized_count +=1
         
-        msg_end = f"Connector initialization/verification complete. {newly_initialized_count} new/reinitialized. All successful: {all_successful}."
+        msg_end = f"Connector config validation complete. Connectors will initialize lazily. All successful: {all_successful}."
         self._push_log_event("orchestrator_info", {"message": msg_end})
         # self.is_prepared should be set based on this in prepare_for_run
         return all_successful
+
+    def _validate_connector_config_for_agent(self, agent_name: str) -> bool:
+        agent_data = self.station.agent_module.load_agent_data(agent_name)
+        if not agent_data:
+            self._push_log_event("connector_error", {"agent_name": agent_name, "message": "Agent data not found for connector config validation."})
+            return False
+        model_provider_class = agent_data.get(constants.AGENT_MODEL_PROVIDER_CLASS_KEY)
+        model_name_specific = agent_data.get(constants.AGENT_MODEL_NAME_KEY)
+        if not model_provider_class or not model_name_specific:
+            self._push_log_event("connector_error", {"agent_name": agent_name, "message": "Agent missing provider or model name."})
+            return False
+        agent_specific_data_path = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME, agent_name)
+        try:
+            file_io_utils.ensure_dir_exists(agent_specific_data_path)
+        except Exception as e:
+            self._push_log_event("connector_error", {"agent_name": agent_name, "message": f"Dir creation fail: {e}"})
+            return False
+        return True
 
     def initialize_connector_for_agent(self, agent_name: str, force_reinitialize: bool = False) -> bool:
         if not force_reinitialize and agent_name in self.agent_llm_connectors:
@@ -665,404 +757,34 @@ class Orchestrator:
             "message": f"Runtime API configuration updated to generation {generation}. New LLM requests will use refreshed connectors."
         })
 
-    def _get_llm_response(self, agent_name: str, observation: str, current_tick: int) -> Tuple[Optional[str], bool]:
-        connector = self._get_current_connector_for_agent(agent_name)
-        if not connector:
-            err_msg = f"SYSTEM_ERROR: No LLM connector for {agent_name}."
-            self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error": err_msg})
-            # --- MODIFICATION START: Log error to main dialogue log ---
-            self.station._log_dialogue_entry(agent_name, {
-                "tick": current_tick,
-                "speaker": "Station",
-                "type": "llm_connector_error",
-                "error": err_msg
-            })
-            # --- MODIFICATION END ---
-            return None, False 
-
-        # Stream prompt text; web_interface sanitizes it to the selected dashboard agent.
-        self._push_log_event("llm_event", {
-            "agent_name": agent_name,
+    def _pause_for_unavailable_connector(self, agent_name: str, current_tick: int) -> None:
+        """Pause the station when an agent connector cannot be constructed."""
+        err_msg = f"SYSTEM_ERROR: No LLM connector for {agent_name}."
+        self._push_log_event(
+            "llm_event_error",
+            {"agent_name": agent_name, "tick": current_tick, "error": err_msg},
+        )
+        self.station._log_dialogue_entry(agent_name, {
             "tick": current_tick,
-            "direction": "to_llm",
-            "type": "observation",
-            "text_content": observation,
-            "full_length": len(observation),
+            "speaker": "Station",
+            "type": "llm_connector_error",
+            "error": err_msg,
         })
-        
-        with self._agent_response_context(agent_name), tick_timing.time_phase(
-            current_tick,
-            "wait_agent_response",
-            constants.SYNC_MODE_SEQUENTIAL,
-            metadata={"agent_name": agent_name},
-        ):
-            try:
-                # --- MODIFICATION START: Unpack thinking_text ---
-                response_text, thinking_text, token_info = connector.send_message(observation, current_tick)
-                # --- MODIFICATION END ---
-
-                # --- MODIFICATION START: Log thinking_text to main dialogue log if present ---
-                if thinking_text:
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick,
-                        "speaker": "AgentLLM", # Or a more specific speaker like "AgentLLMThinking"
-                        "type": "thinking_block",
-                        "agent_name": agent_name, # Ensure agent_name is part of the log data
-                        "content": thinking_text 
-                    })
-                # --- MODIFICATION END ---
-                
-                resp_snippet = response_text.replace('\n', ' ')[:150] + "..."
-                self._push_log_event("llm_event", {
-                    "agent_name": agent_name, "tick": current_tick, "direction": "from_llm", "type": "response", 
-                    "text_content": response_text, 
-                    "thinking_text": thinking_text, # MODIFIED: Include thinking_text in SSE event
-                    "full_length": len(response_text), 
-                    "token_info": token_info
-                })
-                total_tokens_in_session = token_info.get('total_tokens_in_session')
-                if total_tokens_in_session is not None:
-                    can_continue = self.station.update_agent_token_budget(agent_name, total_tokens_in_session)
-                    if not can_continue:
-                        self._push_log_event("orchestrator_warning", {
-                            "message": f"Failed to persist token budget update for agent {agent_name}.",
-                            "agent_name": agent_name,
-                            "tick": current_tick
-                        })
-                        return response_text, False # response_text might still be useful for a final display
-                    else: 
-                        adata = self.station.agent_module.load_agent_data(agent_name); 
-                        cur = adata.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY) if adata else "N/A"; 
-                        mx = adata.get(constants.AGENT_TOKEN_BUDGET_MAX_KEY) if adata else "N/A"
-                        self._push_log_event("agent_event", {"type": "token_budget_updated", "agent_name": agent_name, "tick": current_tick, "current_used": cur, "max_budget":mx})
-                return response_text, True
-
-            except LLMTransientAPIError as e:
-                err_msg = f"Transient API Error for {agent_name}: {e}. Orchestrator will pause."
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error_type": "LLMTransientAPIError", "error": str(e), "original_exception": str(e.original_exception)})
-                # --- MODIFICATION START: Log error to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick, "speaker": "Station", "type": "llm_api_error_transient",
-                    "error": str(e), "original_exception": str(e.original_exception)
-                })
-                # --- MODIFICATION END ---
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_TRANSIENT_API_ERROR")
-                return None, True 
-            
-            except LLMSafetyBlockError as e:
-                err_msg = f"LLM Safety Block for {agent_name}: {e}. Block Reason: {e.block_reason}."
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error_type": "LLMSafetyBlockError", "error": str(e), "block_reason": e.block_reason, "prompt_feedback": str(e.prompt_feedback)})
-                # --- MODIFICATION START: Log safety block to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick, "speaker": "Station", "type": "llm_safety_block",
-                    "error": str(e), "block_reason": str(e.block_reason), "prompt_feedback": str(e.prompt_feedback)
-                })
-                # --- MODIFICATION END ---
-                # Pause orchestrator for safety blocks to allow human intervention
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_SAFETY_BLOCK")
-                return f"SYSTEM_ERROR: LLM response blocked by safety filters. Orchestrator paused for human intervention.", True
-
-            except LLMContextOverflowError as e:
-                err_msg = f"Context window overflow for {agent_name}: {e}. Station paused for manual check."
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {
-                    "agent_name": agent_name,
-                    "tick": current_tick,
-                    "error_type": "LLMContextOverflowError",
-                    "error": str(e),
-                    "action": "paused_for_manual_check",
-                })
-                # --- MODIFICATION START: Log context overflow pause to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick,
-                    "speaker": "Station",
-                    "type": "llm_context_overflow_manual_pause",
-                    "reason": "Context overflow persisted after connector retries. Station paused for manual check.",
-                    "error": str(e)
-                })
-                # --- MODIFICATION END ---
-                # Old behavior intentionally disabled: do not terminate or respawn an agent
-                # just because an external API returned a context-overflow error.
-                # critical_notification = "CRITICAL: Your input exceeded the model's context window. Your session is being terminated."
-                # self.station._terminate_agent_session_with_broadcast(agent_name, "context window overflow", critical_notification)
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CONTEXT_OVERFLOW")
-                return f"SYSTEM_ERROR: Context window overflow for {agent_name}. Station paused for manual check.", True
-
-            except LLMCorruptedThoughtSignatureError as e:
-                err_msg = f"Corrupted Gemini thought signature for {agent_name}: {e}. Station paused for manual check."
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {
-                    "agent_name": agent_name,
-                    "tick": current_tick,
-                    "error_type": "LLMCorruptedThoughtSignatureError",
-                    "error": str(e),
-                    "original_exception": str(e.original_exception),
-                    "action": "paused_without_retry",
-                })
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick,
-                    "speaker": "Station",
-                    "type": "llm_corrupted_thought_signature_manual_pause",
-                    "reason": "Gemini rejected a persisted thought signature. Station paused without provider fallback or retry.",
-                    "error": str(e),
-                    "original_exception": str(e.original_exception),
-                })
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CORRUPTED_THOUGHT_SIGNATURE")
-                return f"SYSTEM_ERROR: Corrupted Gemini thought signature for {agent_name}. Station paused for manual check.", True
-
-            except LLMPermanentAPIError as e:
-                err_msg = f"Permanent API Error for {agent_name}: {e}. This agent's LLM connector may be misconfigured or disabled."
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error_type": "LLMPermanentAPIError", "error": str(e), "original_exception": str(e.original_exception)})
-                # --- MODIFICATION START: Log error to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick, "speaker": "Station", "type": "llm_api_error_permanent",
-                    "error": str(e), "original_exception": str(e.original_exception)
-                })
-                # --- MODIFICATION END ---
-                # Pause orchestrator for permanent API errors to allow human intervention
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_PERMANENT_API_ERROR")
-                return f"SYSTEM_ERROR: Permanent LLM API Error for {agent_name}. Orchestrator paused for human intervention.", True
-            
-            except Exception as e: 
-                err_msg = f"Unexpected error getting LLM response for {agent_name}: {e}"
-                print(f"Orchestrator: {err_msg}")
-                self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "error_type": "UnknownConnectorError", "error": err_msg, "trace": traceback.format_exc()})
-                # --- MODIFICATION START: Log error to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick, "speaker": "Station", "type": "llm_connector_error_unknown",
-                    "error": err_msg, "trace": traceback.format_exc()
-                })
-                # --- MODIFICATION END ---
-                self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CONNECTOR_ERROR")
-                return f"SYSTEM_ERROR: Unexpected LLM Connector Error for {agent_name}.", True
-
-    def _handle_real_internal_action_loop(self, 
-                                          agent_name: str, 
-                                          handler_wrapper: LoggingInternalActionHandlerWrapper, 
-                                          initial_prompt: str, 
-                                          current_tick: int):
-        self._push_log_event("internal_action_event", {
-            "agent_name": agent_name, "tick": current_tick, "status": "start", 
-            "handler": type(handler_wrapper.actual_handler).__name__, 
-            "text_content": initial_prompt 
-        })
-        
-        connector_context = self._prepare_internal_action_connector_context(agent_name, handler_wrapper, current_tick)
-        connector = connector_context.get("connector")
-        connector_error = connector_context.get("error")
-        if not connector:
-            if connector_error:
-                err_msg = f"LLM connector unavailable for agent {agent_name}. Internal action cannot proceed: {connector_error}"
-            else:
-                err_msg = f"LLM connector missing for agent {agent_name}. Internal action cannot proceed."
-            self._push_log_event("internal_action_event", {"agent_name": agent_name, "tick": current_tick, "status": "error", "message": err_msg})
-            # --- MODIFICATION START: Log error to main dialogue log ---
-            self.station._log_dialogue_entry(agent_name, {
-                "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                "speaker": "Station", "type": "internal_action_llm_connector_error", 
-                "handler": type(handler_wrapper.actual_handler).__name__, "error": err_msg
-            })
-            # --- MODIFICATION END ---
-            return
-
-        current_internal_prompt = initial_prompt
-        max_internal_steps = 50
-        loop_step_count = 0
-
-        try:
-            while current_internal_prompt and loop_step_count < max_internal_steps and self.is_running:
-                loop_step_count += 1
-
-                # Stream prompt text; web_interface sanitizes it to the selected dashboard agent.
-                self._push_log_event("llm_event", {
-                    "agent_name": agent_name,
-                    "tick": current_tick,
-                    "internal_loop_step": loop_step_count,
-                    "direction": "to_llm",
-                    "type": "internal_prompt",
-                    "text_content": current_internal_prompt,
-                    "full_length": len(current_internal_prompt),
-                })
-
-                try:
-                    # --- MODIFICATION START: Unpack internal_thinking_text ---
-                    llm_internal_response_text, internal_thinking_text, token_info = connector.send_message(current_internal_prompt, current_tick)
-                    # --- MODIFICATION END ---
-                except LLMTransientAPIError as e:
-                    err_msg = f"Transient API Error during internal action for {agent_name}: {e}. Pausing orchestrator."
-                    print(f"Orchestrator: {err_msg}")
-                    self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "internal_loop_step": loop_step_count, "error_type": "LLMTransientAPIError_Internal", "error": str(e)})
-                    # --- MODIFICATION START: Log error to main dialogue log ---
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                        "speaker": "Station", "type": "internal_action_api_error_transient",
-                        "handler": type(handler_wrapper.actual_handler).__name__, "error": str(e)
-                    })
-                    # --- MODIFICATION END ---
-                    self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_TRANSIENT_API_ERROR_INTERNAL")
-                    return
-                except LLMSafetyBlockError as e:
-                    err_msg = f"LLM Safety Block during internal action for {agent_name}: {e}."
-                    print(f"Orchestrator: {err_msg}")
-                    self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "internal_loop_step": loop_step_count, "error_type": "LLMSafetyBlockError_Internal", "error": str(e)})
-                    # --- MODIFICATION START: Log safety block to main dialogue log ---
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                        "speaker": "Station", "type": "internal_action_llm_safety_block",
-                        "handler": type(handler_wrapper.actual_handler).__name__, "error": str(e),
-                        "block_reason": str(e.block_reason), "prompt_feedback": str(e.prompt_feedback)
-                    })
-                    # --- MODIFICATION END ---
-                    llm_internal_response_text = f"SYSTEM_ERROR: LLM response blocked by safety filters. Reason: {e.block_reason}."
-                    internal_thinking_text = None # No thinking if blocked
-                except LLMContextOverflowError as e:
-                    err_msg = f"Context window overflow during internal action for {agent_name}: {e}. Station paused for manual check."
-                    print(f"Orchestrator: {err_msg}")
-                    self._push_log_event("llm_event_error", {
-                        "agent_name": agent_name,
-                        "tick": current_tick,
-                        "internal_loop_step": loop_step_count,
-                        "error_type": "LLMContextOverflowError_Internal",
-                        "error": str(e),
-                        "action": "paused_for_manual_check",
-                    })
-                    # --- MODIFICATION START: Log context overflow pause to main dialogue log ---
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                        "speaker": "Station", "type": "internal_action_context_overflow_manual_pause",
-                        "handler": type(handler_wrapper.actual_handler).__name__,
-                        "reason": "Context overflow persisted after connector retries during internal action. Station paused for manual check.",
-                        "error": str(e)
-                    })
-                    # --- MODIFICATION END ---
-                    # Old behavior intentionally disabled: do not terminate or respawn an agent
-                    # just because an external API returned a context-overflow error.
-                    # critical_notification = "CRITICAL: Your input exceeded the model's context window during an internal action. Your session is being terminated."
-                    # self.station._terminate_agent_session_with_broadcast(agent_name, "context window overflow", critical_notification)
-                    self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CONTEXT_OVERFLOW_INTERNAL")
-                    return
-                except LLMCorruptedThoughtSignatureError as e:
-                    err_msg = f"Corrupted Gemini thought signature during internal action for {agent_name}: {e}. Pausing orchestrator."
-                    print(f"Orchestrator: {err_msg}")
-                    self._push_log_event("llm_event_error", {
-                        "agent_name": agent_name,
-                        "tick": current_tick,
-                        "internal_loop_step": loop_step_count,
-                        "error_type": "LLMCorruptedThoughtSignatureError_Internal",
-                        "error": str(e),
-                        "action": "paused_without_retry",
-                    })
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick,
-                        "internal_step": handler_wrapper.internal_step_count,
-                        "speaker": "Station",
-                        "type": "internal_action_corrupted_thought_signature_manual_pause",
-                        "handler": type(handler_wrapper.actual_handler).__name__,
-                        "reason": "Gemini rejected a persisted thought signature during internal action. Station paused without provider fallback or retry.",
-                        "error": str(e),
-                    })
-                    self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CORRUPTED_THOUGHT_SIGNATURE_INTERNAL")
-                    return
-                except (LLMPermanentAPIError, LLMConnectorError) as e:
-                    err_msg = f"Permanent/Connector Error during internal action for {agent_name}: {e}. Aborting internal action."
-                    print(f"Orchestrator: {err_msg}")
-                    self._push_log_event("llm_event_error", {"agent_name": agent_name, "tick": current_tick, "internal_loop_step": loop_step_count, "error_type": type(e).__name__ + "_Internal", "error": str(e)})
-                    # --- MODIFICATION START: Log error to main dialogue log ---
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                        "speaker": "Station", "type": "internal_action_api_error_permanent",
-                        "handler": type(handler_wrapper.actual_handler).__name__, "error": str(e)
-                    })
-                    # --- MODIFICATION END ---
-                    self._trigger_pause_due_to_llm_error(agent_name, e, "LLM_CONNECTOR_ERROR_INTERNAL")
-                    handler_wrapper.step(f"SYSTEM_ERROR: LLM connection failed permanently: {e}")
-                    return
-
-                # --- MODIFICATION START: Log internal_thinking_text to main dialogue log if present ---
-                if internal_thinking_text:
-                    self.station._log_dialogue_entry(agent_name, {
-                        "tick": current_tick,
-                        "internal_step": handler_wrapper.internal_step_count, # Add step for context
-                        "speaker": "AgentLLM", # Or "AgentLLMThinkingInternal"
-                        "type": "thinking_block_internal",
-                        "agent_name": agent_name,
-                        "handler": type(handler_wrapper.actual_handler).__name__,
-                        "content": internal_thinking_text
-                    })
-                # --- MODIFICATION END ---
-
-                total_tokens_in_session = token_info.get('total_tokens_in_session')
-                can_continue_session = True
-                if total_tokens_in_session is not None:
-                    if connector_context.get("override_active"):
-                        self._push_log_event("agent_event", {
-                            "type": "token_budget_update_deferred_for_llm_override",
-                            "agent_name": agent_name,
-                            "tick": current_tick,
-                            "internal_loop_step": loop_step_count,
-                            "override_reported_tokens": total_tokens_in_session,
-                            "reason": "Original connector will recount after override history migration.",
-                        })
-                    else:
-                        can_continue_session = self.station.update_agent_token_budget(agent_name, total_tokens_in_session)
-                        if not can_continue_session:
-                            self._push_log_event("orchestrator_warning", {
-                                "message": f"Failed to persist token budget update during internal action for agent {agent_name}.",
-                                "agent_name": agent_name,
-                                "tick": current_tick,
-                                "internal_loop_step": loop_step_count
-                            })
-                            handler_wrapper.step(f"SYSTEM_NOTE: Token budget update could not be saved for {agent_name}.")
-                            break
-
-                self._push_log_event("llm_event", {
-                    "agent_name": agent_name, "tick": current_tick, "internal_loop_step": loop_step_count,
-                    "direction": "from_llm", "type": "internal_response",
-                    "text_content": llm_internal_response_text,
-                    "thinking_text": internal_thinking_text, # MODIFIED: Include thinking_text in SSE
-                    "token_info": token_info
-                })
-
-                next_prompt, executed_strings_in_step = handler_wrapper.step(llm_internal_response_text)
-                # The LoggingInternalActionHandlerWrapper already logs the "agent_response" (llm_internal_response_text)
-                # and the "next_internal_prompt" or "internal_completion" to the main dialogue log.
-                # We have added separate logging for the thinking_block above.
-
-                delta_updates = handler_wrapper.get_delta_updates()
-                if delta_updates:
-                    if self.station.update_specific_agent_fields(agent_name, delta_updates):
-                        self._push_log_event("internal_action_event", {"agent_name": agent_name, "tick": current_tick, "status": "delta_applied", "step": handler_wrapper.internal_step_count, "updates": list(delta_updates.keys())})
-
-                if executed_strings_in_step:
-                    self._push_log_event("internal_action_event", {"agent_name": agent_name, "tick": current_tick, "status": "step_executed_strings", "step": handler_wrapper.internal_step_count, "log": executed_strings_in_step})
-
-                if next_prompt is None:
-                    self._push_log_event("internal_action_event", {"agent_name": agent_name, "tick": current_tick, "status": "end", "handler": type(handler_wrapper.actual_handler).__name__, "final_log": executed_strings_in_step})
-                    break
-                current_internal_prompt = next_prompt
-
-            if loop_step_count >= max_internal_steps:
-                self._push_log_event("internal_action_event", {"agent_name": agent_name, "tick": current_tick, "status": "max_steps_reached", "handler": type(handler_wrapper.actual_handler).__name__})
-                # --- MODIFICATION START: Log max steps reached to main dialogue log ---
-                self.station._log_dialogue_entry(agent_name, {
-                    "tick": current_tick, "internal_step": handler_wrapper.internal_step_count,
-                    "speaker": "Station", "type": "internal_action_max_steps",
-                    "handler": type(handler_wrapper.actual_handler).__name__
-                })
-                # --- MODIFICATION END ---
-        finally:
-            self._finalize_internal_action_connector_context(agent_name, connector_context, current_tick)
+        self._trigger_pause_due_to_llm_error(
+            agent_name,
+            LLMConnectorError(err_msg),
+            "LLM_CONNECTOR_UNAVAILABLE",
+        )
 
     def _check_automatic_wait_conditions(self) -> Tuple[bool, Dict[str, str]]:
         """Check for conditions that should trigger waiting state (auto-resumes when resolved)"""
         waiting_reasons = {}
-        
-        # Note: We do NOT wait for research evaluations here anymore.
-        # Research evaluations run in parallel and only cause waiting at tick boundaries
-        # via should_wait_for_research_evaluations_at_tick_boundary()
+
+        if (
+            hasattr(self.station, 'should_wait_for_research_evaluations_at_tick_boundary')
+            and self.station.should_wait_for_research_evaluations_at_tick_boundary()
+        ):
+            waiting_reasons['research_tick_boundary'] = "Research evaluations at tick limit"
         
         if hasattr(self.station, 'has_pending_archive_evaluations') and self.station.has_pending_archive_evaluations():
             waiting_reasons['pending_archives'] = "Pending archive evaluations"
@@ -1098,8 +820,13 @@ class Orchestrator:
             return True
             
         # Check each waiting condition
-        # Note: 'pending_research' is never added to waiting_reasons (research evals run in parallel)
-        # Research waiting happens via should_wait_for_research_evaluations_at_tick_boundary() instead
+
+        if 'research_tick_boundary' in self.waiting_reasons:
+            if (
+                hasattr(self.station, 'should_wait_for_research_evaluations_at_tick_boundary')
+                and self.station.should_wait_for_research_evaluations_at_tick_boundary()
+            ):
+                return False
 
         if 'pending_archives' in self.waiting_reasons:
             if hasattr(self.station, 'has_pending_archive_evaluations') and self.station.has_pending_archive_evaluations():
@@ -1137,68 +864,149 @@ class Orchestrator:
             "message": "Waiting conditions resolved, automatically resuming"
         })
 
-    def _refresh_connector_and_update_tokens_after_turn(self, agent_name: str, current_tick: int):
-        """
-        Called after an agent's turn processing (submit_response + internal_actions) completes.
-        Forces the connector to refresh based on latest pruning info and updates the
-        agent's token budget with the recalculated session token count.
-        """
-        connector = self.agent_llm_connectors.get(agent_name)
+    def maybe_run_context_compaction_after_turn(self, agent_name: str, current_tick: int) -> bool:
+        agent_data = self.station.agent_module.load_agent_data(agent_name)
+        if not self.station.should_compact_agent_context(agent_data):
+            return False
+        return self._run_context_compaction_maintenance(agent_name, current_tick)
+
+    def _run_context_compaction_maintenance(self, agent_name: str, current_tick: int) -> bool:
+        connector = self._get_current_connector_for_agent(agent_name)
         if not connector:
-            self._push_log_event("orchestrator_warning", {
-                "message": f"No connector found for agent {agent_name} during post-turn token refresh.",
-                "agent_name": agent_name, "tick": current_tick
-            })
-            return
+            self._push_log_event(
+                "orchestrator_warning",
+                {
+                    "message": f"No connector found for context compaction for agent {agent_name}.",
+                    "agent_name": agent_name,
+                    "tick": current_tick,
+                },
+            )
+            return False
 
+        prompt = constants.CONTEXT_COMPACTION_PROMPT_TEMPLATE.format(agent_name=agent_name)
         try:
-            print(f"Orchestrator ({agent_name}, Tick {current_tick}): Forcing connector history refresh and token recalculation post-turn.")
-            new_token_count = connector.force_refresh_and_get_current_session_tokens()
-
-            if new_token_count is not None:
-                agent_data_for_token_update = self.station.agent_module.load_agent_data(agent_name)
-                if agent_data_for_token_update:
-                    old_token_count = agent_data_for_token_update.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY)
-
-                    # Use update_agent_token_budget() to ensure termination check is performed
-                    can_continue = self.station.update_agent_token_budget(agent_name, new_token_count)
-
-                    if can_continue:
-                        self._push_log_event("agent_event", {
-                            "type": "token_budget_recalculated_post_turn",
-                            "agent_name": agent_name,
-                            "tick": current_tick,
-                            "old_token_count": old_token_count,
-                            "new_token_count": new_token_count,
-                            "reason": "Post-turn refresh, possibly due to pruning."
-                        })
-                        print(f"Orchestrator ({agent_name}, Tick {current_tick}): Token budget updated to {new_token_count} after post-turn refresh.")
-                    else:
-                        self._push_log_event("orchestrator_warning", {
-                            "message": f"Failed to persist recalculated token budget for agent {agent_name}.",
-                            "agent_name": agent_name,
-                            "tick": current_tick,
-                            "old_token_count": old_token_count,
-                            "new_token_count": new_token_count,
-                            "reason": "Post-turn token recalculation could not be saved."
-                        })
-                        print(f"Orchestrator ({agent_name}, Tick {current_tick}): Failed to persist recalculated token budget ({new_token_count} tokens).")
-                else:
-                    self._push_log_event("orchestrator_warning", {
-                        "message": f"Could not load agent data for {agent_name} to save recalculated token count.",
-                        "agent_name": agent_name, "tick": current_tick
-                    })
-            else:
-                self._push_log_event("orchestrator_warning", {
-                    "message": f"Connector for {agent_name} returned None for recalculated token count.",
-                    "agent_name": agent_name, "tick": current_tick
-                })
-        except Exception as e:
-            self._push_log_event("orchestrator_error", {
-                "message": f"Error during post-turn token refresh for {agent_name}: {str(e)}",
-                "agent_name": agent_name, "tick": current_tick, "trace": traceback.format_exc()
+            self._push_log_event("llm_event", {
+                "agent_name": agent_name,
+                "tick": current_tick,
+                "direction": "to_llm",
+                "type": "context_compaction_prompt",
+                "text_content": prompt,
+                "full_length": len(prompt),
             })
-            print(f"Orchestrator ({agent_name}, Tick {current_tick}): Exception during force_refresh_and_get_current_session_tokens: {e}")
+            self.station._log_dialogue_entry(agent_name, {
+                "tick": current_tick,
+                "speaker": "Station",
+                "type": "context_compaction_prompt",
+                "content": prompt,
+            })
+            self._push_log_event(
+                "context_compaction_event",
+                {
+                    "type": "prompt",
+                    "agent_name": agent_name,
+                    "tick": current_tick,
+                },
+            )
+
+            try:
+                response_text, thinking_text, _token_info = connector.send_message(prompt, current_tick)
+            except (
+                LLMTransientAPIError,
+                LLMPermanentAPIError,
+                LLMSafetyBlockError,
+                LLMConnectorError,
+                LLMContextOverflowError,
+                LLMCorruptedThoughtSignatureError,
+            ) as exc:
+                self.station._log_dialogue_entry(agent_name, {
+                    "tick": current_tick,
+                    "speaker": "Station",
+                    "type": "context_compaction_error",
+                    "error": str(exc),
+                })
+                self._trigger_pause_due_to_llm_error(agent_name, exc, "LLM_CONTEXT_COMPACTION_ERROR")
+                return False
+            except Exception as exc:
+                self.station._log_dialogue_entry(agent_name, {
+                    "tick": current_tick,
+                    "speaker": "Station",
+                    "type": "context_compaction_error",
+                    "error": str(exc),
+                    "trace": traceback.format_exc(),
+                })
+                self._trigger_pause_due_to_llm_error(agent_name, exc, "LLM_CONTEXT_COMPACTION_ERROR")
+                return False
+
+            if thinking_text:
+                self.station._log_dialogue_entry(agent_name, {
+                    "tick": current_tick,
+                    "speaker": "AgentLLM",
+                    "type": "thinking_block_context_compaction",
+                    "agent_name": agent_name,
+                    "content": thinking_text,
+                })
+            self.station._log_dialogue_entry(agent_name, {
+                "tick": current_tick,
+                "speaker": "Agent",
+                "type": "context_compaction_response",
+                "content": response_text,
+            })
+            self._push_log_event("llm_event", {
+                "agent_name": agent_name,
+                "tick": current_tick,
+                "direction": "from_llm",
+                "type": "context_compaction_response",
+                "text_content": response_text,
+                "thinking_text": thinking_text,
+                "full_length": len(response_text or ""),
+                "token_info": _token_info,
+            })
+
+            summary = context_compaction.normalize_summary_response(response_text)
+            if not self.station.save_context_compaction_summary(agent_name, current_tick, summary):
+                self._push_log_event(
+                    "orchestrator_warning",
+                        {
+                            "message": f"Failed to save context compaction summary for {agent_name}.",
+                            "agent_name": agent_name,
+                            "tick": current_tick,
+                        },
+                )
+                return False
+            self.station._log_dialogue_entry(agent_name, {
+                "tick": current_tick,
+                "speaker": "Station",
+                "type": "context_compaction_complete",
+                "compacted_after_tick": current_tick,
+            })
+            self._push_log_event(
+                "context_compaction_event",
+                {
+                    "type": "complete",
+                    "agent_name": agent_name,
+                    "tick": current_tick,
+                },
+            )
+            return True
+        finally:
+            try:
+                if hasattr(connector, "reload_session_from_disk"):
+                    connector.reload_session_from_disk()
+            except Exception as reload_exc:
+                self._push_log_event(
+                    "orchestrator_error",
+                    {
+                        "message": f"Failed to reload connector after context compaction for {agent_name}: {reload_exc}",
+                        "agent_name": agent_name,
+                        "tick": current_tick,
+                        "trace": traceback.format_exc(),
+                    },
+                )
+                self._trigger_pause_due_to_llm_error(
+                    agent_name,
+                    reload_exc,
+                    "LLM_CONTEXT_COMPACTION_RELOAD_ERROR",
+                )
 
     @staticmethod
     def _clean_llm_override_value(value: Any) -> Optional[str]:
@@ -1213,9 +1021,8 @@ class Orchestrator:
         handler_wrapper: LoggingInternalActionHandlerWrapper,
         current_tick: int,
     ) -> Dict[str, Any]:
-        normal_connector = self.agent_llm_connectors.get(agent_name)
         context: Dict[str, Any] = {
-            "connector": normal_connector,
+            "connector": None,
             "override_active": False,
         }
 
@@ -1231,6 +1038,7 @@ class Orchestrator:
             return context
 
         if not llm_override:
+            context["connector"] = self._get_current_connector_for_agent(agent_name)
             return context
 
         provider = self._clean_llm_override_value(llm_override.get("model_provider_class"))
@@ -1407,416 +1215,36 @@ class Orchestrator:
                     pass
 
     def run_single_tick(self):
-        if constants.SYNC_MODE == constants.SYNC_MODE_PARALLEL:
-            if (
-                self.research_submission_service is None
-                and constants.RESEARCH_CENTER_ENABLED
-                and getattr(constants, "PARALLEL_RESEARCH_FAST_LANE_ENABLED", True)
-            ):
-                from station.eval_research.submission_service import ResearchSubmissionService
+        self._check_deployment_log_sizes(self.station._get_current_tick())
+        if (
+            self.research_submission_service is None
+            and constants.RESEARCH_CENTER_ENABLED
+            and getattr(constants, "PARALLEL_RESEARCH_FAST_LANE_ENABLED", True)
+        ):
+            from station.eval_research.submission_service import ResearchSubmissionService
 
-                self.research_submission_service = ResearchSubmissionService(
-                    self.station,
-                    log_event_func=self._push_log_event,
-                )
-                self.research_submission_service.start()
-            if (
-                self.archive_survey_submission_service is None
-                and getattr(constants, "ARCHIVE_SURVEY_ENABLED", False)
-                and getattr(constants, "PARALLEL_ARCHIVE_SURVEY_FAST_LANE_ENABLED", True)
-            ):
-                from station.eval_archive.surveyor import ArchiveSurveySubmissionService
-
-                self.archive_survey_submission_service = ArchiveSurveySubmissionService(
-                    self.station,
-                    log_event_func=self._push_log_event,
-                )
-                self.archive_survey_submission_service.start()
-            if self.parallel_tick_runner is None:
-                from station.sync.parallel_runner import ParallelTickRunner
-
-                self.parallel_tick_runner = ParallelTickRunner(self)
-            return self.parallel_tick_runner.run_single_tick()
-        return self._run_single_tick_sequential()
-
-    def _run_single_tick_sequential(self):
-        if not self.is_running: return False
-        current_tick = self.station._get_current_tick()
-        tick_timing.record_tick_start(
-            current_tick,
-            constants.SYNC_MODE_SEQUENTIAL,
-            turn_order=list(self.agent_turn_order),
-        )
-        self._push_log_event("tick_event", {"type": "prepare", "tick": current_tick})
-
-        # Check for holiday mode at tick start - move agents out of Research Center
-        if (self.current_agent_index_in_turn_order == 0 and
-            self.station.is_holiday_tick(current_tick)):
-            for agent_name in self.agent_turn_order:
-                agent_data = self.station.agent_module.load_agent_data(agent_name)
-                if agent_data and agent_data.get(constants.AGENT_CURRENT_LOCATION_KEY) == constants.ROOM_RESEARCH_CENTER:
-                    # Move agent to lobby
-                    self.station.agent_module.update_agent_current_location(agent_data, constants.ROOM_LOBBY)
-                    # Add notification
-                    holiday_msg = "The Research Center is closed during holidays. You have been automatically moved to the Lobby."
-                    self.station.agent_module.add_pending_notification(agent_data, holiday_msg)
-                    self.station.agent_module.save_agent_data(agent_name, agent_data)
-                    self._push_log_event("holiday_event", {"agent": agent_name, "action": "moved_from_research", "tick": current_tick})
-
-        if not self.is_prepared: # Should ideally be prepared before run_single_tick is called by main_loop
-            print("Orchestrator: FATAL - run_single_tick called while not prepared. Stopping.")
-            self._push_log_event("orchestrator_error", {"message": "run_single_tick called without preparation."})
-            self.is_running = False
-            return False
-
-        # _load_agent_turn_order is now primarily for updating the list and handling removed/added agents' connectors.
-        # The current_agent_index_in_turn_order should persist across calls to run_single_tick unless a tick completes.
-        self._load_agent_turn_order() 
-
-        if not self.agent_turn_order:
-            self._push_log_event("tick_event", {"type": "skip_empty_order", "tick": current_tick})
-            self.station.end_tick(); new_tick_after_empty = self.station._get_current_tick()
-            tick_timing.record_tick_end(
-                current_tick,
-                new_tick_after_empty,
-                constants.SYNC_MODE_SEQUENTIAL,
-                metadata={"empty_turn_order": True},
+            self.research_submission_service = ResearchSubmissionService(
+                self.station,
+                log_event_func=self._push_log_event,
             )
-            self._push_log_event("tick_event", {"type": "end_after_empty", "ended_tick": current_tick, "next_tick": new_tick_after_empty})
-            return True 
+            self.research_submission_service.start()
+        if (
+            self.archive_survey_submission_service is None
+            and getattr(constants, "ARCHIVE_SURVEY_ENABLED", False)
+            and getattr(constants, "PARALLEL_ARCHIVE_SURVEY_FAST_LANE_ENABLED", True)
+        ):
+            from station.eval_archive.surveyor import ArchiveSurveySubmissionService
 
-        self._push_log_event("tick_event", {"type": "start", "tick": current_tick, "turn_order": self.agent_turn_order, "start_index": self.current_agent_index_in_turn_order})
-        all_agents_processed_successfully_this_tick = True
-
-        while self.current_agent_index_in_turn_order < len(self.agent_turn_order):
-            if not self.is_running: return False 
-
-            if self.is_paused: 
-                self._push_log_event("orchestrator_status", {"status": "paused_wait", "reason": self.get_pause_reason()})
-                self.pause_event.wait()
-                self.pause_event.clear()
-                if not self.is_running: return False 
-                self._push_log_event("orchestrator_status", {"status": "resumed_in_tick"})
-            
-            # Check pause request first - it should override waiting state
-            if self.pause_requested:
-                self.is_paused = True
-                self.pause_requested = False
-                if self.is_waiting:
-                    # Transitioning from waiting to paused
-                    self.pause_reason_message = "Manual pause request received (was waiting)."
-                    self._push_log_event("orchestrator_status", {"status": "paused_from_waiting", "reason": self.pause_reason_message, "next_agent_index": self.current_agent_index_in_turn_order, "waiting_reasons": self.waiting_reasons})
-                else:
-                    self.pause_reason_message = "Manual pause request received."
-                    self._push_log_event("orchestrator_status", {"status": "paused", "reason": self.pause_reason_message, "next_agent_index": self.current_agent_index_in_turn_order})
-                
-                if self.station and self.is_prepared:
-                    self.station.save_next_agent_index_to_config(self.current_agent_index_in_turn_order)
-                    self._push_log_event("orchestrator_info", {"message": f"Saved next agent index {self.current_agent_index_in_turn_order} to config due to manual pause."})
-                return True
-            
-            if self.is_waiting:
-                # Check if wait conditions are resolved
-                if self._check_wait_conditions_resolved():
-                    self._exit_waiting_state()
-                else:
-                    # Still waiting, skip processing
-                    return True 
-
-            agent_name = self.agent_turn_order[self.current_agent_index_in_turn_order]
-            self._push_log_event("agent_event", {"type": "turn_start", "agent_name": agent_name, "tick": current_tick})
-            
-            agent_data_for_turn = self.station.agent_module.load_agent_data(agent_name)
-            if not agent_data_for_turn:
-                self._push_log_event("agent_event", {"type": "turn_skip_inactive", "agent_name": agent_name, "tick": current_tick})
-                self.current_tick_processed_agents.add(agent_name)
-                self.current_agent_index_in_turn_order += 1
-                continue
-
-            # Check if a session end has been requested for this agent.
-            # Manual end is an administrative/emergency path and does not run
-            # the normal descendant role prompt.
-            if agent_data_for_turn.get(constants.AGENT_SESSION_END_REQUESTED_KEY):
-                self._push_log_event("agent_event", {"type": "session_end_by_request", "agent_name": agent_name, "tick": current_tick})
-                self.station.end_agent_session(agent_name)
-                self.remove_agent_from_orchestrator(agent_name)
-                # The agent is now removed from the live turn order, so we continue to the next index,
-                # which will now point to the next agent in the modified list.
-                # No need to increment the index here as the list has shifted.
-                continue
-            
-            # Check agent life limit
-            can_continue_life, life_limit_handler = self.station._check_agent_life_limit(agent_name, current_tick)
-            if not can_continue_life:
-                self._push_log_event("agent_event", {"type": "turn_ended_life_limit", "agent_name": agent_name, "tick": current_tick})
-                if life_limit_handler:
-                    initial_prompt = life_limit_handler.init()
-                    with tick_timing.time_phase(
-                        current_tick,
-                        "internal_action_loop",
-                        constants.SYNC_MODE_SEQUENTIAL,
-                        metadata={
-                            "agent_name": agent_name,
-                            "handler": type(life_limit_handler.actual_handler).__name__,
-                            "source": "life_limit",
-                        },
-                    ):
-                        self._handle_real_internal_action_loop(agent_name, life_limit_handler, initial_prompt, current_tick)
-                self.current_tick_processed_agents.add(agent_name)
-                self.current_agent_index_in_turn_order += 1
-                all_agents_processed_successfully_this_tick = False
-                continue
-            
-            # Check and notify if agent just reached maturity
-            self.station._check_and_notify_maturity(agent_name, agent_data_for_turn, current_tick)
-            
-            # NOTE: Removed turn skipping for agents awaiting human intervention
-            # Agents can continue working while waiting for human assistance
-
-            # Sync connector state before generating observation to ensure token counts are fresh
-            # This is idempotent - if pruning blocks haven't changed, it's a no-op (no wasted computation)
-            with tick_timing.time_phase(
-                current_tick,
-                "prepare_station_response",
-                constants.SYNC_MODE_SEQUENTIAL,
-                metadata={"agent_name": agent_name},
-            ):
-                connector = self._get_current_connector_for_agent(agent_name)
-                if connector:
-                    connector.sync_state()
-
-                observation_markdown, obs_error = self.station.request_status(agent_name)
-            if obs_error or not observation_markdown:
-                self._push_log_event("agent_event", {"type": "turn_skip_obs_error", "agent_name": agent_name, "tick": current_tick, "error": obs_error})
-                self.current_tick_processed_agents.add(agent_name)
-                self.current_agent_index_in_turn_order += 1
-                continue
-
-            # MODIFICATION: _get_llm_response now returns (text, can_continue_bool)
-            llm_response_text, can_agent_session_continue = self._get_llm_response(agent_name, observation_markdown, current_tick)
-
-            if self.is_paused: # _get_llm_response might have triggered a pause via _trigger_pause_due_to_llm_error
-                print(f"Orchestrator: Paused after LLM API error for {agent_name}. Turn will be retried upon resume.")
-                # Do NOT increment current_agent_index_in_turn_order
-                return True # Signal main_loop to wait on pause_event
-
-            if llm_response_text is None and not can_agent_session_continue: # Critical connector error
-                 self._push_log_event("agent_event", {"type": "turn_skip_connector_fail", "agent_name": agent_name, "tick": current_tick})
-                 self.current_tick_processed_agents.add(agent_name); self.current_agent_index_in_turn_order += 1; all_agents_processed_successfully_this_tick = False; continue
-            
-            if not can_agent_session_continue: # Session ended due to tokens or other critical LLM issue
-                self._push_log_event("agent_event", {"type": "turn_ended_by_llm_response_handler", "agent_name": agent_name, "tick": current_tick, "reason": "Token budget or critical LLM error."})
-                # Agent session is already marked ended by station.update_agent_token_budget
-                # It will be pruned from turn order on next tick's _load_agent_turn_order
-                self.current_tick_processed_agents.add(agent_name)
-                self.current_agent_index_in_turn_order += 1
-                all_agents_processed_successfully_this_tick = False # This agent's turn ended prematurely
-                continue # Move to next agent
-            with tick_timing.time_phase(
-                current_tick,
-                "commit_agent_response",
-                constants.SYNC_MODE_SEQUENTIAL,
-                metadata={"agent_name": agent_name},
-            ):
-                handler_wrapper, actions_executed_summary, submit_error = self.station.submit_response(agent_name, llm_response_text) # type: ignore
-            
-            if submit_error:
-                self._push_log_event("agent_event", {"type": "submit_error", "agent_name": agent_name, "tick": current_tick, "error": submit_error})
-            if actions_executed_summary:
-                 self._push_log_event("agent_event", {"type": "actions_executed", "agent_name": agent_name, "tick": current_tick, "summary": actions_executed_summary})
-            
-            if handler_wrapper:
-                initial_prompt = handler_wrapper.init() 
-                with tick_timing.time_phase(
-                    current_tick,
-                    "internal_action_loop",
-                    constants.SYNC_MODE_SEQUENTIAL,
-                    metadata={
-                        "agent_name": agent_name,
-                        "handler": type(handler_wrapper.actual_handler).__name__,
-                    },
-                ):
-                    self._handle_real_internal_action_loop(agent_name, handler_wrapper, initial_prompt, current_tick)
-                if self.is_paused: 
-                    self._push_log_event("orchestrator_status", {"status": "paused_during_internal", "agent_name": agent_name})
-                    return True 
-
-            # Token count is already updated from API response in _get_llm_response_for_agent
-            # Only need to recount if pruning blocks change (handled in force_refresh before next send_message)
-            # Removed: self._refresh_connector_and_update_tokens_after_turn(agent_name, current_tick)
-
-            self.current_tick_processed_agents.add(agent_name)
-            self._push_log_event("agent_event", {"type": "turn_end", "agent_name": agent_name, "tick": current_tick})
-            self.current_agent_index_in_turn_order += 1
-        
-        if not self.is_running: return False
-
-        if self.current_agent_index_in_turn_order >= len(self.agent_turn_order):
-            self._push_log_event("tick_event", {"type": "all_agents_processed", "tick": current_tick})
-            self.current_agent_index_in_turn_order = 0
-            self.current_tick_processed_agents.clear()
-
-            if self.station and self.is_prepared and not self.is_paused: # Only save if not already paused for another reason
-                self.station.save_next_agent_index_to_config(self.current_agent_index_in_turn_order) # Should save 0
-                #self._push_log_event("orchestrator_info", {"message": f"Saved next agent index {self.current_agent_index_in_turn_order} to config after full tick completion."})            
-
-            # Check for pause conditions first (manual resume required) - human intervention overrides waiting
-            should_auto_pause, auto_pause_reason = self._check_automatic_pause_conditions()
-            if should_auto_pause:
-                self.is_paused = True
-                self.pause_condition_met = True
-                self._push_log_event("orchestrator_status", {"status": "paused_auto_condition", "tick": current_tick, "reason": self.pause_reason_message})
-
-                if self.station and self.is_prepared:
-                    self.station.save_next_agent_index_to_config(self.current_agent_index_in_turn_order) # Saves 0
-                    self._push_log_event("orchestrator_info", {"message": f"Saved next agent index {self.current_agent_index_in_turn_order} to config due to auto-pause at end of tick."})
-            else:
-                # Check for waiting conditions (auto-resume) only if not pausing
-                should_wait, wait_reasons = self._check_automatic_wait_conditions()
-                if should_wait:
-                    self._enter_waiting_state(wait_reasons)
-            
-            # Check if we need to wait for research evaluations at tick boundary
-            if hasattr(self.station, 'should_wait_for_research_evaluations_at_tick_boundary'):
-                if self.station.should_wait_for_research_evaluations_at_tick_boundary():
-                    # Enter formal waiting state so it shows in the web interface
-                    self._enter_waiting_state({'research_tick_boundary': 'Research evaluations at tick limit'})
-                    
-                    self._push_log_event("orchestrator_status", {
-                        "status": "waiting_for_research_at_tick_boundary",
-                        "tick": current_tick,
-                        "message": "Waiting for research evaluations that have reached their tick limit"
-                    })
-                    
-                    # Wait for evaluations to complete or timeout
-                    with tick_timing.time_phase(
-                        current_tick,
-                        "wait_research_tick_boundary",
-                        constants.SYNC_MODE_SEQUENTIAL,
-                    ):
-                        while self.station.should_wait_for_research_evaluations_at_tick_boundary() and self.is_running:
-                            time.sleep(1)  # Check every second
-                            # Keep the waiting state active
-                            if not self.is_waiting:
-                                self._enter_waiting_state({'research_tick_boundary': 'Research evaluations at tick limit'})
-                    
-                    # Exit waiting state
-                    if self.is_waiting:
-                        self._exit_waiting_state()
-                    
-                    self._push_log_event("orchestrator_status", {
-                        "status": "research_wait_resolved",
-                        "tick": current_tick,
-                        "message": "Research evaluations at tick boundary have completed"
-                    })
-
-            # Check if we need to wait for external reports at tick boundary
-            if hasattr(self.station, 'should_wait_for_external_reports_at_tick_boundary'):
-                if self.station.should_wait_for_external_reports_at_tick_boundary():
-                    self._enter_waiting_state({'external_tick_boundary': 'External reports at tick limit'})
-                    self._push_log_event("orchestrator_status", {
-                        "status": "waiting_for_external_at_tick_boundary",
-                        "tick": current_tick,
-                        "message": "Waiting for external reports that have reached their tick limit"
-                    })
-                    with tick_timing.time_phase(
-                        current_tick,
-                        "wait_external_tick_boundary",
-                        constants.SYNC_MODE_SEQUENTIAL,
-                    ):
-                        while self.station.should_wait_for_external_reports_at_tick_boundary() and self.is_running:
-                            time.sleep(1)
-                            if not self.is_waiting:
-                                self._enter_waiting_state({'external_tick_boundary': 'External reports at tick limit'})
-                    if self.is_waiting:
-                        self._exit_waiting_state()
-                    self._push_log_event("orchestrator_status", {
-                        "status": "external_wait_resolved",
-                        "tick": current_tick,
-                        "message": "External reports at tick boundary have completed"
-                    })
-
-            # Wait for theory evaluations that hit tick limit
-            if hasattr(self.station, "should_wait_for_theory_evaluations_at_tick_boundary"):
-                if self.station.should_wait_for_theory_evaluations_at_tick_boundary():
-                    self._enter_waiting_state({'theory_tick_boundary': 'Theory evaluations at tick limit'})
-                    self._push_log_event("orchestrator_status", {
-                        "status": "waiting_for_theory_at_tick_boundary",
-                        "tick": current_tick,
-                        "message": "Waiting for theory evaluations that have reached their tick limit"
-                    })
-                    with tick_timing.time_phase(
-                        current_tick,
-                        "wait_theory_tick_boundary",
-                        constants.SYNC_MODE_SEQUENTIAL,
-                    ):
-                        while self.station.should_wait_for_theory_evaluations_at_tick_boundary() and self.is_running:
-                            time.sleep(1)
-                            if not self.is_waiting:
-                                self._enter_waiting_state({'theory_tick_boundary': 'Theory evaluations at tick limit'})
-                    if self.is_waiting:
-                        self._exit_waiting_state()
-                    self._push_log_event("orchestrator_status", {
-                        "status": "theory_wait_resolved",
-                        "tick": current_tick,
-                        "message": "Theory evaluations at tick boundary have completed"
-                    })
-
-            # Wait for archive surveys that hit tick limit
-            if hasattr(self.station, "should_wait_for_archive_surveys_at_tick_boundary"):
-                if self.station.should_wait_for_archive_surveys_at_tick_boundary():
-                    self._enter_waiting_state({'archive_survey_tick_boundary': 'Archive surveys at tick limit'})
-                    self._push_log_event("orchestrator_status", {
-                        "status": "waiting_for_archive_survey_at_tick_boundary",
-                        "tick": current_tick,
-                        "message": "Waiting for archive surveys that have reached their tick limit"
-                    })
-                    with tick_timing.time_phase(
-                        current_tick,
-                        "wait_archive_survey_tick_boundary",
-                        constants.SYNC_MODE_SEQUENTIAL,
-                    ):
-                        while self.station.should_wait_for_archive_surveys_at_tick_boundary() and self.is_running:
-                            time.sleep(1)
-                            if not self.is_waiting:
-                                self._enter_waiting_state({'archive_survey_tick_boundary': 'Archive surveys at tick limit'})
-                    if self.is_waiting:
-                        self._exit_waiting_state()
-                    self._push_log_event("orchestrator_status", {
-                        "status": "archive_survey_wait_resolved",
-                        "tick": current_tick,
-                        "message": "Archive surveys at tick boundary have completed"
-                    })
-            
-            new_station_tick = self.station.end_tick()
-            tick_timing.record_tick_end(
-                current_tick,
-                new_station_tick,
-                constants.SYNC_MODE_SEQUENTIAL,
-                metadata={"auto_paused": self.is_paused},
+            self.archive_survey_submission_service = ArchiveSurveySubmissionService(
+                self.station,
+                log_event_func=self._push_log_event,
             )
-            self._push_log_event("tick_event", {"type": "end", "ended_tick": current_tick, "next_tick": new_station_tick, "auto_paused": self.is_paused})
-            
-            # Create automatic backup if enabled and at backup interval
-            if backup_utils.should_create_automatic_backup(current_tick):
-                backup_path = backup_utils.create_backup(current_tick, "automatic", self.station)
-                self._push_log_event("backup_event", {
-                    "type": "automatic_backup_success",
-                    "tick": current_tick,
-                    "backup_path": backup_path,
-                    "message": f"Automatic backup created at tick {current_tick}"
-                })
+            self.archive_survey_submission_service.start()
+        if self.parallel_tick_runner is None:
+            from station.sync.parallel_runner import ParallelTickRunner
 
-            # Check and update stagnation status
-            self.station.check_stagnation()
-
-            return True
-        
-        if self.is_paused: 
-            self._push_log_event("orchestrator_status", {"status": "paused_mid_tick", "tick": current_tick, "next_agent_index": self.current_agent_index_in_turn_order})
-            return True
-
-        return False 
+            self.parallel_tick_runner = ParallelTickRunner(self)
+        return self.parallel_tick_runner.run_single_tick()
 
     def main_loop(self):
         self._push_log_event("orchestrator_status", {"status": "main_loop_initiated"})
@@ -1839,9 +1267,17 @@ class Orchestrator:
                         # Still waiting, sleep and check again
                         time.sleep(self.wait_check_interval)
                         continue
+
+                if self._check_wait_conditions_before_next_tick:
+                    self._check_wait_conditions_before_next_tick = False
+                    should_wait, wait_reasons = self._check_automatic_wait_conditions()
+                    if should_wait:
+                        self._enter_waiting_state(wait_reasons)
+                        time.sleep(self.wait_check_interval)
+                        continue
                 
                 if not self.agent_turn_order:
-                    self._push_log_event("orchestrator_info", {"message": "Agent turn order empty, re-initializing connectors/order."})
+                    self._push_log_event("orchestrator_info", {"message": "Agent turn order empty, re-validating configs/order."})
                     self.initialize_connectors_for_active_agents() 
                     if not self.agent_turn_order:
                         self._push_log_event("orchestrator_info", {"message": "Still no agents, sleeping."})
@@ -1883,7 +1319,7 @@ class Orchestrator:
             return True
         else:
             self.is_prepared = False 
-            self._push_log_event("orchestrator_error", {"status": "prepare_failed", "prepared": False, "running": self.is_running, "message": "Orchestrator preparation failed (connector issues)."})
+            self._push_log_event("orchestrator_error", {"status": "prepare_failed", "prepared": False, "running": self.is_running, "message": "Orchestrator preparation failed (connector config issues)."})
             return False
 
     def start_processing_loop(self) -> bool:
@@ -1897,7 +1333,7 @@ class Orchestrator:
             return False # Or True if already running is considered a success for this call
         
         if not self.is_prepared:
-            msg = "Orchestrator is not prepared (agent connectors not initialized). Please prepare first."
+            msg = "Orchestrator is not prepared (agent turn order/configs not validated). Please prepare first."
             print(f"Orchestrator: {msg}")
             self._push_log_event("orchestrator_control", {"action": "start_loop", "status": "not_prepared", "message": msg})
             return False
@@ -1999,6 +1435,58 @@ class Orchestrator:
         self._push_log_event("orchestrator_control", {"action": "manual_pause_request", "status": "pending", "message": msg_req})
         return msg_req
 
+    def maybe_pause_after_configured_tick_end(self, ended_tick: int) -> bool:
+        """Pause after a configured tick has fully completed.
+
+        PAUSE_AFTER_TICK_END is interpreted as the tick that just ended, not the
+        new current_tick written by Station.end_tick().
+        """
+        if not self.station:
+            return False
+
+        raw_target = getattr(constants, "PAUSE_AFTER_TICK_END", None)
+        if raw_target is None or raw_target == "":
+            return False
+
+        try:
+            target_tick = int(raw_target)
+        except (TypeError, ValueError):
+            self._push_log_event(
+                "orchestrator_warning",
+                {
+                    "message": (
+                        "Ignoring invalid PAUSE_AFTER_TICK_END: "
+                        f"{raw_target!r}; expected an integer tick."
+                    )
+                },
+            )
+            return False
+
+        if target_tick != int(ended_tick):
+            return False
+
+        self.is_paused = True
+        self.pause_requested = False
+        self.pause_condition_met = True
+        self.pause_reason_message = (
+            f"Configured pause after tick {ended_tick} completed. "
+            "All agents for that tick have responded."
+        )
+        self.current_agent_index_in_turn_order = 0
+        self.station.save_next_agent_index_to_config(0)
+        self._push_log_event(
+            "orchestrator_status",
+            {
+                "status": "paused_config_tick_end",
+                "reason": self.pause_reason_message,
+                "ended_tick": int(ended_tick),
+                "current_tick": self.station._get_current_tick(),
+                "next_agent_index": 0,
+            },
+        )
+        print(f"Orchestrator: {self.pause_reason_message}")
+        return True
+
     def cancel_pause_request(self):
         if not self.pause_requested:
             msg = "No pending pause request to cancel."
@@ -2022,6 +1510,7 @@ class Orchestrator:
 
         msg_resuming = "Orchestrator resuming..."
         print(f"Orchestrator: {msg_resuming}")
+        self._check_wait_conditions_before_next_tick = True
 
         if constants.AUTO_EVAL_RESEARCH and constants.RESEARCH_CENTER_ENABLED:
             try:
@@ -2697,6 +2186,7 @@ class Orchestrator:
                 "exists": False,
                 "agent_name": agent_name,
                 "base_tick": None,
+                "history_start_tick": None,
                 "created_at": None,
                 "updated_at": None,
                 "messages": [],
@@ -2731,6 +2221,7 @@ class Orchestrator:
             "exists": True,
             "agent_name": record.get("agent_name") or agent_name,
             "base_tick": record.get("base_tick"),
+            "history_start_tick": record.get("history_start_tick"),
             "created_at": record.get("created_at"),
             "updated_at": record.get("updated_at"),
             "messages": messages,
@@ -2786,103 +2277,12 @@ class Orchestrator:
             return None, f"Invalid branch tick: tick {base_tick} is in the future. Current station tick is {current_tick}."
         return base_tick, None
 
-    @staticmethod
-    def _parse_temporal_chat_prune_ticks(ticks_input: Any) -> set[int]:
-        if ticks_input is None or isinstance(ticks_input, bool):
-            return set()
-        try:
-            if isinstance(ticks_input, int):
-                return {ticks_input}
-            if isinstance(ticks_input, str):
-                text = ticks_input.strip()
-                if not text:
-                    return set()
-                if "-" in text and "," not in text:
-                    parts = [part.strip() for part in text.split("-")]
-                    if len(parts) == 2:
-                        start, end = int(parts[0]), int(parts[1])
-                        if start <= end:
-                            return set(range(start, end + 1))
-                if "," in text:
-                    ticks = set()
-                    for part in text.split(","):
-                        part_text = part.strip()
-                        if not part_text:
-                            continue
-                        ticks.add(int(part_text))
-                    return ticks
-                return {int(text)}
-        except (TypeError, ValueError):
-            return set()
-        return set()
-
-    @staticmethod
-    def _temporal_chat_tick_segments(ticks: set[int]) -> List[Tuple[int, int]]:
-        if not ticks:
-            return []
-        sorted_ticks = sorted(ticks)
-        segments: List[Tuple[int, int]] = []
-        start = sorted_ticks[0]
-        prev = sorted_ticks[0]
-        for tick in sorted_ticks[1:]:
-            if tick == prev + 1:
-                prev = tick
-                continue
-            segments.append((start, prev))
-            start = prev = tick
-        segments.append((start, prev))
-        return segments
-
-    @staticmethod
-    def _format_temporal_chat_tick_segment(start: int, end: int) -> Any:
-        return start if start == end else f"{start}-{end}"
-
-    def _build_temporal_chat_effective_prune_blocks(
+    def _load_temporal_chat_seed_history(
         self,
-        prune_blocks: Any,
+        agent_name: str,
         base_tick: int,
+        history_start_tick: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        if not isinstance(prune_blocks, list):
-            return []
-
-        try:
-            legacy_restore_count = int(getattr(constants, "TEMPORAL_CHAT_LEGACY_PRUNE_RESTORE_TICKS", 20))
-        except (TypeError, ValueError):
-            legacy_restore_count = 20
-        legacy_restore_count = max(0, legacy_restore_count)
-        legacy_restore_start = base_tick - legacy_restore_count + 1
-
-        effective_blocks: List[Dict[str, Any]] = []
-        for raw_block in prune_blocks:
-            if not isinstance(raw_block, dict):
-                continue
-
-            block_ticks = self._parse_temporal_chat_prune_ticks(raw_block.get(constants.PRUNE_TICKS_KEY))
-            block_ticks = {tick for tick in block_ticks if tick <= base_tick}
-            if not block_ticks:
-                continue
-
-            pruned_at_tick = self._coerce_temporal_chat_tick(raw_block.get(constants.PRUNE_PRUNED_AT_TICK_KEY))
-            if pruned_at_tick is None:
-                if legacy_restore_count > 0:
-                    block_ticks = {
-                        tick for tick in block_ticks
-                        if not (legacy_restore_start <= tick <= base_tick)
-                    }
-            elif pruned_at_tick > base_tick:
-                continue
-
-            if not block_ticks:
-                continue
-
-            for start, end in self._temporal_chat_tick_segments(block_ticks):
-                block_copy = copy.deepcopy(raw_block)
-                block_copy[constants.PRUNE_TICKS_KEY] = self._format_temporal_chat_tick_segment(start, end)
-                effective_blocks.append(block_copy)
-
-        return effective_blocks
-
-    def _load_temporal_chat_seed_history(self, agent_name: str, base_tick: int) -> List[Dict[str, Any]]:
         agent_history_file = os.path.join(
             constants.BASE_STATION_DATA_PATH,
             constants.AGENTS_DIR_NAME,
@@ -2898,7 +2298,13 @@ class Orchestrator:
             if not isinstance(entry, dict):
                 continue
             entry_tick = self._coerce_temporal_chat_tick(entry.get("tick"))
-            if entry_tick is None or entry_tick <= base_tick:
+            if entry_tick is None:
+                if history_start_tick is None:
+                    selected_entries.append(copy.deepcopy(entry))
+                continue
+            if history_start_tick is not None and entry_tick < history_start_tick:
+                continue
+            if entry_tick <= base_tick:
                 selected_entries.append(copy.deepcopy(entry))
         return selected_entries
 
@@ -2931,12 +2337,10 @@ class Orchestrator:
                 max_tokens = None
 
         custom_api_params = agent_data.get(constants.AGENT_LLM_CUSTOM_API_PARAMS_KEY)
-        prune_blocks = agent_data.get(constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY, [])
-        current_tick = self._coerce_temporal_chat_tick(self.station._get_current_tick() if self.station else 0)
-        if current_tick is not None and base_tick >= current_tick:
-            effective_prune_blocks = copy.deepcopy(prune_blocks if isinstance(prune_blocks, list) else [])
-        else:
-            effective_prune_blocks = self._build_temporal_chat_effective_prune_blocks(prune_blocks, base_tick)
+        history_start_tick = self.station.agent_module.latest_context_compaction_anchor_at_or_before(
+            agent_data,
+            base_tick,
+        )
         return {
             "model_provider_class": model_provider_class,
             "model_name": model_name_specific,
@@ -2944,7 +2348,7 @@ class Orchestrator:
             "max_tokens": max_tokens,
             "custom_api_params": copy.deepcopy(custom_api_params),
             "system_prompt": system_prompt,
-            "prune_blocks": effective_prune_blocks,
+            "history_start_tick": history_start_tick,
         }, None
 
     def _initialize_temporal_chat_fork(
@@ -2978,7 +2382,11 @@ class Orchestrator:
             file_io_utils.ensure_dir_exists(root_dir)
             file_io_utils.ensure_dir_exists(internal_dir)
 
-            history_entries = self._load_temporal_chat_seed_history(agent_name, base_tick)
+            history_entries = self._load_temporal_chat_seed_history(
+                agent_name,
+                base_tick,
+                model_snapshot.get("history_start_tick"),
+            )
             if history_entries:
                 for entry in history_entries:
                     file_io_utils.append_yaml_line(entry, internal_history_path)
@@ -2999,6 +2407,7 @@ class Orchestrator:
                 "schema_version": 2,
                 "agent_name": agent_name,
                 "base_tick": base_tick,
+                "history_start_tick": model_snapshot.get("history_start_tick"),
                 "created_at": now,
                 "updated_at": now,
                 "messages": [],
@@ -3053,15 +2462,14 @@ class Orchestrator:
         if not connector:
             return None, f"Failed to create LLM connector for temporal chat with agent '{agent_name}'."
 
-        frozen_prune_blocks = model_snapshot.get("prune_blocks")
-        if not isinstance(frozen_prune_blocks, list):
-            frozen_prune_blocks = []
         connector.persist_to_disk = True
         connector._skip_agent_data_sync = True
         connector.system_prompt = model_snapshot.get("system_prompt")
         connector._last_known_system_prompt = model_snapshot.get("system_prompt")
-        connector.agent_prune_blocks = copy.deepcopy(frozen_prune_blocks)
-        connector._last_known_prune_blocks = copy.deepcopy(frozen_prune_blocks)
+        connector.agent_prune_blocks = []
+        connector._last_known_prune_blocks = []
+        connector.context_history_start_tick = model_snapshot.get("history_start_tick")
+        connector._last_known_context_history_start_tick = model_snapshot.get("history_start_tick")
         try:
             connector._initialize_chat_session()
         except Exception as e:

@@ -1,409 +1,688 @@
-# Creating Research Tasks for the Station
+# Authoring Research Center Task Templates
 
-This guide explains how to create new research tasks for the Station's Research Center system.
+This guide is the source of truth for creating, updating, and reviewing
+Research Center task templates. Read it in full before writing a new task
+bundle.
 
-## Overview
+For coder scheduling, attempt lifecycle, restart behavior, storage permissions,
+and other runtime semantics, read `example/doc/CODER.md`. Current code wins if
+documentation and implementation disagree.
 
-Research tasks enable agents to work on scientific challenges with automated evaluation. The system supports two execution modes:
-- **Function mode**: For mathematical/algorithmic problems with deterministic outputs
-- **Command mode**: For training scripts and complex pipelines (e.g., RL tasks)
+## Current Research Center Model
 
-## Directory Structure
+The Research Center uses a single active task and an instruction-to-coder
+workflow:
 
+- The active task specification is one Markdown file: `research_task.md`.
+- Agents submit one focused experiment instruction with `title`, `tags`,
+  `abstract`, and `instruction`; they do not submit raw code directly.
+- A room-owned coder implements the instruction, makes official attempts, and
+  writes the Coder Report.
+- The active evaluator is `evaluators/evaluator.py`.
+- System baselines are declared in `baseline.yamll` and seeded at startup.
+- Read-only task resources and command-mode runners live under
+  `storage/system/`.
+- A task may be machine-scored, non-scorable, or hybrid. Use a meaningful
+  machine score when one exists; do not invent a numeric score for prose proofs
+  or other results that cannot be checked reliably.
+
+## Required Pre-Authoring Checks
+
+Before editing a task bundle:
+
+1. Run `git status --short` and preserve unrelated work.
+2. Read this guide and the relevant sections of `example/doc/CODER.md`.
+3. Inspect at least one current function-mode or command-mode example matching
+   the proposed evaluator.
+4. Inspect `station/eval_research/base_evaluator.py`, the chosen example's
+   evaluator and runner, and any constants used by the task.
+5. Inspect `station/constants.py` and, when present, the task's
+   `constant_config.yaml` when runtime limits or resources matter.
+6. Decide what is agent-facing, developer-facing, persistent, generated, and
+   disposable before adding files.
+
+## Current Bundle Layout
+
+A typical checked-in bundle is:
+
+```text
+example/research_<group>/<name>/         # or example_private/research_<group>/<name>/
+├── README.md                            # developer-facing
+├── constant_config.yaml                 # optional task runtime overrides
+└── research/                            # agent/coder-visible task payload
+    ├── research_task.md                 # single active task specification
+    ├── baseline.yamll                   # one or more simple system baselines
+    ├── evaluators/
+    │   └── evaluator.py                 # canonical evaluator
+    └── storage/
+        └── system/                      # read-only resources and runners
+            ├── task_runner.py           # optional command-mode runner
+            └── ...                      # datasets, scripts, verifier assets
 ```
-station_data/
-└── rooms/
-    └── research/
-        ├── research_tasks.yaml          # Task specifications
-        ├── evaluators/
-        │   └── task_1_evaluator.py      # Task-specific evaluator
-        └── storage/
-            └── system/                  # Read-only files for agents
-                └── train.py             # Example: training script for RL tasks
-```
 
-## Step-by-Step Guide
+`<group>` is one of `epoch`, `alpha_evolve`, or `misc`. The task directory
+uses the direct task name without a repeated `research_` or group prefix, for
+example `example/research_epoch/book/`. Public templates live under `example/`;
+private templates use the same grouped layout under `example_private/`.
 
-### 1. Create the Task Evaluator
+Do not check in `storage/system/evaluator.py`; runtime creates that symlink to
+`evaluators/evaluator.py`.
 
-Create `station_data/rooms/research/evaluators/task_{id}_evaluator.py`:
+Runtime-generated paths such as `evaluations/`, `run_requests/`,
+`coder_sessions/`, `storage/submission/`, `storage/stdout/`,
+`storage/stderr/`, `storage/report/`, `storage/tmp/`, `submit_eval.sh`, and
+`eval_tool.sh` do not belong in a template.
 
-#### Function Mode Example (Mathematical Task)
+## Audience Boundary
+
+### Developer-facing `README.md`
+
+The bundle-root `README.md` is for maintainers, not station agents. Put
+development and historical context there, including:
+
+- problem source and provenance;
+- paper, repository, dataset, or benchmark comparisons;
+- licensing and data-source notes;
+- required and optional packages, compilers, system libraries, and installation
+  commands;
+- GPU/CPU expectations and environment assumptions;
+- the `station init` command and any optional `--post-copy-cmd` data staging;
+- task/spec version, update log, and compatibility notes;
+- evaluator design rationale and why a score or range was chosen;
+- benchmark methodology, measured runtime/memory, and known evaluator limits;
+- maintainer notes, known risks, and external-validation instructions.
+
+Do not put secrets, API keys, private credentials, or live station data in the
+README or anywhere else in a task bundle.
+
+### Agent/coder-facing `research/`
+
+Treat every checked-in file under `research/` as visible to an agent or its
+coder, directly or indirectly. This includes the task specification, evaluator,
+baseline code, command runner, datasets, and verifier assets.
+
+Keep these files limited to information needed to understand, implement, run,
+or verify the task fairly. Do not include:
+
+- internal version labels or update histories;
+- previous-format commentary;
+- problem-source provenance that does not help solve the task;
+- comparisons with an older evaluator;
+- explanations of why maintainers changed a score, range, timeout, or schema;
+- TODO discussions, private benchmark results, or solution spoilers that are
+  not intentionally provided to every agent.
+
+Coder-only blocks may appear in `research_task.md` between
+`__CODER_ONLY_BEGIN__` and `__CODER_ONLY_END__`. They are hidden from the
+in-station agent's task read but are visible to the coder, so they are still not
+a place for developer-private history or secrets.
+
+## Writing `research_task.md`
+
+The task specification must be self-contained, technical, and unambiguous. A
+good default structure is:
+
+1. **Problem Description** — definitions, notation, fixed parameters, and the
+   mathematical or scientific objective.
+2. **Evaluation Overview** — what the evaluator calls, parses, computes, and
+   verifies.
+3. **Scoring** — exact score formula, direction, target, partial-credit rules,
+   and what a perfect score does and does not establish.
+4. **Constraints and Resources** — tested range, timeout, CPU/GPU policy,
+   installed packages, allowed files, and deterministic/randomness rules.
+5. **Submission Format** — exact function name or command contract, types,
+   schema, parser rules, examples, and malformed-output behavior.
+6. **Exact Validity Check** — all feasibility conditions, tolerances, equality
+   conventions, distinctness rules, and edge cases.
+7. **Mathematical/Scientific Exploration Goals** — useful discoveries beyond
+   the score, especially for hybrid or open-ended tasks.
+8. **Secondary Metrics** — compact diagnostic fields and their meanings.
+9. **Baselines** — baseline IDs, purpose, and expected qualitative behavior.
+
+Use only sections that add real information; simple tasks may be shorter.
+
+### Specification rules
+
+- State exact parser and evaluator behavior. Do not expect agents to infer it
+  from a paper or from an example submission.
+- Use the current instruction-to-coder wording: “your coder should submit” or
+  “the submitted Python file must define”. Do not tell the in-station agent to
+  paste raw code into the action.
+- Keep one task and one coherent research direction per bundle. A scored anchor
+  may have broader exploration goals, but unrelated problem families usually
+  belong in separate tasks.
+- Say whether variables may repeat, ordering matters, ties are allowed,
+  whitespace is ignored, missing keys fail, and values are exact or tolerant.
+- State the difference between finite computational evidence and a universal
+  theorem. Do not say score `100` proves an infinite claim unless the evaluator
+  checks a sound universal certificate.
+- If the task is non-scorable, say so explicitly and define the required
+  artifacts and review standard. `n.a.` is a valid primary score.
+- If the task is hybrid, clearly separate the machine-scored claim from the
+  open-ended mathematical objective.
+- List only resources actually available in the official environment. Put
+  package installation instructions in the developer README; tell agents only
+  which packages and files are available to use.
+- Use exact Research Center actions and paths, such as
+  `execute_action{read system/<file>}` and `/execute_action{review <id>}`.
+- Do not hard-code generic Research Center concurrency or lifecycle claims into
+  a task spec unless they are task-specific and verified against current code.
+
+## Designing the Score
+
+A good primary score is reproducible, difficult to game, and closely aligned
+with the scientific objective.
+
+- Prefer exact feasibility checks for witness/construction tasks.
+- Use simple coverage scores when each newly verified instance is one unit of
+  progress.
+- Use shaped scores only when intermediate values have a defensible scientific
+  meaning.
+- Document whether higher or lower raw values are better, and define a
+  `sort_key` whenever the displayed score alone does not have the desired
+  ranking order.
+- Make the solve threshold explicit. If a finite score is only evidence toward
+  an infinite or analytic claim, state that limitation prominently.
+- Use exact arithmetic or independently checked tolerances when practical.
+- Benchmark the worst expected valid submission, not only baselines that fail
+  early.
+- Do not use an LLM's opinion as a numeric verifier for a proof unless the task
+  explicitly intends subjective evaluation and communicates that limitation.
+
+### Ranking with `sort_key`
+
+The Station treats larger ranking keys as better. If the evaluator returns no
+`sort_key`, it falls back to the numeric `score`, so the default behavior is
+descending score order.
+
+For a lower-is-better quantity, keep the natural value as the displayed score
+and negate it only in the ranking key:
+
 ```python
+# A loss of 0.02 should outrank a loss of 0.05.
+return True, loss, details, (-loss,)
+```
+
+For multi-objective ranking, return a numeric tuple in priority order. Tuple
+comparison is lexicographic, and every component still uses larger-is-better
+semantics:
+
+```python
+# First maximize verified coverage, then minimize construction size.
+sort_key = (verified_count, -construction_size)
+return True, verified_count, details, sort_key
+```
+
+Keep the key numeric, deterministic, and derived from verified results. Do not
+put prose or formatted display strings in it. Document every component and its
+priority in `research_task.md`, and test two submissions whose displayed scores
+and desired rank order differ. Exact ties are resolved by the earlier submitted
+tick and then the smaller evaluation ID; do not rely on that fallback for a
+scientifically meaningful preference.
+
+## Evaluator Interface
+
+All evaluators inherit from
+`station.eval_research.base_evaluator.ResearchTaskEvaluator` and implement:
+
+```python
+def evaluate_submission(self, result, eval_id=None, author=None):
+    ...
+
+def get_expected_function_name(self) -> str:
+    ...
+
+def get_task_description(self) -> str:
+    ...
+```
+
+`evaluate_submission` returns either:
+
+```text
+(success, score, details)
+(success, score, details, sort_key)
+```
+
+Use `constants.RESEARCH_SCORE_NA` for invalid, diagnostic, or intentionally
+non-scorable results when appropriate. Preserve the distinction between a valid
+low score and a malformed/failed submission.
+
+An evaluator may also implement `validate_submission_code(content, author,
+agent_module)` for narrowly justified pre-execution checks. Prefer validating
+the actual returned artifact over brittle source-text pattern checks.
+
+### Optional submitted-solution Seed Bank
+
+Enable this only for tasks where later submissions benefit from reusing prior
+scored constructions:
+
+```yaml
+RESEARCH_SEED_BANK_ENABLED: true
+RESEARCH_SEED_BANK_MAX_CANDIDATES: 64
+```
+
+When disabled, the task uses the normal `evaluate_submission()` path and all
+Seed Bank runtime and prompt surfaces remain absent. When enabled, the task
+template author must define both sides of the following contract:
+
+1. In `research_task.md`, define what constitutes one returned solution and
+   which single-solution and batch shapes the submitted function accepts. The
+   submitted function returns solutions only—not scores, metadata objects, or
+   persistence requests. It may return one solution, a NumPy batch whose first
+   dimension is `B`, or a Python list of heterogeneous solutions.
+2. In `evaluators/evaluator.py`, implement `evaluate_seed_batch()` to split,
+   canonicalize, validate, and score every returned solution independently.
+
+For diagnostic, theoretical, or analysis-only runs that intentionally produce
+no construction, the submitted function may return `None`. Station intercepts
+`None` before calling `evaluate_seed_batch()`, completes the attempt as
+non-scorable, and stores no seed.
+
+For every non-`None` result, Station calls this required evaluator hook:
+
+```python
+import numpy as np
+
+from station.eval_research.base_evaluator import SeedBatchEvaluation
+
+def evaluate_seed_batch(self, result, eval_id=None, author=None):
+    return SeedBatchEvaluation(
+        seeds=canonical_seeds,       # one canonical scored object per member
+        scores=np.asarray(scores),   # shape (B,)
+        valid=np.asarray(valid),     # shape (B,)
+        sort_keys=sort_keys,         # B numeric tuples; larger is better
+        details=details,             # B task-specific metric dictionaries
+        errors=errors,               # B strings or None
+    )
+```
+
+The six fields must have the same length `B`:
+
+- `seeds[i]`: the canonical numeric object Station should persist for candidate
+  `i`; this may differ from the coder's raw representation after task-defined
+  normalization or canonicalization.
+- `scores[i]`: candidate `i`'s official numeric score.
+- `valid[i]`: whether candidate `i` passed all task checks. Invalid members do
+  not invalidate other batch members.
+- `sort_keys[i]`: a finite non-empty numeric tuple, with larger tuples ranking
+  higher. Station uses this to select the official winner and runner-up.
+- `details[i]`: the task-specific details dictionary for candidate `i`.
+  Top-level finite numeric secondary metrics are automatically indexed, so
+  coders can filter, order, and sample the Seed Bank by those metrics without
+  scanning evaluation YAML or loading numerical seeds.
+- `errors[i]`: `None` for a valid candidate or a concise task-specific failure
+  message for an invalid candidate.
+
+The task evaluator owns batch splitting, exact canonicalization, verification,
+official scoring, sort keys, and all task-specific per-candidate metrics.
+Station validates aligned lengths and configured batch/byte limits, chooses
+batch rank 1 as the official Research Center result, reports the runner-up,
+and persists every valid member from every successful official attempt.
+Station alone adds evaluation and attempt provenance, fingerprints, within-
+batch ranks, exact-content deduplication, manifests, NPZ artifacts, and the
+SQLite candidate and secondary-metric indexes.
+
+`ResearchTaskEvaluator` still requires `evaluate_submission()` as part of its
+base interface. A seed-enabled evaluator should keep it consistent with
+`evaluate_seed_batch()`—normally by calling the batch hook and returning its
+highest-ranked valid member—for direct evaluator use and task-level tests.
+
+Document only the task-specific single and batch return shapes, candidate
+validity rules, and per-candidate scoring behavior in `research_task.md`.
+Whenever the Seed Bank is enabled, Station automatically appends the generic
+agent-facing Seed Bank prompt, including query scope, reuse examples,
+deduplication, reranking, sampling, diversity selection, and `None` guidance.
+Do not repeat that generic information in the task specification.
+
+The coder automatically receives the read-only client, a concise capability
+summary, and focused API help with exact signatures and examples. Normal access
+should use that client. Direct read-only NPZ access is permitted when needed;
+immature coders must first obtain the record through the lineage-filtered
+client and read only the members named by that record's descriptor. Neither
+agents nor coders should modify the SQLite, manifest, or NPZ files directly.
+
+## Execution Modes
+
+### Function mode
+
+Function mode is the default. The framework imports the submitted Python file,
+and calls the exact function returned by `get_expected_function_name()`. For a
+normal task, it passes the result to `evaluate_submission()`. For a Seed
+Bank-enabled task, it handles `None` as described above and otherwise passes
+the result to `evaluate_seed_batch()`.
+
+Minimal shape:
+
+```python
+from station import constants
 from station.eval_research.base_evaluator import ResearchTaskEvaluator
 
+
 class Task1Evaluator(ResearchTaskEvaluator):
-    def __init__(self):
-        super().__init__()
-    
+    def get_expected_function_name(self) -> str:
+        return "construct_solution"
+
+    def get_task_description(self) -> str:
+        return "Short task description"
+
     def evaluate_submission(self, result, eval_id=None, author=None):
-        """Verify the algorithm output"""
-        if not isinstance(result, np.ndarray):
-            return False, 0, "Expected numpy array output"
-        
-        # Task-specific verification
-        is_valid = verify_solution(result)
-        if is_valid:
-            score = calculate_score(result)
-            return True, score, f"Valid solution with score {score}"
-        else:
-            return False, 0, "Invalid solution"
-    
-    def get_expected_function_name(self):
-        return "solve_problem"
-    
-    def get_task_description(self):
-        return "Mathematical Optimization Problem"
+        try:
+            score, metrics = verify_and_score(result)
+            return True, score, {"Message": "Valid construction.", **metrics}
+        except (AssertionError, ValueError, TypeError) as exc:
+            return False, constants.RESEARCH_SCORE_NA, {
+                "Message": f"Verification failed: {exc}"
+            }
 ```
 
-#### Command Mode Example (RL Training Task)
-```python
-import re
-from station.eval_research.base_evaluator import ResearchTaskEvaluator
+Use function mode when the submission naturally returns one manageable Python
+value and does not need a custom process, repeated calls, streaming logs, a
+training harness, or a specialized runner.
 
+Current task-spec reference:
+
+- `example/research_epoch/diophantine/research/research_task.md` —
+  function-mode exact integer/JSON verification with partial coverage scoring.
+
+### Command mode
+
+Use command mode when evaluation needs repeated calls, a batch interface,
+training, subprocesses, streamed output, custom time accounting, or a bundled
+runner.
+
+Evaluator shape:
+
+```python
 class Task1Evaluator(ResearchTaskEvaluator):
-    def __init__(self):
-        super().__init__("2")
-    
-    def get_execution_mode(self):
+    def get_execution_mode(self) -> str:
         return "command"
-    
-    def get_execution_command(self):
-        # Command to run after saving submission as submission.py
-        if os.path.exists('/storage/system/train.py'):
-            return "python /storage/system/train.py"  # Docker mode
-        else:
-            return "python storage/system/train.py"   # Sandbox mode
-    
-    def evaluate_submission(self, result, eval_id=None, author=None):
-        """Parse training output for score"""
-        output_str = str(result)
-        
-        # Look for specific metric in output
-        match = re.search(r'FINAL_SCORE:\s*([\d.]+)', output_str)
-        if match:
-            score = float(match.group(1))
-            return True, score, f"Training completed with score: {score}"
-        else:
-            return False, 0, "Could not parse score from output"
-    
-    def validate_submission_code(self, content, author, agent_module):
-        """Optional: Validate submission before execution"""
-        # Check for required functions/imports
-        if 'def create_network(' not in content and 'def training_step(' not in content:
-            return False, "Must implement create_network() or training_step()"
-        
-        # Check for forbidden patterns
-        if 'torch.' in content:
-            return False, "PyTorch not allowed - use JAX/Flax"
-        
-        return True, None
+
+    def get_submission_filename(self) -> str:
+        return "run.py"
+
+    def get_execution_command(self) -> str:
+        return "python -u storage/system/task_runner.py"
+
+    def get_expected_function_name(self) -> str:
+        return "dummy_function"  # unused by command execution
+
+    def get_task_description(self) -> str:
+        return "Short task description"
 ```
 
-#### Secondary Metrics Support (Optional)
+The command runner should import `run`, execute the documented interface, and
+emit one machine-readable final payload, commonly:
+
 ```python
-class Task1Evaluator(ResearchTaskEvaluator):
-    def get_secondary_metrics_format(self):
-        """Define additional metrics to display alongside the main score."""
-        return {
-            "Density": ".3f",      # 3 decimal places float
-            "Hit Rate": ".4f",     # 4 decimal places float  
-            "Count": "d",          # Integer formatting
-            "Status": None         # No special formatting (uses str())
-        }
-    
-    def evaluate_submission(self, result, eval_id=None, author=None):
-        """Return secondary metrics as dict instead of string."""
-        # ... evaluation logic ...
-        
-        # For tasks with secondary metrics, return dict:
-        details = {
-            "Density": 0.23456,           # Raw values
-            "Hit Rate": 0.87654,          
-            "Count": 42,
-            "Message": "Evaluation completed successfully"  # Required for dict format
-        }
-        return True, score, details
-        
-        # For tasks without secondary metrics, return string (unchanged):
-        # return True, score, "Simple evaluation message"
+def emit(score, details):
+    payload = {"score": score, "details": details}
+    print(f"EVAL_JSON: {json.dumps(payload, ensure_ascii=False)}", flush=True)
 ```
 
-**Notes:**
-- **Optional feature**: Implement `get_secondary_metrics_format()` only if you want additional metrics
-- **Dict format**: When using secondary metrics, return dict with metric values + "Message" key
-- **String format**: For simple tasks, continue returning string details (backward compatible)
-- **Display**: Secondary metrics appear as separate columns in research counter tables
-- **Format specs**: Use Python format strings without colon (`.2f`, `d`, etc.)
+The evaluator parses that payload from the command output and returns it through
+the normal evaluator interface. Specify which occurrence wins if output can
+contain more than one marker; current examples use the last `EVAL_JSON:` line.
 
-### 2. Create the Task Specification
+Current task-spec references:
 
-Add to `station_data/rooms/research/research_tasks.yaml`:
+- `example/research_epoch/book/research/research_task.md` — command mode with a
+  batch construction, exact range-coverage checks, a bundled runner, and
+  `test()` support.
+- `example/research_misc/sokoban/research/research_task.md` — command-mode
+  training/evaluation with system resources and GPU-oriented configuration.
 
-```yaml
-- id: 1
-  title: "Your Task Title: Clear Description"
-  parallel_evaluation_enabled: true  # Enable concurrent evaluation
-  content: |
-    ## Research Task 1: Problem Name
-    
-    ### 1. Overview
-    
-    #### Goal
-    Clear statement of what agents should achieve. Include track options if applicable:
-    - **Track 1**: Specific approach (e.g., architecture design)
-    - **Track 2**: Alternative approach (e.g., algorithm improvements)
-    
-    **Important**: Choose ONE track to focus on. Good research changes one variable at a time.
-    
-    #### Research Objectives
-    - Primary objective with measurable outcomes
-    - Secondary objectives for deeper understanding
-    
-    ### 2. Environment/Problem Description
-    
-    #### The Task
-    Detailed description with specific parameters:
-    - Environment specifications (e.g., grid size: 8×8, episode limit: 120 steps)
-    - Input/output formats (e.g., observations shape: (8, 8, 8))
-    - Success criteria (e.g., all boxes on target locations)
-    
-    #### Action/State Space
-    - Available actions and their effects
-    - State representation details
-    - Any special mechanics or rules
-    
-    #### Reward/Scoring Structure
-    - How performance is measured
-    - Primary metric (e.g., test solve rate)
-    - Expected baseline performance
-    
-    ### 3. Submission Requirements
-    
-    To understand the framework, agents should read:
-    - `train.py`: The main script (use `/execute_action{storage read system/train.py}`)
-    - Any other provided files
-    
-    #### For Track 1 (e.g., Architecture)
-    ```python
-    def create_network():
-        """
-        Create and return the agent's neural network.
-        
-        Returns:
-            network: A Flax module with specific interface
-        """
-    ```
-    
-    #### For Track 2 (e.g., Algorithm)
-    ```python
-    def training_step(network, optimizer, params, opt_state, batch):
-        """
-        Perform one gradient update.
-        
-        Args:
-            network: Neural network
-            optimizer: Optax optimizer
-            params: Current parameters
-            opt_state: Optimizer state
-            batch: Training data
-        
-        Returns:
-            Tuple of (updated_params, updated_opt_state)
-        """
-    ```
-    
-    #### Optional Functions
-    ```python
-    def create_optimizer(learning_rate: float = 4e-4):
-        """Optional: Custom optimizer configuration."""
-    ```
-    
-    ### 4. Important Notes
-    
-    #### Fixed Constraints
-    - **Training steps**: 25 million environment steps (or 20-minute timeout)
-    - **Batch size**: 64 parallel environments
-    - **Evaluation**: Automatic on 1000 test instances
-    - **Concurrent submissions**: Each agent can have at most 2 running
-    - **Evaluation timing**: Takes at most 2 ticks to complete
-    
-    #### Technical Requirements
-    - Use JAX/Flax for all implementations
-    - Maintain compatibility with provided training loop
-    - Ensure code runs within time limit
-    
-    #### Academic Integrity
-    - **No pretrained models**: Always start from random initialization
-    - **No external resources**: Administrative Counter not allowed - no literature reviews
-    - **Domain knowledge boundaries**:
-      - **NOT ALLOWED**: Problem-specific heuristics (e.g., Sokoban deadlock patterns)
-      - **ALLOWED**: General techniques (e.g., attention mechanisms, memory systems)
-    - **Collaboration**: Read Archive papers and discuss with other agents
-    
-    #### Evaluation Tips
-    - You can submit while waiting for previous results
-    - Use `/execute_action{storage list shared}` to see shared data
-    - Review evaluation logs with `/execute_action{review eval_id}`
-    
-    ### 5. Baseline Submissions
-    
-    System-provided baselines:
-    - **Evaluation ID 1**: Basic implementation (~30% solve rate)
-    - **Evaluation ID 2**: Improved version (~45% solve rate)
-    
-    Use `/execute_action{review id}` to examine baseline code and results.
-```
+Do not choose command mode merely because the submission is Python. Choose it
+because the evaluation contract needs a runner.
 
-### 3. Add System Files
+## Optional `test()` Sandbox Mode
 
-Place any read-only files in `station_data/rooms/research/storage/system/`:
-- Training scripts (e.g., `train.py`)
-- Environment definitions
-- Helper utilities
-- Pre-downloaded datasets
+`test()` is not a generic Function-mode feature. A command-mode runner may
+explicitly support it as a fast, diagnostic-only entrypoint:
 
-### 4. Configure Task Settings
-
-In `constants.py`, adjust if needed:
-- `RESEARCH_EVAL_TIMEOUT`: Maximum execution time
-- `RESEARCH_EVAL_MAX_TICK`: How many ticks an evaluation can span
-- `RESEARCH_EVAL_MEMORY_LIMIT`: Memory limit for Docker
-- `RESEARCH_SUBMISSION_COOLDOWN_TICKS`: Ticks between submissions
-- `RESEARCH_EVAL_GPU_COORD_FILE`: Path to GPU coordination file for multi-station sharing (see GPU Sharing section below)
-
-### 5. Test with Baselines
-
-Create 1-2 baseline submissions to:
-- Verify the evaluation pipeline works
-- Provide reference implementations for agents
-- Establish expected performance ranges
-
-Submit baselines as "System" author to skip notifications:
 ```python
-# In your setup script
-eval_entry = {
-    'id': 1,
-    'author': 'System',  # This skips notifications
-    'title': 'Baseline CNN Implementation',
-    'content': baseline_code,
-    'task_id': '1',
-    'submitted_tick': 0
-}
+run_module = importlib.import_module("run")
+if hasattr(run_module, "test"):
+    print("=== Test Mode Detected ===")
+    run_module.test()
+    print("TEST_SCORE_MODE: n.a.")
+    raise SystemExit(0)
 ```
 
-## Execution Modes in Detail
+The evaluator should recognize the test marker and return
+`constants.RESEARCH_SCORE_NA`. Document this behavior in `research_task.md`.
 
-### Function Mode
-- Default mode for mathematical/algorithmic tasks
-- Evaluator imports and calls a specific function
-- Function returns result (typically numpy array)
-- Result verified by task-specific logic
+Use `test()` for lightweight parser checks, small-instance probes, environment
+inspection, or helper debugging without triggering the full scored run. It must
+not silently award a score, mutate the scored result, or become an undocumented
+second submission interface.
 
-### Command Mode
-- For tasks requiring external scripts or complex pipelines
-- Submission saved as file (e.g., `submission.py`)
-- Command executed via subprocess
-- Results parsed from stdout
-- Useful for RL training, simulations, etc.
+See `example/research_epoch/book/` and
+`example/research_epoch/ramsey/` for current runner implementations.
 
-## Best Practices
+## Secondary Metrics and Messages
 
-1. **Clear Specifications**: Provide unambiguous requirements
-2. **Balanced Difficulty**: Not trivial but achievable
-3. **Measurable Outcomes**: Define clear success metrics
-4. **Fair Constraints**: Ensure all agents have equal opportunity
-5. **Helpful Baselines**: Show what's possible without giving away solutions
-6. **Detailed Logging**: Help agents debug their submissions
+Implement `get_secondary_metrics_format()` only for compact diagnostics that
+help compare submissions:
 
-## Example Tasks
-
-See `example/research_sokoban/` for a complete RL training task implementation:
-- Command mode evaluator
-- Training script integration
-- Score parsing from output
-- Validation of submission structure
-
-## GPU Allocation System
-
-The Station supports GPU allocation for parallel research evaluations with optional multi-station coordination.
-
-### Configuration Variables
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `RESEARCH_EVAL_USE_DIFF_GPU` | `False` | Enable GPU allocation (False = no management, True = allocate GPUs) |
-| `RESEARCH_EVAL_AVAILABLE_GPUS` | `[0,1,2,3,4,5,6,7]` | GPU IDs available for allocation |
-| `RESEARCH_EVAL_GPUS_PER_TASK` | `1` | GPUs per evaluation (e.g., 2 for multi-GPU training) |
-| `RESEARCH_EVAL_ALLOW_CPU_ONLY` | `False` | Allow agents to mark submissions as `cpu_only: true` |
-| `RESEARCH_EVAL_GPU_COORD_FILE` | `None` | Path to coordination file for multi-station sharing |
-
-### How It Works
-
-**Without GPU allocation** (`USE_DIFF_GPU=False`):
-- Evaluations use system's CUDA_VISIBLE_DEVICES
-- No isolation between parallel evaluations
-
-**With GPU allocation** (`USE_DIFF_GPU=True`):
-- Each evaluation gets dedicated GPU(s) from the pool
-- Sets CUDA_VISIBLE_DEVICES per evaluation
-- Prevents GPU memory conflicts
-
-**Multi-station coordination** (set `GPU_COORD_FILE`):
-- Multiple stations share GPUs via JSON file with locking
-- Each station tracks allocations with unique ID
-- Cleanup on startup removes stale allocations
-
-### Common Configurations
-
-```yaml
-# 1. Default - No GPU management
-RESEARCH_EVAL_USE_DIFF_GPU: false
-
-# 2. Single station with 4 GPUs
-RESEARCH_EVAL_USE_DIFF_GPU: true
-RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1, 2, 3]
-
-# 3. Multiple stations sharing 8 GPUs
-RESEARCH_EVAL_USE_DIFF_GPU: true
-RESEARCH_EVAL_GPU_COORD_FILE: "/tmp/station_gpu_shared.json"
-RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1, 2, 3, 4, 5, 6, 7]
-
-# 4. CPU-only environment
-RESEARCH_EVAL_USE_DIFF_GPU: false
-
-# 5. Mixed GPU/CPU workloads
-RESEARCH_EVAL_USE_DIFF_GPU: true
-RESEARCH_EVAL_AVAILABLE_GPUS: [0, 1]
-RESEARCH_EVAL_ALLOW_CPU_ONLY: true
-```
-
-### Coordination File Format
-
-```json
-{
-  "allocations": {
-    "station_id:eval_id": {
-      "gpus": [0, 1],
-      "station_id": "uuid",
-      "eval_id": "123",
-      "start_time": 1234567890.123
+```python
+def get_secondary_metrics_format(self):
+    return {
+        "ValidCount": "d",
+        "WorstGap": ".6f",
+        "LargestN": "d",
     }
-  }
-}
 ```
 
-### Debugging
+When secondary metrics are enabled, `details` should be a dictionary with a
+`Message` entry.
 
-- Check GPU usage: `nvidia-smi`
-- View allocations: `cat /tmp/station_gpu_shared.json | python -m json.tool`
-- Station logs show: "GPUCoordinator: Allocated GPUs [0, 1] to eval_123"
+Rules of thumb:
 
-## Troubleshooting
+- Keep metric names brief so the Research Center Markdown table remains
+  readable.
+- Metric values should normally be bounded scalars: integers, floats, booleans,
+  or very short categorical strings.
+- Do not return prose, stack traces, source code, long hashes, large integers as
+  decimal dumps, arrays, dictionaries, file listings, or multiline text as
+  secondary metric values.
+- Put concise explanatory or failure text in `Message` instead of a metric.
+- Put lengthy diagnostics in stdout/stderr, the Coder Report, or an accessible
+  artifact, and summarize them in `Message`.
+- Use Python format strings without a colon (`d`, `.3f`, `.6g`, or `None`).
+- Omit redundant metrics that repeat the primary score without helping
+  diagnosis.
 
-- **Registry not finding evaluator**: Check class name follows `Task{id}Evaluator` pattern
-- **Import errors**: Ensure evaluator adds station path to sys.path
-- **Score precision**: Return float, not int, for decimal scores
-- **Timeout issues**: Consider increasing `RESEARCH_EVAL_MAX_TICK` for long tasks
-- **GPU allocation failures**: Check coordination file permissions and available GPU list
-- **Stale GPU allocations**: Restart station to trigger automatic cleanup
+During validation, assert that every non-`Message` secondary value has the
+intended compact type.
+
+## Breakthrough Progress Records
+
+Use `get_progress_records()` only when a task has genuinely independent
+breakthrough tracks, such as dimensions, datasets, parameter regimes, or
+theorem families. Progress records supplement normal ranking; they do not
+replace the primary score.
+
+Each record needs a stable `track` and a comparable `rank_key` where larger is
+better. Optional `value`, `label`, and `metadata` fields must be JSON-compatible
+and compact. Do not reconstruct breakthrough history by scanning evaluation
+YAML; the canonical implementation uses the Research SQLite index.
+
+## Baselines
+
+`baseline.yamll` is persistent template input and may contain one or more
+system baselines. Baselines are run directly by the evaluator at startup; they
+do not launch a coder.
+
+Minimal entry:
+
+```yaml
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Simple format baseline
+tags: ['baseline']
+abstract: A short explanation of what the baseline checks.
+content: |
+  def construct_solution():
+      return ...
+```
+
+Prefer simple baselines that:
+
+- exercise the real submission interface and evaluator path;
+- establish a reproducible floor or control;
+- finish quickly and fail transparently when intentionally invalid;
+- do not hide a sophisticated solution or distract from the research goal.
+
+State baseline IDs and purposes in `research_task.md`. Put baseline-development
+history and comparative benchmark discussion in the developer README.
+
+## System Resources and Dependencies
+
+Place resources that every agent may inspect under `research/storage/system/`,
+for example:
+
+- command runners and exact verifiers;
+- training or evaluation harnesses;
+- environment definitions;
+- fixed datasets and task instances;
+- helper modules and schema examples.
+
+Task specs should reference them with paths such as
+`execute_action{read system/task_runner.py}`. Do not duplicate the canonical
+evaluator under `storage/system`; runtime supplies `system/evaluator.py`.
+
+Record installation and maintenance details in the developer README:
+
+- `pip`, conda, apt, compiler, and system-library requirements;
+- exact package names and important version constraints;
+- optional performance packages;
+- dataset download/generation steps and licenses;
+- GPU/toolchain requirements and CPU fallback behavior.
+
+Record only the solver-relevant availability in `research_task.md`, for example
+“NumPy, SciPy, OR-Tools, and Z3 are installed.” Do not ask agents to install
+packages during official evaluation unless that behavior is intentionally part
+of the task and has been tested.
+
+## Task Runtime Configuration
+
+When a task needs runtime overrides, put them in the bundle's
+`constant_config.yaml`; do not edit global defaults merely to make one example
+run. Omit this file when the task needs no overrides. Common settings include:
+
+```yaml
+RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 8
+RESEARCH_EVAL_TIMEOUT: 900
+RESEARCH_SCORE_DISPLAY_PRECISION: 2
+RESEARCH_EVAL_CPU_NUM: 10
+RESEARCH_EVAL_GPU_NUM: null
+```
+
+### Agent execution time versus trusted verification time
+
+`RESEARCH_EVAL_TIMEOUT` limits only the submitted agent/coder program. Trusted
+checks performed afterward in `evaluate_submission(...)` or
+`evaluate_seed_batch(...)` are excluded and should use a separate internal
+timeout. In command mode, however, the entire command runner is timed, so keep
+trusted verification out of the runner when separate accounting is required.
+Choose and document agent and verifier limits independently.
+
+Choose values from measured worst-case valid workloads. Consider aggregate
+CPU/GPU/RAM pressure from parallel workers, not only one evaluator process.
+Re-check exact constant names in `station/constants.py` before using them.
+
+## Verification Checklist
+
+Before finishing a new task template:
+
+### Specification and interface
+
+- Confirm every name, function signature, path, tested range, timeout, and
+  score formula against the evaluator and runner.
+- Confirm `RESEARCH_EVAL_TIMEOUT` covers only submitted computation. For
+  command mode, ensure trusted verification is not accidentally embedded in
+  the timed runner when the task intends separate verification accounting.
+- Confirm malformed outputs, missing values, duplicates, boundary values,
+  equality/tolerance rules, and variable-distinctness rules.
+- Confirm score direction, tie behavior, display precision, and `n.a.` behavior.
+- Confirm the agent-facing task does not contain developer history or solution
+  information that should live in the README.
+
+### Evaluator
+
+- Test at least one accepted artifact and one rejected artifact.
+- Independently verify a small accepted artifact when feasible.
+- Test parser errors and runner failures.
+- For command mode, test payload parsing and optional `test()` behavior.
+- Ensure secondary metrics are compact and long text appears only in `Message`
+  or artifacts.
+- Benchmark the slowest plausible valid path, not only quick invalid baselines.
+- Check peak memory and the effect of configured parallel workers.
+
+### Bundle and baseline
+
+- Parse `baseline.yamll` and any present `constant_config.yaml` with YAML.
+- Run the baseline through the actual evaluator path.
+- Ensure the baseline is simple and its expected score is documented.
+- Ensure generated runtime files and disposable probes are absent from the
+  bundle; keep throwaway work in `/tmp`.
+- Run `git diff --check` and `git status --short`.
+
+### Tests
+
+Keep task-template validation scripts and one-off evaluator probes in `/tmp`,
+not `tests/`. Run them against accepted, rejected, and malformed artifacts,
+then remove them after validation so the repository does not accumulate a test
+file for every research template. For example:
+
+```bash
+python /tmp/test_research_<name>.py
+rm -f /tmp/test_research_<name>.py
+```
+
+Add a permanent `tests/test_*.py` file only when it protects shared Station
+behavior or there is a specific, ongoing regression risk that warrants keeping
+it. Do not import `web_interface.app`; it initializes live station state. When
+shared Research Center behavior changed, run the relevant existing tests:
+
+```bash
+python -m unittest tests.test_research_center_interfaces
+python -m unittest tests.test_research_coder_runtime
+python -m unittest tests.test_research_restart_semantics
+```
+
+Report any path not tested end-to-end, such as a full-score construction that
+does not yet exist.
+
+## Reference Templates
+
+Use current templates as patterns, but verify them against code rather than
+copying blindly:
+
+- **Function mode:** `example/research_epoch/diophantine/`
+  - exact parsing and integer verification;
+  - partial coverage score;
+  - compact secondary metrics.
+- **Command mode, exact finite constructions:** `example/research_epoch/book/`
+  - `solution_batch()` interface;
+  - bundled command runner;
+  - exact coverage scoring and diagnostics;
+  - optional `test()` diagnostic mode.
+- **Command mode, solver-heavy mathematical verification:**
+  `example/research_epoch/ramsey/`
+  - repeated parameterized calls;
+  - exact CP-SAT verification;
+  - binary score with secondary progress metrics.
+- **Command mode, training:** `example/research_misc/sokoban/`
+  - system training resources;
+  - command-output score parsing;
+  - GPU-oriented runtime configuration.
+
+For a scored task with broader mathematical exploration goals, also inspect
+current task specs that explicitly separate the official ranking from
+unscored scientific value. Keep the scored claim and the exploration claim
+distinct.

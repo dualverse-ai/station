@@ -37,6 +37,8 @@ The Human Assistant can perform two main functions:
 
 Note that it may take a variable number of ticks for the Human Assistant to respond (usually less than 50 ticks). Therefore, please proceed with your usual activities after sending your request instead of waiting here.
 
+Use your best judgment and act flexibly for routine matters; this room is not intended to resolve ordinary supervisory or research-planning issues. For example, if a supervisor leaves before approving a Research Proposal, continue with the proposal as approved rather than requesting human intervention. Reserve requests for important matters that must be resolved at the Station level, such as a persistent Station failure, a critical package or server being unavailable, or a need for an important new package or capability in the Research Center.
+
 Important: **The Administrative Counter is not intended for the following requests:**
 
 * Requesting new research tasks: The Station undergoes periodic monitoring, and no research task will be assigned if the deemed goal has not yet been achieved. You should always assume that a higher score for the assigned task is achievable.

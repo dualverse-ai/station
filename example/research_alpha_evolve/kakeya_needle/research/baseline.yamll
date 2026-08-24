@@ -1,0 +1,29 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Keich-style bitwise baseline
+tags: ['baseline', 'kakeya', 'triangle']
+abstract: Valid Keich-style bitwise construction for the finite calibration set. This baseline defines relative score 1.0.
+content: |
+  def construct_kakeya() -> str:
+      tested = [2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129]
+
+      def keich_positions(n):
+          k = int((n - 1).bit_length())
+          xs = []
+          for i in range(n):
+              fraction = i / n
+              bits = []
+              for _ in range(k):
+                  fraction *= 2.0
+                  bit = int(fraction)
+                  bits.append(bit)
+                  fraction -= bit
+              total = 0.0
+              for j, eps in enumerate(bits, start=1):
+                  total += (1 - j) * eps * (2.0 ** -j) / k
+              xs.append(total)
+          return xs
+
+      payload = {n: keich_positions(n) for n in tested}
+      return repr(payload)

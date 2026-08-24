@@ -132,7 +132,6 @@ class TickTimingSummaryTests(unittest.TestCase):
             {
                 "tick": tick,
                 "next_tick": tick + 1,
-                "sync_mode": "parallel",
                 "started_timestamp": float(tick),
                 "started_at": f"start-{tick}",
                 "ended_timestamp": float(tick + 1),
@@ -169,7 +168,6 @@ class TickTimingSummaryTests(unittest.TestCase):
                 "latest_tick": tick,
                 "latest_tick_started_timestamp": float(tick),
                 "latest_tick_started_at": f"start-{tick}",
-                "latest_tick_sync_mode": "parallel",
             })
             state["recent_ticks"] = tick_timing._updated_recent_ticks(
                 state,
@@ -177,7 +175,6 @@ class TickTimingSummaryTests(unittest.TestCase):
                     "event": "tick_end",
                     "tick": tick,
                     "next_tick": tick + 1,
-                    "sync_mode": "parallel",
                     "ended_timestamp": float(tick + 1),
                     "ended_at": f"end-{tick}",
                     "duration_seconds": 1.0,

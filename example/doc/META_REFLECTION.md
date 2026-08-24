@@ -15,17 +15,14 @@ This mechanism is separate from:
 In `station/constants.py` or `station_data/constant_config.yaml`:
 
 ```python
-REFLECTION_META_INTERVAL = 20  # None, 0, or negative disables compulsory meta reflection
+REFLECTION_META_INTERVAL = 50  # None, 0, or negative disables compulsory meta reflection
 REFLECTION_META_TICKS = 3  # Number of internal reflection ticks for meta_reflect
-REFLECTION_META_PROTECTED_TICK_LIMIT = 4  # Maximum meta_reflect start ticks protected from pruning
 REFLECTION_META_PROMPT_FILENAME = "meta_prompts.yaml"
 REFLECTION_META_MODEL_PROVIDER_CLASS = None  # Optional provider override for meta_reflect only
 REFLECTION_META_MODEL_NAME = None  # Optional model override for meta_reflect only
 ```
 
 Set `REFLECTION_META_INTERVAL` to `None`, `0`, or a negative value to disable the mechanism. When disabled, the Station does not append maturity guidance, track countdowns, warn agents, or allow compulsory meta reflection sessions.
-
-Set `REFLECTION_META_PROTECTED_TICK_LIMIT` to a non-negative integer to cap protected meta-reflection start ticks. `0` makes meta-reflection start ticks immediately prunable, and `None` or a negative value keeps all meta-reflection start tick protections.
 
 When `REFLECTION_META_INTERVAL` is positive, mature agents are required to perform meta reflection at least once every configured interval. The overdue warning begins after an additional five-tick grace period.
 
@@ -35,7 +32,7 @@ The override is scoped to the internal meta reflection session. The Station buil
 
 ## Prompt File
 
-Prompts are loaded from `station_data/meta_prompts.yaml`. The default template is in `example/station_default/meta_prompts.yaml`.
+Prompts are loaded from `station_data/meta_prompts.yaml`. The default template is in `example/station/default/meta_prompts.yaml`.
 
 The file uses the same format as `random_prompts.yaml`:
 
@@ -48,11 +45,18 @@ The file uses the same format as `random_prompts.yaml`:
 - text: "Prompt visible to supervisors."
   audience: supervisor
 
+- text: "Prompt visible only to tenured agents."
+  audience: tenured
+
 - when: [HOLIDAY_MODE_ENABLED]
   text: "Prompt enabled only when the listed constant evaluates to true."
+
+- when: ["RESEARCH_MAX_CONCURRENT_SUBMISSIONS >= 2"]
+  text: "Prompt enabled only when a numeric constant comparison is true."
 ```
 
-Supported audiences are `all`, `supervisor`, and `non_supervisor`. If `audience` is omitted, the prompt is eligible for all agents.
+Supported audiences are `all`, `supervisor`, `non_supervisor`, and `tenured`. If `audience` is omitted, the prompt is eligible for all agents.
+Supported `when` conditions are constant names, negated constant names such as `!HOLIDAY_MODE_ENABLED`, and numeric constant comparisons using `>=`, `<=`, `>`, `<`, `==`, or `!=`.
 
 ## Agent Usage
 
@@ -64,7 +68,7 @@ Agents must go to the Reflection Chamber and issue:
 
 No YAML input is needed. The Station randomly selects an eligible prompt and starts an internal reflection session for `REFLECTION_META_TICKS` ticks. Meta reflection is available on both normal work days and holidays, and guest agents can use it after maturity.
 
-The Station tick that starts a compulsory `meta_reflect` internal session is recorded in the agent YAML `protected_dialogue_ticks` list and cannot be pruned by Token Management. Only the newest `REFLECTION_META_PROTECTED_TICK_LIMIT` meta-reflection start ticks remain protected; with the default limit of `4`, an early meta reflection becomes prunable after four newer meta-reflection protections have been added. Older meta-reflection ticks that predate this YAML record are not inferred retroactively.
+Compulsory `meta_reflect` sessions are normal internal action history. They are summarized by the same automatic context compaction flow as the rest of the agent session.
 
 ## Countdown And Warning
 

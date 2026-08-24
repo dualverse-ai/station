@@ -41,6 +41,10 @@ from .base import (
 
 
 class GoogleGeminiConnector(BaseLLMConnector):
+    THINKING_ONLY_MODEL_TURN_PLACEHOLDER = (
+        "[No visible model response was recorded for this thinking-only turn.]"
+    )
+
     def __init__(self,
                  model_name: str,
                  agent_name: str,
@@ -1007,6 +1011,22 @@ class GoogleGeminiConnector(BaseLLMConnector):
                                 thought_signature = self._extract_part_thought_signature(part)
                                 if thought_signature is not None:
                                     break
+                        if entry["role"] == "model" and not text_content.strip():
+                            if isinstance(thinking_content, str) and thinking_content.strip():
+                                self._log(
+                                    "WARNING",
+                                    "Gemini history contains a thinking-only model turn; "
+                                    "using a visible placeholder and omitting thought_signature "
+                                    "for SDK replay.",
+                                )
+                                text_content = self.THINKING_ONLY_MODEL_TURN_PLACEHOLDER
+                                thought_signature = None
+                            else:
+                                self._log(
+                                    "WARNING",
+                                    f"Skipping Gemini model history entry with no visible text: {entry}",
+                                )
+                                continue
                         history_for_filtering.append({
                             "tick": entry["tick"],
                             "role": entry["role"], 
@@ -1038,12 +1058,28 @@ class GoogleGeminiConnector(BaseLLMConnector):
     ) -> None:
         if not getattr(self, "persist_to_disk", True):
             return
-        if not text and not thinking_text: # Don't save if both are empty
+        visible_text = text or ""
+        visible_thought_signature = thought_signature
+        if (
+            role == "model"
+            and not visible_text.strip()
+            and isinstance(thinking_text, str)
+            and thinking_text.strip()
+        ):
+            self._log(
+                "WARNING",
+                "Gemini model turn had thinking_content but no visible text; "
+                "persisting a visible placeholder without thought_signature.",
+            )
+            visible_text = self.THINKING_ONLY_MODEL_TURN_PLACEHOLDER
+            visible_thought_signature = None
+
+        if not visible_text and not thinking_text: # Don't save if both are empty
             return
         try:
-            part_data: Dict[str, Any] = {'text': text}
-            if role == 'model' and thought_signature is not None:
-                part_data['thought_signature'] = thought_signature
+            part_data: Dict[str, Any] = {'text': visible_text}
+            if role == 'model' and visible_thought_signature is not None:
+                part_data['thought_signature'] = visible_thought_signature
             turn_data = {'tick': tick, 'role': role, 'parts': [part_data]}
             if thinking_text:
                 turn_data['thinking_content'] = thinking_text

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -31,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from station import constants
 from station import file_io_utils
 from .base_evaluator import ResearchTaskEvaluator
+from .breakthroughs import normalize_progress_records
 from .coder_manager import ResearchCoderManager
 from .evaluation_helpers import save_stdout_with_limit
 from .evaluation_manager import EvaluationManager, extract_secondary_metrics_for_display_info
@@ -42,6 +44,97 @@ from .task_registry import ResearchTaskRegistry
 
 class FatalResearchNotificationError(RuntimeError):
     """Raised when Research Center notification delivery fails and must not be retried automatically."""
+
+
+def _gpu_management_enabled() -> bool:
+    return constants.RESEARCH_EVAL_GPU_NUM is not None or bool(constants.RESEARCH_EVAL_USE_DIFF_GPU)
+
+
+def _resource_coordination_station_id(station_instance: Any) -> str:
+    """Return a resource owner ID unique to one live Station process lineage."""
+    station_id = str(getattr(station_instance, "station_id", None) or "unknown")
+    if os.environ.get("STATION_MULTISTART_BRANCH") != "1":
+        return station_id
+    seed = str(os.environ.get("STATION_MULTISTART_SEED") or "").strip()
+    if not seed:
+        raise RuntimeError(
+            "Multistart Research resource coordination requires STATION_MULTISTART_SEED"
+        )
+    return f"{station_id}:s{seed}"
+
+
+def _gpu_count_per_task() -> int:
+    configured_count = (
+        constants.RESEARCH_EVAL_GPU_NUM
+        if constants.RESEARCH_EVAL_GPU_NUM is not None
+        else constants.RESEARCH_EVAL_GPUS_PER_TASK
+    )
+    try:
+        count = int(configured_count)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "GPU count must be a positive integer. Set RESEARCH_EVAL_GPU_NUM, "
+            "or use legacy RESEARCH_EVAL_GPUS_PER_TASK with RESEARCH_EVAL_USE_DIFF_GPU."
+        ) from exc
+    if count <= 0:
+        raise ValueError(
+            "GPU count must be a positive integer. Set RESEARCH_EVAL_GPU_NUM, "
+            "or use legacy RESEARCH_EVAL_GPUS_PER_TASK with RESEARCH_EVAL_USE_DIFF_GPU."
+        )
+    return count
+
+
+def _detect_gpu_ids_with_nvidia_smi() -> List[int]:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if result.returncode != 0:
+        return []
+    gpu_ids: List[int] = []
+    for line in result.stdout.splitlines():
+        match = re.search(r"\d+", line)
+        if match:
+            gpu_ids.append(int(match.group(0)))
+    return gpu_ids
+
+
+def _parse_gpu_list(value: Any) -> List[int]:
+    if isinstance(value, (list, tuple)):
+        if value:
+            return [int(gpu) for gpu in value]
+        return _detect_gpu_ids_with_nvidia_smi()
+    if isinstance(value, str):
+        if not value.strip():
+            return _detect_gpu_ids_with_nvidia_smi()
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    if value is None:
+        return _detect_gpu_ids_with_nvidia_smi()
+    return [int(value)]
+
+
+def _managed_gpu_ids() -> List[int]:
+    if not _gpu_management_enabled():
+        return []
+    gpu_ids = _parse_gpu_list(constants.RESEARCH_EVAL_AVAILABLE_GPUS)
+    if not gpu_ids:
+        raise RuntimeError(
+            "GPU management is enabled, but no usable GPUs could be auto-detected. "
+            "Set RESEARCH_EVAL_AVAILABLE_GPUS explicitly, for example [0, 1, 2, 3], "
+            "or disable GPU management."
+        )
+    per_task = _gpu_count_per_task()
+    if len(gpu_ids) < per_task:
+        raise RuntimeError(
+            f"RESEARCH_EVAL_GPU_NUM is {per_task}, but only {len(gpu_ids)} GPU(s) are available: {gpu_ids}."
+        )
+    return gpu_ids
 
 
 class AutoResearchEvaluator:
@@ -65,12 +158,20 @@ class AutoResearchEvaluator:
         self.timeout = constants.RESEARCH_EVAL_TIMEOUT
         self.memory_limit = constants.RESEARCH_EVAL_MEMORY_LIMIT
         self.cpu_limit = constants.RESEARCH_EVAL_CPU_LIMIT
-        self.max_parallel_workers = constants.RESEARCH_EVAL_MAX_PARALLEL_WORKERS
-        self.attempt_worker_max = max(32, os.cpu_count() or 8)
+        self.max_parallel_workers = max(1, int(constants.RESEARCH_EVAL_MAX_PARALLEL_WORKERS or 1))
+        # Official attempts are a subset of live coder workflows. Basing this
+        # executor on host CPU count created a large pool unrelated to the
+        # configured station concurrency or CPUs allocated per evaluation.
+        self.attempt_worker_max = self.max_parallel_workers
         self.log_queue = log_queue
 
         phase_started_at = time.perf_counter()
         self.paths = ensure_runtime_layout()
+        self.seed_bank_store = None
+        if bool(getattr(constants, "RESEARCH_SEED_BANK_ENABLED", False)):
+            from .seed_bank import ensure_seed_bank_layout
+
+            self.seed_bank_store = ensure_seed_bank_layout(self.paths, constants)
         ensure_task_spec_markdown()
         print(
             "AutoResearchEvaluator: startup ensure_runtime_layout/task_spec "
@@ -93,12 +194,14 @@ class AutoResearchEvaluator:
         self.thread_pool: Optional[ThreadPoolExecutor] = None
         self.active_futures: Dict[str, Dict[str, Any]] = {}
 
-        runtime_station_id = getattr(station_instance, "station_id", None)
+        runtime_station_id = _resource_coordination_station_id(station_instance)
+        resource_expiry_seconds = max(float(self.timeout) * 2, 300.0)
         phase_started_at = time.perf_counter()
         self.gpu_coordinator = GPUCoordinator(
             coord_file_path=constants.RESEARCH_EVAL_GPU_COORD_FILE,
-            available_gpus=constants.RESEARCH_EVAL_AVAILABLE_GPUS.copy() if constants.RESEARCH_EVAL_USE_DIFF_GPU else [],
+            available_gpus=_managed_gpu_ids(),
             station_id=runtime_station_id,
+            expiry_seconds=resource_expiry_seconds,
         )
         print(
             "AutoResearchEvaluator: startup GPUCoordinator init "
@@ -112,6 +215,7 @@ class AutoResearchEvaluator:
                 coord_file_path=constants.RESEARCH_EVAL_CPU_COORD_FILE,
                 available_cpus=available_cpus,
                 station_id=runtime_station_id,
+                expiry_seconds=resource_expiry_seconds,
             )
             print(
                 "AutoResearchEvaluator: startup CPUCoordinator init "
@@ -266,16 +370,16 @@ class AutoResearchEvaluator:
         return []
 
     def _allocate_gpu(self, eval_id: str) -> Optional[List[int]]:
-        if not constants.RESEARCH_EVAL_USE_DIFF_GPU:
+        if not _gpu_management_enabled():
             return None
-        return self.gpu_coordinator.allocate(eval_id, count=constants.RESEARCH_EVAL_GPUS_PER_TASK)
+        return self.gpu_coordinator.allocate(eval_id, count=_gpu_count_per_task())
 
     def _deallocate_gpu(self, eval_id: str):
-        if constants.RESEARCH_EVAL_USE_DIFF_GPU:
+        if _gpu_management_enabled():
             self.gpu_coordinator.deallocate(eval_id)
 
     def _cleanup_gpu_allocations(self):
-        if constants.RESEARCH_EVAL_USE_DIFF_GPU:
+        if _gpu_management_enabled():
             self.gpu_coordinator.cleanup_stale_allocations(
                 stale_run_seconds=constants.RESEARCH_EVAL_GPU_STALE_RUN_HOURS * 3600
             )
@@ -335,6 +439,16 @@ class AutoResearchEvaluator:
         if reason:
             self._push_log_event("auto_research_wake", {"reason": reason})
         self._wake_event.set()
+
+    def refresh_task_registry(self) -> ResearchTaskEvaluator:
+        """Reload the active evaluator after all Research Center work has drained."""
+        new_registry = ResearchTaskRegistry()
+        evaluator = new_registry.get_evaluator()
+        if evaluator is None:
+            raise RuntimeError("The active Research Center evaluator could not be loaded.")
+        evaluator.get_task_description()
+        self.task_registry = new_registry
+        return evaluator
 
     def stop_evaluation_loop(self):
         started_at = time.perf_counter()
@@ -503,9 +617,24 @@ class AutoResearchEvaluator:
                 return True
         return False
 
+    @staticmethod
+    def _attempt_elapsed_seconds(attempt: Dict[str, Any]) -> float:
+        started = attempt.get("started_timestamp") or attempt.get("requested_timestamp")
+        try:
+            started_float = float(started)
+        except (TypeError, ValueError):
+            return 0.0
+        if started_float <= 0:
+            return 0.0
+        return max(0.0, time.time() - started_float)
+
     def _recover_stale_coder_states(self):
         for eval_id in self.eval_manager.get_running_instruction_eval_ids():
-            if eval_id in self.coder_manager.active_sessions:
+            audit_enabled = bool(getattr(constants, "RESEARCH_CODER_AUDIT_ENABLED", True))
+            audit_manager = getattr(self.coder_manager, "audit_manager", None)
+            if eval_id in self.coder_manager.active_sessions or (
+                audit_enabled and audit_manager is not None and eval_id in audit_manager.active_sessions
+            ):
                 continue
             if eval_id in self.active_futures:
                 continue
@@ -516,15 +645,123 @@ class AutoResearchEvaluator:
             if not isinstance(eval_data, dict) or eval_data.get("final"):
                 continue
 
+            if audit_enabled:
+                audit = eval_data.get("audit", {}) or {}
+                audit_status = str(audit.get("status", "")).strip().lower()
+                audit_pid = audit.get("active_pid")
+                audit_report_path = os.path.join(self.paths.audit_dir, f"{eval_id}.md")
+                audit_verdict_path = os.path.join(self.paths.audit_dir, f"{eval_id}.verdict")
+                if audit_status in {"pass", "fail"}:
+                    verdict = (
+                        (file_io_utils.load_text(audit_verdict_path) or "").strip().lower()
+                        if os.path.exists(audit_verdict_path)
+                        else ""
+                    )
+                    if verdict in {"pass", "fail"} and os.path.exists(audit_report_path):
+                        self.coder_manager._handle_audit_verdict(
+                            eval_id,
+                            verdict,
+                            file_io_utils.load_text(audit_report_path) or "",
+                            audit.get("session_id"),
+                        )
+                    else:
+                        self.eval_manager.update_evaluation(
+                            eval_id,
+                            lambda record: record.setdefault("audit", {}).update({
+                                "active": False,
+                                "active_pid": None,
+                                "status": "retry",
+                                "last_error": "Recovered incomplete persisted auditor verdict; auditor will be relaunched.",
+                            }),
+                        )
+                    continue
+                if audit_status == "blocked":
+                    continue
+                if bool(audit.get("active")):
+                    if self._pid_exists(audit_pid):
+                        continue
+                    if os.path.exists(audit_report_path) and os.path.exists(audit_verdict_path):
+                        verdict = (file_io_utils.load_text(audit_verdict_path) or "").strip().lower()
+                        if verdict in {"pass", "fail"}:
+                            self.coder_manager._handle_audit_verdict(
+                                eval_id, verdict, file_io_utils.load_text(audit_report_path) or "", audit.get("session_id")
+                            )
+                            continue
+                    self.eval_manager.update_evaluation(eval_id, lambda record: record.setdefault("audit", {}).update({
+                        "active": False, "active_pid": None, "status": "retry",
+                        "last_error": "Recovered stale auditor process; auditor will be relaunched.",
+                    }))
+                    continue
+                if audit_status == "repairing":
+                    coder_state = eval_data.get("coder", {}) or {}
+                    if bool(coder_state.get("active")) and self._pid_exists(coder_state.get("active_pid")):
+                        continue
+                    attempts = eval_data.get("attempts") or []
+                    latest_attempt = attempts[-1] if attempts else {}
+                    latest_attempt_status = str(latest_attempt.get("status", "")).strip().lower()
+                    repair_attempt_interrupted = latest_attempt_status in {"queued", "running"}
+                    # The report from before the repair is still present. Only
+                    # advance to re-audit when the repair coder replaced it and
+                    # the corresponding official attempt reached a terminal state.
+                    report_path = os.path.join(self.paths.reports_dir, f"{eval_id}.md")
+                    try:
+                        report_mtime_ns = os.stat(report_path).st_mtime_ns
+                    except OSError:
+                        report_mtime_ns = 0
+                    baseline_mtime_ns = int(audit.get("repair_report_baseline_mtime_ns", 0) or 0)
+                    if baseline_mtime_ns:
+                        repair_report_ready = report_mtime_ns > baseline_mtime_ns
+                    else:
+                        started_timestamp = float(coder_state.get("started_timestamp") or 0)
+                        repair_report_ready = bool(
+                            report_mtime_ns and started_timestamp and report_mtime_ns > int(started_timestamp * 1e9)
+                        )
+                    if repair_report_ready and not repair_attempt_interrupted:
+                        self.eval_manager.update_evaluation(eval_id, lambda record: record.update({
+                            "status": "running",
+                            "coder": dict(record.get("coder", {}) or {}, active=False, active_pid=None, status="audit_running"),
+                            "audit": dict(record.get("audit", {}) or {}, status="queued", active=False),
+                        }))
+                    else:
+                        resume_token = str(coder_state.get("resume_token") or "").strip()
+                        from .restart_evaluations import _abandon_interrupted_repair_attempt
+
+                        def recover_repair(record):
+                            interruption_reason = (
+                                "Recovered interrupted repair attempt: no live evaluator future, "
+                                "run request, or repair coder process remained."
+                            )
+                            attempt_abandoned = _abandon_interrupted_repair_attempt(
+                                record,
+                                interruption_reason,
+                                self.eval_manager,
+                            )
+                            record.update({
+                                "status": "running" if resume_token else "queued",
+                                "coder": dict(
+                                    record.get("coder", {}) or {},
+                                    active=bool(resume_token),
+                                    active_pid=None,
+                                    status="pending_resume" if resume_token else "queued",
+                                    next_resume_timestamp=None,
+                                    resume_delay_seconds=None,
+                                    last_error=(
+                                        "Recovered interrupted repair attempt."
+                                        if attempt_abandoned
+                                        else (record.get("coder", {}) or {}).get("last_error")
+                                    ),
+                                ),
+                            })
+                        self.eval_manager.update_evaluation(eval_id, recover_repair)
+                    continue
+                if audit_status in {"queued", "retry", "running", "pending_resume", "resuming"} and not bool((eval_data.get("coder", {}) or {}).get("active")):
+                    # An unfinished audit is independently restartable; it must not
+                    # cause the coder attempt to be rerun.
+                    continue
+
             coder = eval_data.get("coder", {}) or {}
-            if not bool(coder.get("active")):
-                continue
             coder_status = str(coder.get("status", "")).strip().lower()
             if coder_status in {"pending_resume", "resuming"} and str(coder.get("resume_token", "")).strip():
-                continue
-
-            pid = coder.get("active_pid")
-            if self._pid_exists(pid):
                 continue
 
             attempts = eval_data.get("attempts") or []
@@ -532,8 +769,60 @@ class AutoResearchEvaluator:
             latest_attempt_status = str(latest_attempt.get("status", "")).strip().lower()
             report_path = os.path.join(self.paths.reports_dir, f"{eval_id}.md")
 
+            coder_active = bool(coder.get("active"))
+            pid = coder.get("active_pid")
+            if coder_active and self._pid_exists(pid):
+                continue
+
+            if (
+                not coder_active
+                and coder_status == "attempt_running"
+                and latest_attempt_status in {"queued", "running"}
+                and self._attempt_elapsed_seconds(latest_attempt) < float(self.timeout)
+            ):
+                continue
+
             if os.path.exists(report_path) and latest_attempt_status not in {"queued", "running"}:
                 report_text = file_io_utils.load_text(report_path) or ""
+                if audit_enabled and audit_status in {"", "not_started"}:
+                    resume_token = str(coder.get("resume_token") or "").strip() or None
+                    if not resume_token:
+                        session_id = str(coder.get("session_id") or "").strip()
+                        transcript_path = os.path.join(
+                            self.paths.coder_sessions_dir,
+                            session_id,
+                            "transcript.jsonl",
+                        )
+                        try:
+                            backend = str(coder.get("backend") or constants.RESEARCH_CODER_BACKEND).lower()
+                            resume_token = self.coder_manager._get_cli_job_backend(backend).extract_resume_token(
+                                transcript_path
+                            )
+                        except Exception:
+                            resume_token = None
+                    self.eval_manager.update_evaluation(eval_id, lambda record: record.update({
+                        "status": "running",
+                        "coder": dict(
+                            record.get("coder", {}) or {},
+                            active=False,
+                            active_pid=None,
+                            status="audit_running",
+                            resume_token=resume_token,
+                        ),
+                        "audit": dict(
+                            record.get("audit", {}) or {},
+                            status="queued",
+                            active=False,
+                            active_pid=None,
+                        ),
+                    }))
+                    self._push_log_event(
+                        "auto_research_recovered_stale_coder_report_for_audit",
+                        {"eval_id": eval_id, "session_id": coder.get("session_id")},
+                    )
+                    continue
+                if audit_enabled:
+                    continue
                 final_status = self.coder_manager._parse_final_status(report_text)
                 self.eval_manager.finalize_evaluation(eval_id, report_text, final_status=final_status)
                 self._push_log_event(
@@ -542,10 +831,16 @@ class AutoResearchEvaluator:
                 )
                 continue
 
-            reason = (
-                "Recovered stale coder state: coder session was marked active, "
-                "but no live coder process, active future, or run-request remained."
-            )
+            if coder_active:
+                reason = (
+                    "Recovered stale coder state: coder session was marked active, "
+                    "but no live coder process, active future, or run-request remained."
+                )
+            else:
+                reason = (
+                    "Recovered stale attempt state: coder was inactive and no active future "
+                    "or run-request remained after the attempt timeout."
+                )
 
             def mutator(record: Dict[str, Any]):
                 coder_record = record.setdefault("coder", {})
@@ -569,7 +864,12 @@ class AutoResearchEvaluator:
             self.eval_manager.update_evaluation(eval_id, mutator)
             self._push_log_event(
                 "auto_research_recovered_stale_coder",
-                {"eval_id": eval_id, "session_id": coder.get("session_id"), "active_pid": pid},
+                {
+                    "eval_id": eval_id,
+                    "session_id": coder.get("session_id"),
+                    "active_pid": pid,
+                    "coder_active": coder_active,
+                },
             )
 
     def _repair_terminal_notifications(self):
@@ -727,12 +1027,17 @@ class AutoResearchEvaluator:
                     continue
 
             gpu_ids = None
-            if constants.RESEARCH_EVAL_USE_DIFF_GPU and not eval_data.get("cpu_only", False):
-                gpu_ids = self._allocate_gpu(eval_id)
-                if gpu_ids is None:
-                    if cpu_ids is not None:
-                        self._deallocate_cpu(eval_id)
-                    continue
+            gpu_management_enabled = _gpu_management_enabled()
+            cpu_only = gpu_management_enabled and bool(request.get("cpu_only", False))
+            if gpu_management_enabled:
+                if cpu_only:
+                    gpu_ids = []
+                else:
+                    gpu_ids = self._allocate_gpu(eval_id)
+                    if gpu_ids is None:
+                        if cpu_ids is not None:
+                            self._deallocate_cpu(eval_id)
+                        continue
 
             future = self.thread_pool.submit(self._execute_run_request, eval_id, attempt_number, request_path, gpu_ids, cpu_ids)
             self.active_futures[eval_id] = {
@@ -760,7 +1065,7 @@ class AutoResearchEvaluator:
 
         for eval_id in completed:
             metadata = self.active_futures.pop(eval_id, {})
-            if metadata.get("gpu_ids") is not None:
+            if metadata.get("gpu_ids"):
                 self._deallocate_gpu(eval_id)
             if metadata.get("cpu_ids") is not None:
                 self._deallocate_cpu(eval_id)
@@ -774,16 +1079,28 @@ class AutoResearchEvaluator:
         details: Any,
         safe_to_resubmit: bool,
         prelude_stdout: str = "",
+        attempt_status: str = "completed",
     ):
         stdout_path = os.path.join(self.paths.stdout_dir, f"{eval_id}.log")
         stderr_path = os.path.join(self.paths.stderr_dir, f"{eval_id}.log")
+        normalized_status = str(attempt_status or "completed").strip().lower()
+        if normalized_status == "completed":
+            status_message = (
+                "The submission has run to completion. You may now submit the next attempt or write the final Coder Report."
+            )
+        else:
+            status_message = (
+                f"The attempt has settled with status '{normalized_status}'. Inspect the failure details "
+                "before deciding whether to retry or finalize the report."
+            )
 
         _, metrics_dict = extract_secondary_metrics_for_display_info({constants.EVALUATION_DETAILS_KEY: details})
         footer_lines = [
             "",
-            "Official evaluation finished. The score and secondary metrics below are authoritative. Inspect them before deciding whether to resubmit or finalize the report.",
+            "Official evaluation finished. The attempt status, score, and secondary metrics below are authoritative. Inspect them before deciding whether to resubmit or finalize the report.",
             "ATTEMPT_COMPLETE",
-            "The submission has run to completion. You may now submit the next attempt or write the final Coder Report.",
+            f"ATTEMPT_STATUS: {normalized_status}",
+            status_message,
             f"PRIMARY_SCORE: {score}",
             f"SECONDARY_METRICS: {json.dumps(metrics_dict, sort_keys=True)}",
             f"SAFE_TO_RESUBMIT: {'true' if safe_to_resubmit else 'false'}",
@@ -810,7 +1127,9 @@ class AutoResearchEvaluator:
         resource_parts: List[str] = []
         if cpu_ids is not None:
             resource_parts.append(f"CPUs={cpu_ids}")
-        if gpu_ids is not None:
+        if gpu_ids == []:
+            resource_parts.append("GPUs=disabled")
+        elif gpu_ids is not None:
             resource_parts.append(f"GPUs={gpu_ids}")
         if not resource_parts:
             resource_parts.append("default resources")
@@ -885,12 +1204,21 @@ class AutoResearchEvaluator:
         author = eval_data.get("author", "Unknown")
         title = eval_data.get("title", "Untitled")
         is_system_baseline = bool(eval_data.get("system_baseline"))
+        current_tick = getattr(self.station, "_get_current_tick", lambda: 0)()
 
         temp_eval_entry = {
             constants.EVALUATION_ID_KEY: eval_id,
             constants.EVALUATION_CONTENT_KEY: content,
             constants.EVALUATION_AUTHOR_KEY: author,
+            constants.EVALUATION_SUBMITTED_TICK_KEY: eval_data.get(constants.EVALUATION_SUBMITTED_TICK_KEY, 0),
+            "current_tick": current_tick,
+            "system_baseline": is_system_baseline,
         }
+        if bool(getattr(constants, "RESEARCH_SEED_BANK_ENABLED", False)):
+            temp_eval_entry["lineage"] = str(eval_data.get("lineage", "unknown")).lower()
+            temp_eval_entry["coder_access_phase"] = str(
+                (eval_data.get("coder_access") or {}).get("phase") or "mature"
+            ).lower()
 
         try:
             if hasattr(evaluator, "validate_submission_code"):
@@ -904,6 +1232,7 @@ class AutoResearchEvaluator:
                         "",
                         safe_to_resubmit=(attempt_number < int(eval_data.get("coder", {}).get("max_attempts", constants.RESEARCH_CODER_MAX_ATTEMPTS))),
                         prelude_stdout=start_banner,
+                        attempt_status="failed",
                     )
                     self.eval_manager.complete_attempt(
                         eval_id,
@@ -945,6 +1274,7 @@ class AutoResearchEvaluator:
                     "",
                     safe_to_resubmit=safe_to_resubmit,
                     prelude_stdout=start_banner,
+                    attempt_status=attempt_status,
                 )
                 self.eval_manager.complete_attempt(
                     eval_id,
@@ -962,21 +1292,105 @@ class AutoResearchEvaluator:
                 return
 
             algorithm_result = execution_result["result"]
-            try:
-                eval_result = evaluator.evaluate_submission_with_formatting(algorithm_result, eval_id, author)
-            except TypeError:
-                eval_result = evaluator.evaluate_submission_with_formatting(algorithm_result, eval_id)
+            if bool(getattr(constants, "RESEARCH_SEED_BANK_ENABLED", False)):
+                from .seed_bank import validate_and_rank_seed_batch
 
-            if len(eval_result) == 4:
-                success, score, details, sort_key = eval_result
+                if algorithm_result is None:
+                    success = True
+                    score = constants.RESEARCH_SCORE_NA
+                    details = {
+                        "Message": (
+                            "The submission intentionally returned None. The attempt completed "
+                            "as non-scorable and no candidate was added to the Seed Bank."
+                        ),
+                        "SeedBankCandidates": 0,
+                    }
+                    sort_key = None
+                else:
+                    try:
+                        seed_batch = evaluator.evaluate_seed_batch_with_formatting(algorithm_result, eval_id, author)
+                    except TypeError:
+                        seed_batch = evaluator.evaluate_seed_batch_with_formatting(algorithm_result, eval_id)
+                    try:
+                        ranked_seed_batch = validate_and_rank_seed_batch(seed_batch, constants)
+                    except ValueError as exc:
+                        success = False
+                        score = constants.RESEARCH_SCORE_NA
+                        details = {"Message": f"Seed batch evaluation failed: {exc}"}
+                        sort_key = (float("-inf"),)
+                    else:
+                        winner_index = ranked_seed_batch.winner_index
+                        runner_up_index = ranked_seed_batch.runner_up_index
+                        if self.seed_bank_store is None:
+                            raise RuntimeError("Seed Bank is enabled but its Station store was not initialized.")
+                        try:
+                            self.seed_bank_store.save_batch(
+                                eval_id=eval_id,
+                                attempt_number=attempt_number,
+                                lineage=str(eval_data.get("lineage", "unknown")),
+                                author=str(author),
+                                ranked=ranked_seed_batch,
+                            )
+                        except (TypeError, ValueError) as exc:
+                            success = False
+                            score = constants.RESEARCH_SCORE_NA
+                            details = {"Message": f"Seed batch persistence rejected: {exc}"}
+                            sort_key = (float("-inf"),)
+                        else:
+                            success = True
+                            score = float(seed_batch.scores[winner_index])
+                            sort_key = tuple(seed_batch.sort_keys[winner_index])
+                            winner_details = seed_batch.details[winner_index]
+                            details = dict(winner_details) if isinstance(winner_details, dict) else {
+                                "Message": str(winner_details)
+                            }
+                            batch_size = len(seed_batch.seeds)
+                            valid_count = len(ranked_seed_batch.ranked_indices)
+                            runner_up_text = "none"
+                            if runner_up_index is not None:
+                                runner_up_text = (
+                                    f"batch index {runner_up_index}, "
+                                    f"score {float(seed_batch.scores[runner_up_index]):.12g}"
+                                )
+                            original_message = str(details.get("Message", "")).strip()
+                            summary = (
+                                f"Seed batch: {batch_size} candidates, {valid_count} valid; "
+                                f"winner batch index {winner_index}; runner-up {runner_up_text}."
+                            )
+                            details["Message"] = f"{original_message} {summary}".strip()
+                            details["BatchSize"] = batch_size
+                            details["ValidCandidates"] = valid_count
+                            details["WinnerBatchIndex"] = winner_index
+                            details["RunnerUpBatchIndex"] = runner_up_index
+                            details["RunnerUpScore"] = (
+                                None if runner_up_index is None else float(seed_batch.scores[runner_up_index])
+                            )
             else:
-                success, score, details = eval_result
-                sort_key = None
+                try:
+                    eval_result = evaluator.evaluate_submission_with_formatting(algorithm_result, eval_id, author)
+                except TypeError:
+                    eval_result = evaluator.evaluate_submission_with_formatting(algorithm_result, eval_id)
+
+                if len(eval_result) == 4:
+                    success, score, details, sort_key = eval_result
+                else:
+                    success, score, details = eval_result
+                    sort_key = None
 
             if isinstance(details, dict):
                 error_message = details.get("Message", "Evaluation failed")
             else:
                 error_message = str(details)
+            progress_records = self._get_progress_records(
+                evaluator=evaluator,
+                result=algorithm_result,
+                success=bool(success),
+                score=score,
+                details=details,
+                sort_key=sort_key,
+                eval_id=eval_id,
+                author=author,
+            )
 
             stdout_text, stderr_text = self._write_attempt_logs(
                 eval_id,
@@ -986,6 +1400,7 @@ class AutoResearchEvaluator:
                 details,
                 safe_to_resubmit=safe_to_resubmit,
                 prelude_stdout=start_banner,
+                attempt_status="completed" if success else "failed",
             )
             self.eval_manager.complete_attempt(
                 eval_id,
@@ -998,6 +1413,7 @@ class AutoResearchEvaluator:
                 error=None if success else f"Evaluation failed: {error_message}",
                 sort_key=sort_key,
                 status="completed" if success else "failed",
+                progress_records=progress_records if success else [],
             )
             if is_system_baseline:
                 self._finalize_system_baseline(eval_id, content)
@@ -1011,6 +1427,7 @@ class AutoResearchEvaluator:
                 "",
                 safe_to_resubmit=(attempt_number < int(eval_data.get("coder", {}).get("max_attempts", constants.RESEARCH_CODER_MAX_ATTEMPTS))),
                 prelude_stdout=start_banner,
+                attempt_status="failed",
             )
             self.eval_manager.complete_attempt(
                 eval_id,
@@ -1043,6 +1460,36 @@ class AutoResearchEvaluator:
             live_stdout_path=live_stdout_path,
             live_stderr_path=live_stderr_path,
         )
+
+    def _get_progress_records(
+        self,
+        *,
+        evaluator: ResearchTaskEvaluator,
+        result: Any,
+        success: bool,
+        score: Any,
+        details: Any,
+        sort_key: Any,
+        eval_id: str,
+        author: str,
+    ) -> List[Dict[str, Any]]:
+        getter = getattr(evaluator, "get_progress_records", None)
+        if not callable(getter):
+            return []
+        try:
+            raw_records = getter(
+                result=result,
+                success=success,
+                score=score,
+                details=details,
+                sort_key=sort_key,
+                eval_id=eval_id,
+                author=author,
+            )
+        except Exception as exc:
+            print(f"AutoResearchEvaluator: progress record hook failed eval_id={eval_id!r}: {exc}")
+            return []
+        return normalize_progress_records(raw_records)
 
     def _system_baseline_report(self, raw_code: str) -> str:
         return (
@@ -1127,7 +1574,7 @@ class AutoResearchEvaluator:
         running_evals = [
             info
             for info in self.eval_manager.get_active_evaluations()
-            if info.get("status") == "attempt_running" and info.get("coder_active")
+            if info.get("status") == "attempt_running"
         ]
         if not running_evals:
             return False, []

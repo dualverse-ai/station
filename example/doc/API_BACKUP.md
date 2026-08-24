@@ -87,22 +87,43 @@ wraps back to the first endpoint, Station prints that the provider fallback loop
 finished and waits using the normal LLM retry delay before starting the next
 loop.
 
+For OpenAI reasoning models using the Responses API, each endpoint is tried in
+streaming mode first and non-streaming mode on the same-endpoint retry. After
+rotation, the next endpoint starts with streaming again. Setting
+`OPENAI_FORCE_STREAMING` keeps streaming enabled on retries as an explicit
+override. Chat Completions keeps its existing mode-selection behavior.
+
 Station also records the recent result history for the current provider default.
 If the trailing 10 non-expired calls for that default have a failure rate above
 70 percent, Station promotes the provider default to the next endpoint. Samples
 older than one hour are dropped before the rate is evaluated.
 
-When the default is not the base endpoint, connectors try a base recovery probe
-at most once every 30 minutes. The probe uses the current connector's configured
-model and asks for a minimal response. If the probe succeeds, the shared default
-returns to base.
+The External Counter uses this same OpenAI endpoint loop when it inherits the
+normal `OPENAI_*` configuration. If `EXTERNAL_OPENAI_API_KEY`,
+`EXTERNAL_OPENAI_BASE_URL`, `EXTERNAL_HTTP_PROXY`, or `EXTERNAL_HTTPS_PROXY` is
+configured, the External Counter keeps using that dedicated endpoint instead of
+the shared OpenAI backup list.
+
+External Reports use the normal LLM retry budget and fallback-loop timing: they
+retry each endpoint once, rotate immediately through configured backups, and
+sleep only after a complete endpoint loop. Every request error follows this
+path. If the retry budget is exhausted, the report returns to `pending`, the
+Station pauses without notifying the requesting agent, and graceful restart
+does not wait on that already-failed retry.
+
+When the default is not the earliest configured endpoint, connectors try an
+earlier-endpoint recovery probe at most once every 30 minutes. The probe uses
+the current connector's configured model and asks for a minimal response. If the
+current default is `backup 2`, the probe tries `base` first, then `backup 1`;
+the first successful earlier endpoint becomes the shared default. If all earlier
+endpoints fail, the current default is kept until the next recovery window.
 
 Endpoint switches are printed to stdout with provider, endpoint index/name, and
 Base URL. API keys are not printed.
 
-## Parallel Mode
+## Concurrent Agent Calls
 
-Parallel sync mode creates separate connector instances for multiple agents, but
+The tick runner creates separate connector instances for multiple agents, but
 they all use the same process-level provider fallback state in
 `station/runtime_api_config.py`. A failure from one agent can therefore move the
 provider default for all agents. This is intentional: a single provider timeout

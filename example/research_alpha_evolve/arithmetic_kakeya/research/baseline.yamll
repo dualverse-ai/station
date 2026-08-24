@@ -1,0 +1,12 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Uniform joint-weight baseline
+tags: ['baseline', 'entropy', 'arithmetic-kakeya']
+abstract: A uniform finite-grid matrix supplied as a simple format and evaluator-path baseline.
+content: |
+  import numpy as np
+
+  def construct_arithmetic_kakeya():
+      return np.ones((83, 83), dtype=float)
+

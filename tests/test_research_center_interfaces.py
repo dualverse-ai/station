@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import os
+import json
+import time
 import tempfile
 import types
 import unittest
 from unittest import mock
 
 from station import constants
+from station import file_io_utils
 from station.base_room import RoomContext
-from station.eval_research.auto_evaluator import AutoResearchEvaluator
-from station.eval_research.evaluation_manager import EvaluationManager, build_evaluation_previews
+from station.eval_research.cpu_coordinator import CPUCoordinator
+from station.eval_research.gpu_coordinator import GPUCoordinator
+from station.eval_research.auto_evaluator import (
+    AutoResearchEvaluator,
+    _managed_gpu_ids,
+    _resource_coordination_station_id,
+)
+from station.eval_research.evaluation_manager import (
+    STDOUT_STDERR_HIDDEN_NOTICE,
+    EvaluationManager,
+    build_evaluation_previews,
+)
 from station.eval_research.runtime_paths import ensure_runtime_layout
 from station.lineage_evolution import LineageEvolutionManager
 from station.rooms.research_center import ResearchCenter
@@ -26,6 +39,162 @@ class _AgentManagerStub:
 
 
 class ResearchCenterInterfacesTest(unittest.TestCase):
+    def test_storage_read_uses_outer_fence_longer_than_embedded_fences(self):
+        room = ResearchCenter.__new__(ResearchCenter)
+        content = "# Survey\n\n```text\ninside\n```\n\nTail"
+
+        rendered = room._format_storage_read("storage/system/survey.md", content, 1)
+
+        self.assertIn("\n\n````\n# Survey", rendered)
+        self.assertIn("```text\ninside\n```", rendered)
+        self.assertTrue(rendered.endswith("Tail\n````"))
+
+    def test_storage_read_keeps_triple_fence_for_plain_content(self):
+        room = ResearchCenter.__new__(ResearchCenter)
+
+        rendered = room._format_storage_read("storage/shared/note.txt", "plain text", 1)
+
+        self.assertTrue(rendered.endswith("```\nplain text\n```"))
+
+    def test_gpu_num_autodetects_available_gpu_ids(self):
+        with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", 2), \
+             mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False), \
+             mock.patch.object(constants, "RESEARCH_EVAL_AVAILABLE_GPUS", []), \
+             mock.patch("station.eval_research.auto_evaluator._detect_gpu_ids_with_nvidia_smi", return_value=[0, 1, 2]):
+            self.assertEqual(_managed_gpu_ids(), [0, 1, 2])
+
+    def test_gpu_num_raises_clear_error_when_autodetect_fails(self):
+        with mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", 1), \
+             mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False), \
+             mock.patch.object(constants, "RESEARCH_EVAL_AVAILABLE_GPUS", []), \
+             mock.patch("station.eval_research.auto_evaluator._detect_gpu_ids_with_nvidia_smi", return_value=[]):
+            with self.assertRaisesRegex(RuntimeError, "Set RESEARCH_EVAL_AVAILABLE_GPUS explicitly"):
+                _managed_gpu_ids()
+
+    def test_multistart_resource_coordination_id_includes_seed(self):
+        station = mock.Mock(station_id="station-uuid")
+        with mock.patch.dict(
+            os.environ,
+            {"STATION_MULTISTART_BRANCH": "1", "STATION_MULTISTART_SEED": "2"},
+        ):
+            self.assertEqual(
+                "station-uuid:s2",
+                _resource_coordination_station_id(station),
+            )
+
+    def test_multistart_resource_coordination_requires_seed(self):
+        station = mock.Mock(station_id="station-uuid")
+        with mock.patch.dict(os.environ, {"STATION_MULTISTART_BRANCH": "1"}):
+            os.environ.pop("STATION_MULTISTART_SEED", None)
+            with self.assertRaisesRegex(RuntimeError, "STATION_MULTISTART_SEED"):
+                _resource_coordination_station_id(station)
+
+    def test_cpu_coordination_keeps_same_eval_isolated_between_multistart_seeds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            coord_path = os.path.join(temp_dir, "cpu.json")
+            seed_one = CPUCoordinator(
+                coord_file_path=coord_path,
+                available_cpus=[0, 1],
+                station_id="station-uuid:s1",
+                expiry_seconds=10,
+            )
+            self.assertEqual([0], seed_one.allocate("101", count=1))
+
+            seed_two = CPUCoordinator(
+                coord_file_path=coord_path,
+                available_cpus=[0, 1],
+                station_id="station-uuid:s2",
+                expiry_seconds=10,
+            )
+            self.assertEqual([1], seed_two.allocate("101", count=1))
+
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                allocations = json.load(handle)["allocations"]
+            self.assertEqual([0], allocations["station-uuid:s1:101"]["cpus"])
+            self.assertEqual([1], allocations["station-uuid:s2:101"]["cpus"])
+
+    def test_gpu_coordination_keeps_same_eval_isolated_between_multistart_seeds(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            coord_path = os.path.join(temp_dir, "gpu.json")
+            seed_one = GPUCoordinator(
+                coord_file_path=coord_path,
+                available_gpus=[0, 1],
+                station_id="station-uuid:s1",
+                expiry_seconds=10,
+            )
+            self.assertEqual([0], seed_one.allocate("201", count=1))
+
+            seed_two = GPUCoordinator(
+                coord_file_path=coord_path,
+                available_gpus=[0, 1],
+                station_id="station-uuid:s2",
+                expiry_seconds=10,
+            )
+            self.assertEqual([1], seed_two.allocate("201", count=1))
+
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                allocations = json.load(handle)["allocations"]
+            self.assertEqual([0], allocations["station-uuid:s1:201"]["gpus"])
+            self.assertEqual([1], allocations["station-uuid:s2:201"]["gpus"])
+
+    def test_cpu_coordination_records_expiry_and_reclaims_expired_foreign_allocation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            coord_path = os.path.join(temp_dir, "cpu.json")
+            first = CPUCoordinator(
+                coord_file_path=coord_path,
+                available_cpus=[0, 1],
+                station_id="station-a",
+                expiry_seconds=0.01,
+            )
+            self.assertEqual(first.allocate("101", count=1), [0])
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            allocation = data["allocations"]["station-a:101"]
+            self.assertIn("expires_at", allocation)
+            self.assertEqual(allocation["timeout_seconds"], 0.005)
+
+            time.sleep(0.02)
+            second = CPUCoordinator(
+                coord_file_path=coord_path,
+                available_cpus=[0, 1],
+                station_id="station-b",
+                expiry_seconds=10,
+            )
+            self.assertEqual(second.allocate("102", count=2), [0, 1])
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.assertNotIn("station-a:101", data["allocations"])
+            self.assertEqual(data["allocations"]["station-b:102"]["cpus"], [0, 1])
+
+    def test_gpu_coordination_records_expiry_and_reclaims_expired_foreign_allocation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            coord_path = os.path.join(temp_dir, "gpu.json")
+            first = GPUCoordinator(
+                coord_file_path=coord_path,
+                available_gpus=[0, 1],
+                station_id="station-a",
+                expiry_seconds=0.01,
+            )
+            self.assertEqual(first.allocate("201", count=1), [0])
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            allocation = data["allocations"]["station-a:201"]
+            self.assertIn("expires_at", allocation)
+            self.assertEqual(allocation["timeout_seconds"], 0.005)
+
+            time.sleep(0.02)
+            second = GPUCoordinator(
+                coord_file_path=coord_path,
+                available_gpus=[0, 1],
+                station_id="station-b",
+                expiry_seconds=10,
+            )
+            self.assertEqual(second.allocate("202", count=2), [0, 1])
+            with open(coord_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.assertNotIn("station-a:201", data["allocations"])
+            self.assertEqual(data["allocations"]["station-b:202"]["gpus"], [0, 1])
+
     def test_attempt_logs_include_running_banner_and_informative_completion_line(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = os.path.join(temp_dir, "station-data")
@@ -65,13 +234,81 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertIn("Some submissions buffer their own output, so a quiet log does not by itself mean the evaluation is stalled.", persisted_stdout)
             self.assertIn("worker output", persisted_stdout)
             self.assertIn(
-                "Official evaluation finished. The score and secondary metrics below are authoritative.",
+                "Official evaluation finished. The attempt status, score, and secondary metrics below are authoritative.",
                 persisted_stdout,
             )
             self.assertIn("ATTEMPT_COMPLETE", persisted_stdout)
+            self.assertIn("ATTEMPT_STATUS: completed", persisted_stdout)
             self.assertIn("PRIMARY_SCORE: 1.5", persisted_stdout)
             self.assertEqual(stdout_text, persisted_stdout)
             self.assertEqual(stderr_text, "")
+
+    def test_cpu_only_run_request_skips_gpu_allocation_when_gpu_managed(self):
+        class PendingFuture:
+            def done(self):
+                return False
+
+        class RecordingThreadPool:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, fn, *args):
+                self.calls.append((fn, args))
+                return PendingFuture()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", 1), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_AVAILABLE_GPUS", [0, 1]), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_CPU_NUM", None):
+                paths = ensure_runtime_layout()
+                eval_manager = EvaluationManager(paths.evaluations_dir)
+                eval_manager.create_evaluation(
+                    eval_id="91",
+                    author="Veritas I",
+                    title="CPU-only dispatch",
+                    content="Run without GPU.",
+                    tick=10,
+                    tags=["cpu"],
+                    abstract="CPU-only dispatch should not allocate GPU.",
+                    lineage="veritas",
+                )
+                eval_manager.register_attempt(
+                    "91",
+                    "print('cpu only')\n",
+                    "storage/submission/91.py",
+                    cpu_only=True,
+                )
+                request_path = os.path.join(paths.run_requests_dir, "91_attempt_1.yaml")
+                file_io_utils.save_yaml(
+                    {"eval_id": "91", "attempt": 1, "cpu_only": True},
+                    request_path,
+                    sort_keys=False,
+                )
+
+                thread_pool = RecordingThreadPool()
+                evaluator = AutoResearchEvaluator.__new__(AutoResearchEvaluator)
+                evaluator.thread_pool = thread_pool
+                evaluator.active_futures = {}
+                evaluator.attempt_worker_max = 32
+                evaluator.run_requests_dir = paths.run_requests_dir
+                evaluator.eval_manager = eval_manager
+                evaluator._allocate_gpu = lambda _eval_id: self.fail("CPU-only dispatch allocated a GPU")
+                evaluator._report_exception = lambda *args, **kwargs: None
+
+                AutoResearchEvaluator._dispatch_run_requests(evaluator)
+
+            self.assertEqual(len(thread_pool.calls), 1)
+            _, args = thread_pool.calls[0]
+            self.assertEqual(args[0], "91")
+            self.assertEqual(args[1], 1)
+            self.assertEqual(args[3], [])
+            self.assertIsNone(args[4])
+            self.assertEqual(evaluator.active_futures["91"]["gpu_ids"], [])
 
     def test_public_payload_and_top_submission_work_for_new_eval_schema(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -79,7 +316,8 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             callback_updates = []
 
             with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
-                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""):
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
+                 mock.patch.object(constants, "RESEARCH_SCORE_DISPLAY_PRECISION", 2):
                 paths = ensure_runtime_layout()
                 eval_manager = EvaluationManager(paths.evaluations_dir)
                 eval_manager.set_top_submission_callback(lambda submission: callback_updates.append(submission))
@@ -133,6 +371,7 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertIn("Canonical interface test", preview)
             self.assertIn("Author: Veritas I", preview)
             self.assertIn("Abstract: Exercise public evaluation accessors.", preview)
+            self.assertIn("Score: 2.50 | metric: 7\nMessage:\nverified", preview)
 
     def test_supervisor_fallback_and_stats_use_top_submission_without_display_lookup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -340,6 +579,52 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertEqual(record["status"], "completed")
             self.assertEqual(record["coder"]["status"], "completed")
             self.assertEqual(record["final"]["status"], "completed")
+            self.assertFalse(should_wait)
+
+    def test_completed_attempt_with_na_score_finalizes_as_completed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_MAX_TICK", 2):
+                paths = ensure_runtime_layout()
+                eval_manager = EvaluationManager(paths.evaluations_dir)
+
+                eval_manager.create_evaluation(
+                    eval_id="45",
+                    author="Veritas VI",
+                    title="Diagnostic completion test",
+                    content="Run a diagnostic-only submission.",
+                    tick=10,
+                    tags=["diagnostic"],
+                    abstract="Completed diagnostic attempts may be non-scorable.",
+                    lineage="veritas",
+                )
+                eval_manager.register_attempt("45", "print('diagnostic')\n", "storage/submission/45.py")
+                eval_manager.complete_attempt(
+                    "45",
+                    1,
+                    success=True,
+                    score=constants.RESEARCH_SCORE_NA,
+                    stdout="diagnostic\nATTEMPT_COMPLETE\nATTEMPT_STATUS: completed\n",
+                    stderr="",
+                    details={"Message": "diagnostic completed"},
+                    sort_key=None,
+                    status="completed",
+                )
+                eval_manager.finalize_evaluation(
+                    "45",
+                    "# Coder Report\n\n## Final Status\n",
+                )
+
+                record = eval_manager.get_evaluation("45")
+                should_wait = eval_manager.should_wait_at_tick(current_tick=11)
+
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["coder"]["status"], "completed")
+            self.assertEqual(record["final"]["status"], "completed")
+            self.assertEqual(record["final"]["primary_score"], constants.RESEARCH_SCORE_NA)
             self.assertFalse(should_wait)
 
     def test_complete_attempt_does_not_clobber_terminal_status_after_finalize(self):
@@ -978,7 +1263,114 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertEqual(stats["running_evaluations"][0]["evaluation_id"], "83")
             self.assertEqual(stats["running_evaluations"][0]["status"], "attempt_running")
 
-    def test_station_statistics_fallback_reads_research_stats_without_live_evaluator(self):
+    def test_stale_attempt_running_after_inactive_coder_requeues_after_timeout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""):
+                paths = ensure_runtime_layout()
+                eval_manager = EvaluationManager(paths.evaluations_dir)
+
+                eval_manager.create_evaluation(
+                    eval_id="84",
+                    author="Pipeline IV",
+                    title="Stale post-coder attempt",
+                    content="The evaluator worker vanished after the coder exited.",
+                    tick=18,
+                    tags=["pipeline"],
+                    abstract="Stale attempt should be requeued.",
+                    lineage="pipeline",
+                )
+                eval_manager.register_attempt("84", "print('running')\n", "storage/submission/84.py")
+                eval_manager.mark_attempt_running("84", 1)
+                old_started = time.time() - 120.0
+                eval_manager.update_evaluation(
+                    "84",
+                    lambda record: (
+                        record.setdefault("coder", {}).update(
+                            {
+                                "active": False,
+                                "status": "attempt_running",
+                                "active_pid": None,
+                            }
+                        ),
+                        record["attempts"][-1].update({"started_timestamp": old_started}),
+                    ),
+                )
+
+                events = []
+                evaluator = AutoResearchEvaluator.__new__(AutoResearchEvaluator)
+                evaluator.eval_manager = eval_manager
+                evaluator.coder_manager = types.SimpleNamespace(active_sessions={})
+                evaluator.active_futures = {}
+                evaluator.paths = paths
+                evaluator.timeout = 60
+                evaluator._list_run_request_paths = lambda: []
+                evaluator._push_log_event = lambda event_type, data: events.append((event_type, data))
+
+                AutoResearchEvaluator._recover_stale_coder_states(evaluator)
+                record = eval_manager.get_evaluation("84")
+
+            self.assertEqual(record["status"], "queued")
+            self.assertEqual(record["coder"]["status"], "queued")
+            self.assertFalse(record["coder"]["active"])
+            self.assertEqual(record["attempts"][-1]["status"], "abandoned")
+            self.assertIn("inactive", record["attempts"][-1]["error"])
+            self.assertEqual(events[0][0], "auto_research_recovered_stale_coder")
+            self.assertFalse(events[0][1]["coder_active"])
+
+    def test_inactive_coder_attempt_running_before_timeout_is_not_requeued(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""):
+                paths = ensure_runtime_layout()
+                eval_manager = EvaluationManager(paths.evaluations_dir)
+
+                eval_manager.create_evaluation(
+                    eval_id="85",
+                    author="Pipeline V",
+                    title="Attempt still within timeout",
+                    content="The official attempt may still be running.",
+                    tick=19,
+                    tags=["pipeline"],
+                    abstract="Fresh attempt should remain running.",
+                    lineage="pipeline",
+                )
+                eval_manager.register_attempt("85", "print('running')\n", "storage/submission/85.py")
+                eval_manager.mark_attempt_running("85", 1)
+                eval_manager.update_evaluation(
+                    "85",
+                    lambda record: record.setdefault("coder", {}).update(
+                        {
+                            "active": False,
+                            "status": "attempt_running",
+                            "active_pid": None,
+                        }
+                    ),
+                )
+
+                events = []
+                evaluator = AutoResearchEvaluator.__new__(AutoResearchEvaluator)
+                evaluator.eval_manager = eval_manager
+                evaluator.coder_manager = types.SimpleNamespace(active_sessions={})
+                evaluator.active_futures = {}
+                evaluator.paths = paths
+                evaluator.timeout = 3600
+                evaluator._list_run_request_paths = lambda: []
+                evaluator._push_log_event = lambda event_type, data: events.append((event_type, data))
+
+                AutoResearchEvaluator._recover_stale_coder_states(evaluator)
+                record = eval_manager.get_evaluation("85")
+
+            self.assertEqual(record["status"], "running")
+            self.assertEqual(record["coder"]["status"], "attempt_running")
+            self.assertEqual(record["attempts"][-1]["status"], "running")
+            self.assertEqual(events, [])
+
+    def test_station_statistics_without_live_evaluator_avoids_research_index(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = os.path.join(temp_dir, "station-data")
 
@@ -1027,12 +1419,44 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
                     agent_module=types.SimpleNamespace(load_agent_data=lambda *_args, **_kwargs: None),
                     auto_research_evaluator=None,
                 )
-                stats = Station.get_station_statistics(station_stub)
+                with mock.patch.object(
+                    EvaluationManager,
+                    "get_evaluation_statistics",
+                    side_effect=AssertionError("station statistics must not query the Research index"),
+                ):
+                    stats = Station.get_station_statistics(station_stub)
 
-            self.assertEqual(stats["queued_experiments_count"], 1)
-            self.assertEqual(stats["queued_experiments"][0]["evaluation_id"], "74")
+            self.assertEqual(stats["queued_experiments_count"], 0)
+            self.assertEqual(stats["queued_experiments"], [])
             self.assertEqual(stats["running_experiments_count"], 0)
-            self.assertEqual(stats["top_research_submission"]["evaluation_id"], "75")
+            self.assertIsNone(stats["top_research_submission"])
+
+    def test_station_statistics_exposes_cached_breakthrough_age(self):
+        station_stub = types.SimpleNamespace(
+            rooms={},
+            config={
+                constants.STATION_CONFIG_CURRENT_TICK: 200,
+                constants.STATION_CONFIG_AGENT_TURN_ORDER: [],
+                constants.STATION_CONFIG_STAGNATION_COUNTER: 186,
+                constants.STATION_CONFIG_TOP_EVALUATION_ID: "75",
+                constants.STATION_CONFIG_TOP_TITLE: "Cached top",
+                constants.STATION_CONFIG_TOP_SCORE: 8.0,
+                constants.STATION_CONFIG_TOP_SORT_KEY: [8.0],
+                constants.STATION_CONFIG_TOP_TICK: 14,
+                constants.STATION_CONFIG_TOP_AGENT_NAME: "Fallback II",
+            },
+            agent_module=types.SimpleNamespace(load_agent_data=lambda *_args, **_kwargs: None),
+            auto_research_evaluator=None,
+        )
+
+        with mock.patch(
+            "station.eval_research.evaluation_index.get_top_submission",
+            side_effect=AssertionError("dashboard statistics must use station config"),
+        ):
+            stats = Station.get_station_statistics(station_stub)
+
+        self.assertEqual(186, stats["ticks_since_last_breakthrough"])
+        self.assertEqual("75", stats["top_research_submission"]["evaluation_id"])
 
     def test_notification_and_review_formatting_diverge_as_intended(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1081,10 +1505,12 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertIn("**Score:** 5.5", notification_message)
             self.assertIn("**metric:** 11", notification_message)
             self.assertLess(notification_message.index("**Score:** 5.5"), notification_message.index("**Coder Report:**"))
-            self.assertLess(notification_message.index("**Coder Report:**"), notification_message.index("**Final Stdout:**"))
+            self.assertLess(notification_message.index("**Coder Report:**"), notification_message.index("**Stdout/Stderr:**"))
             self.assertNotIn("**Instruction Prompt:**", notification_message)
             self.assertNotIn("**Abstract:**", notification_message)
-            self.assertIn("[... truncated after 12 characters]", notification_message)
+            self.assertIn(STDOUT_STDERR_HIDDEN_NOTICE, notification_message)
+            self.assertNotIn(long_stdout, notification_message)
+            self.assertNotIn("[... truncated after 12 characters]", notification_message)
 
             self.assertIsNotNone(review)
             review_message = review["message"]
@@ -1092,9 +1518,111 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertIn("**Instruction Prompt:**", review_message)
             self.assertLess(review_message.index("**Instruction Prompt:**"), review_message.index("**Score:** 5.5"))
             self.assertLess(review_message.index("**Score:** 5.5"), review_message.index("**Coder Report:**"))
-            self.assertIn("[... truncated after 12 characters]", review_message)
+            self.assertIn(STDOUT_STDERR_HIDDEN_NOTICE, review_message)
+            self.assertNotIn(long_stdout, review_message)
+            self.assertNotIn("[... truncated after 12 characters]", review_message)
 
-    def test_lineage_evolution_reads_research_results_through_evaluation_manager(self):
+    def test_evaluation_table_is_lineage_local_but_direct_review_can_cross_lineage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""):
+                paths = ensure_runtime_layout()
+                eval_manager = EvaluationManager(paths.evaluations_dir)
+                room = ResearchCenter(eval_manager=eval_manager, paths=paths)
+
+                eval_manager.create_evaluation(
+                    eval_id="30",
+                    author="Veritas I",
+                    title="Own lineage method",
+                    content="Run own lineage method.",
+                    tick=10,
+                    tags=["own"],
+                    abstract="Own lineage abstract.",
+                    lineage="veritas",
+                )
+                eval_manager.register_attempt("30", "print('own')\n", "storage/submission/30.py")
+                eval_manager.complete_attempt(
+                    "30",
+                    1,
+                    success=True,
+                    score=1.0,
+                    stdout="own\n",
+                    stderr="",
+                    details={"Message": "own"},
+                    sort_key=(1.0,),
+                    status="completed",
+                )
+                eval_manager.finalize_evaluation("30", "# Coder Report\n\nown report\n")
+
+                eval_manager.create_evaluation(
+                    eval_id="31",
+                    author="Logos I",
+                    title="Other lineage method",
+                    content="Run other lineage method.",
+                    tick=11,
+                    tags=["other"],
+                    abstract="Other lineage abstract.",
+                    lineage="logos",
+                )
+                eval_manager.register_attempt("31", "print('other')\n", "storage/submission/31.py")
+                eval_manager.complete_attempt(
+                    "31",
+                    1,
+                    success=True,
+                    score=2.0,
+                    stdout="other\n",
+                    stderr="",
+                    details={"Message": "other"},
+                    sort_key=(2.0,),
+                    status="completed",
+                )
+                eval_manager.finalize_evaluation("31", "# Coder Report\n\nother report\n")
+
+                agent_data = {
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_NAME_KEY: "Veritas II",
+                    constants.AGENT_LINEAGE_KEY: "veritas",
+                    constants.AGENT_TICK_BIRTH_KEY: 0,
+                    constants.SHORT_ROOM_NAME_RESEARCH: {},
+                }
+                supervisor_data = {
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_NAME_KEY: "Supervisor",
+                    constants.AGENT_LINEAGE_KEY: "supervisor",
+                    constants.AGENT_ROLE_KEY: constants.ROLE_SUPERVISOR,
+                    constants.SHORT_ROOM_NAME_RESEARCH: {},
+                }
+                agent_manager = _AgentManagerStub()
+                room_context = RoomContext(
+                    agent_manager=agent_manager,
+                    capsule_manager=None,
+                    notification_manager=None,
+                    constants_module=constants,
+                    station_instance=types.SimpleNamespace(),
+                )
+
+                lineage_table = room._get_specific_room_content(agent_data, room_context, current_tick=120)
+                supervisor_table = room._get_specific_room_content(supervisor_data, room_context, current_tick=120)
+                help_text = room.get_help_message(agent_data, room_context)
+                immature_review_result, _ = room.handle_action(agent_data, "review", "31", None, room_context, current_tick=10)
+                review_result, _ = room.handle_action(agent_data, "review", "31", None, room_context, current_tick=120)
+
+            self.assertIn("Own lineage method", lineage_table)
+            self.assertNotIn("Other lineage method", lineage_table)
+            self.assertIn("Own lineage method", supervisor_table)
+            self.assertIn("Other lineage method", supervisor_table)
+            self.assertIn("Agents only see their own lineage's evaluations", help_text)
+            self.assertIn("by evaluation ID", help_text)
+            self.assertIn("Do not run broad review attempts", help_text)
+            self.assertNotIn("Non-supervisor", help_text)
+            self.assertNotIn("station policy permits", help_text)
+            self.assertEqual(immature_review_result, ["Immature agents cannot review other-lineage evaluations."])
+            self.assertEqual(review_result, ["Evaluation 31 details sent to your System Messages."])
+            self.assertTrue(any("Other lineage method" in message for message in agent_manager.notifications))
+
+    def test_lineage_evolution_reads_research_results_through_index(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = os.path.join(temp_dir, "station-data")
 
@@ -1151,10 +1679,43 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
                 )
                 eval_manager.finalize_evaluation("31", "# Coder Report\n\n## Final Status\nsuccess\n")
 
-                lineage_manager = LineageEvolutionManager(types.SimpleNamespace())
+                eval_manager.create_evaluation(
+                    eval_id="32",
+                    author="Veritas II",
+                    title="Dimension progress",
+                    content="Improve a secondary track",
+                    tick=5,
+                    tags=["progress"],
+                    abstract="Progress result",
+                    lineage="veritas",
+                )
+                eval_manager.register_attempt("32", "print('v3')\n", "storage/submission/32.py")
+                eval_manager.complete_attempt(
+                    "32",
+                    1,
+                    success=True,
+                    score=1.5,
+                    stdout="v3\n",
+                    stderr="",
+                    details={"Message": "track progress"},
+                    sort_key=(1.5,),
+                    progress_records=[
+                        {
+                            "track": "dimension:d4",
+                            "rank_key": [-0.7],
+                            "value": 0.7,
+                        }
+                    ],
+                    status="completed",
+                )
+                eval_manager.finalize_evaluation("32", "# Coder Report\n\n## Final Status\nsuccess\n")
+
+                eval_manager.get_result_summary = mock.Mock(side_effect=AssertionError("should use index"))
+                eval_manager.get_all_evaluation_ids = mock.Mock(side_effect=AssertionError("should use index"))
+                lineage_manager = LineageEvolutionManager(types.SimpleNamespace(), eval_manager=eval_manager)
                 breakthroughs = lineage_manager._load_all_breakthroughs()
 
-            self.assertEqual(breakthroughs.get("Veritas"), 1)
+            self.assertEqual(breakthroughs.get("Veritas"), 2)
             self.assertEqual(breakthroughs.get("Logos"), 1)
 
     def test_storage_list_does_not_consume_read_cooldown(self):
@@ -1199,6 +1760,98 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             self.assertEqual(result_list_t11, ["Directory listing for storage/shared sent to your System Messages."])
             self.assertEqual(result_read_t11, ["Read cooldown active. `read` and `read_code` will be available again in 5 tick(s)."])
 
+    def test_immature_agent_cannot_access_shared_storage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""):
+                paths = ensure_runtime_layout()
+                os.makedirs(paths.shared_storage, exist_ok=True)
+                with open(os.path.join(paths.shared_storage, "note.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("hello from shared")
+
+                room = ResearchCenter()
+                agent_data = {
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_NAME_KEY: "Tester I",
+                    constants.AGENT_LINEAGE_KEY: "tester",
+                    constants.AGENT_TICK_BIRTH_KEY: 0,
+                    constants.SHORT_ROOM_NAME_RESEARCH: {},
+                }
+                agent_manager = _AgentManagerStub()
+                room_context = RoomContext(
+                    agent_manager=agent_manager,
+                    capsule_manager=None,
+                    notification_manager=None,
+                    constants_module=constants,
+                    station_instance=types.SimpleNamespace(),
+                )
+
+                result_list, _ = room.handle_action(agent_data, "storage", "list shared", None, room_context, current_tick=10)
+                result_read, _ = room.handle_action(agent_data, "read", "shared/note.txt", None, room_context, current_tick=10)
+                result_list_mature, _ = room.handle_action(agent_data, "storage", "list shared", None, room_context, current_tick=40)
+                help_text = room.get_help_message(agent_data, room_context)
+
+            expected = [
+                "Immature agents cannot access `storage/shared`. Use your lineage storage instead, for example `storage/tester/...`, until you mature."
+            ]
+            self.assertEqual(result_list, expected)
+            self.assertEqual(result_read, expected)
+            self.assertEqual(result_list_mature, ["Directory listing for storage/shared sent to your System Messages."])
+            self.assertIn("Immature agents cannot access `storage/shared`", help_text)
+            self.assertIn("across the lineage storage directories your coder can access", help_text)
+            self.assertIn(
+                "Avoid saving any file larger than 1 GB unless it is necessary.",
+                help_text,
+            )
+
+    def test_immature_agent_cannot_access_other_lineage_storage_even_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
+                 mock.patch.object(constants, "RESEARCH_ALLOW_CROSS_LINEAGE_STORAGE_ACCESS", True):
+                paths = ensure_runtime_layout()
+                other_lineage_dir = os.path.join(paths.lineages_root, "other")
+                os.makedirs(other_lineage_dir, exist_ok=True)
+                with open(os.path.join(other_lineage_dir, "note.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("hello from other lineage")
+
+                room = ResearchCenter()
+                agent_data = {
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_NAME_KEY: "Tester I",
+                    constants.AGENT_LINEAGE_KEY: "tester",
+                    constants.AGENT_TICK_BIRTH_KEY: 0,
+                    constants.SHORT_ROOM_NAME_RESEARCH: {},
+                }
+                agent_manager = _AgentManagerStub()
+                room_context = RoomContext(
+                    agent_manager=agent_manager,
+                    capsule_manager=None,
+                    notification_manager=None,
+                    constants_module=constants,
+                    station_instance=types.SimpleNamespace(),
+                )
+
+                result_list_immature, _ = room.handle_action(agent_data, "storage", "list other", None, room_context, current_tick=10)
+                result_read_immature, _ = room.handle_action(agent_data, "read", "lineages/other/note.txt", None, room_context, current_tick=10)
+                result_info_immature, _ = room.handle_action(agent_data, "storage", "info", None, room_context, current_tick=10)
+                result_list_mature, _ = room.handle_action(agent_data, "storage", "list other", None, room_context, current_tick=40)
+                result_read_mature, _ = room.handle_action(agent_data, "read", "lineages/other/note.txt", None, room_context, current_tick=40)
+
+            expected = [
+                "Immature agents cannot access other lineage storage. Use your lineage storage instead, for example `storage/tester/...`, until you mature."
+            ]
+            self.assertEqual(result_list_immature, expected)
+            self.assertEqual(result_read_immature, expected)
+            self.assertEqual(result_info_immature, ["Storage information sent to your System Messages."])
+            self.assertEqual(result_list_mature, ["Directory listing for storage/other sent to your System Messages."])
+            self.assertEqual(result_read_mature, ["File content for storage/other/note.txt sent to your System Messages."])
+            self.assertTrue(any("Cross-lineage reads: Disabled until maturity" in message for message in agent_manager.notifications))
+
     def test_system_evaluator_symlink_reads_are_allowed_and_do_not_consume_cooldown(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             data_root = os.path.join(temp_dir, "station-data")
@@ -1242,7 +1895,9 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
             with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
                  mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
                  mock.patch.object(constants, "RESEARCH_CENTER_ENABLED", True), \
-                 mock.patch.object(constants, "AUTO_EVAL_RESEARCH", False):
+                 mock.patch.object(constants, "AUTO_EVAL_RESEARCH", False), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_GPU_NUM", None), \
+                 mock.patch.object(constants, "RESEARCH_EVAL_USE_DIFF_GPU", False):
                 station = Station()
                 room = station.rooms[constants.ROOM_RESEARCH_CENTER]
                 evaluator = AutoResearchEvaluator(
@@ -1263,7 +1918,8 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
                  mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
                  mock.patch.object(constants, "RESEARCH_CENTER_ENABLED", True), \
                  mock.patch.object(constants, "AUTO_EVAL_RESEARCH", False), \
-                 mock.patch.object(constants, "RESEARCH_SUBMISSION_COOLDOWN_TICKS", 0):
+                 mock.patch.object(constants, "RESEARCH_SUBMISSION_COOLDOWN_TICKS", 0), \
+                 mock.patch.object(constants, "RESEARCH_MAX_CONCURRENT_SUBMISSIONS", 1):
                 station = Station()
                 room = station.rooms[constants.ROOM_RESEARCH_CENTER]
                 eval_manager = station.research_eval_manager
@@ -1301,9 +1957,135 @@ class ResearchCenterInterfacesTest(unittest.TestCase):
                 eval_manager.finalize_evaluation("90", "# Coder Report\n\n## Final Status\nsuccess\n")
                 ready_message = room._build_submission_status_message(agent_data, constants, current_tick=11)
 
-            self.assertIn("**Active Experiment:**", active_message)
+            self.assertIn("**Active Experiment Limit:**", active_message)
             self.assertIn("90", active_message)
             self.assertEqual(ready_message, "**Submission Ready:** You may submit one focused experiment.")
+
+    def test_research_submit_status_and_help_reflect_configured_active_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = os.path.join(temp_dir, "station-data")
+
+            with mock.patch.object(constants, "BASE_STATION_DATA_PATH", data_root), \
+                 mock.patch.object(constants, "RESEARCH_STORAGE_BASE_PATH", ""), \
+                 mock.patch.object(constants, "RESEARCH_CENTER_ENABLED", True), \
+                 mock.patch.object(constants, "AUTO_EVAL_RESEARCH", False), \
+                 mock.patch.object(constants, "RESEARCH_SUBMISSION_COOLDOWN_TICKS", 0), \
+                 mock.patch.object(constants, "RESEARCH_MAX_CONCURRENT_SUBMISSIONS", 2):
+                station = Station()
+                room = station.rooms[constants.ROOM_RESEARCH_CENTER]
+                eval_manager = station.research_eval_manager
+                agent_data = {
+                    constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,
+                    constants.AGENT_NAME_KEY: "Curie I",
+                    constants.AGENT_LINEAGE_KEY: "curie",
+                    constants.SHORT_ROOM_NAME_RESEARCH: {},
+                }
+
+                help_text = room.get_help_message(
+                    agent_data,
+                    RoomContext(None, None, None, constants, station),
+                )
+                eval_manager.create_evaluation(
+                    eval_id="91",
+                    author="Curie I",
+                    title="First active",
+                    content="Run one experiment.",
+                    tick=10,
+                    tags=["limit"],
+                    abstract="First active experiment.",
+                    lineage="curie",
+                )
+                one_active_message = room._build_submission_status_message(agent_data, constants, current_tick=10)
+                eval_manager.create_evaluation(
+                    eval_id="92",
+                    author="Curie I",
+                    title="Second active",
+                    content="Run another experiment.",
+                    tick=10,
+                    tags=["limit"],
+                    abstract="Second active experiment.",
+                    lineage="curie",
+                )
+                limit_message = room._build_submission_status_message(agent_data, constants, current_tick=10)
+
+            self.assertIn("at most **2 active evaluations**", help_text)
+            self.assertIn("Concurrent submissions are useful for exploration", help_text)
+            self.assertIn("**Submission Ready:**", one_active_message)
+            self.assertIn("Active experiments: 1/2 (91)", one_active_message)
+            self.assertIn("**Active Experiment Limit:**", limit_message)
+            self.assertIn("2/2", limit_message)
+            self.assertIn("91, 92", limit_message)
+
+    def test_refresh_replaces_registry_after_evaluator_loads(self):
+        old_registry = object()
+        evaluator = mock.Mock()
+        new_registry = mock.Mock()
+        new_registry.get_evaluator.return_value = evaluator
+        service = object.__new__(AutoResearchEvaluator)
+        service.task_registry = old_registry
+
+        with mock.patch(
+            "station.eval_research.auto_evaluator.ResearchTaskRegistry",
+            return_value=new_registry,
+        ):
+            loaded = service.refresh_task_registry()
+
+        self.assertIs(evaluator, loaded)
+        self.assertIs(new_registry, service.task_registry)
+
+    def test_refresh_keeps_old_registry_when_evaluator_does_not_load(self):
+        old_registry = object()
+        new_registry = mock.Mock()
+        new_registry.get_evaluator.return_value = None
+        service = object.__new__(AutoResearchEvaluator)
+        service.task_registry = old_registry
+
+        with mock.patch(
+            "station.eval_research.auto_evaluator.ResearchTaskRegistry",
+            return_value=new_registry,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "could not be loaded"):
+                service.refresh_task_registry()
+
+        self.assertIs(old_registry, service.task_registry)
+
+    def test_refresh_endpoint_returns_before_background_reload(self):
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        app_path = os.path.join(repo_root, "web_interface", "app.py")
+        with open(app_path, "r", encoding="utf-8") as handle:
+            app_source = handle.read()
+        route_start = app_source.index("@app.route('/api/station/research_evaluator/refresh'")
+        route_end = app_source.index("@app.route('/api/station/api_runtime_config'", route_start)
+        route_source = app_source[route_start:route_end]
+        worker_start = app_source.index("def _run_research_evaluator_refresh")
+        worker_source = app_source[worker_start:route_start]
+
+        self.assertIn("@auth_required", route_source)
+        self.assertIn("methods=['GET', 'POST']", route_source)
+        self.assertIn("threading.Thread", route_source)
+        self.assertIn('"status": "requested"', route_source)
+        self.assertIn("}), 202", route_source)
+        self.assertNotIn("while ", route_source)
+        self.assertLess(worker_source.index("has_pending_or_running"), worker_source.index("refresh_task_registry"))
+        self.assertIn('status="completed"', worker_source)
+
+    def test_auto_transition_detects_and_retargets_live_dimension_and_count(self):
+        repo_root = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(
+            repo_root,
+            "example",
+            "research_alpha_evolve",
+            "kissing_margin",
+            "auto_phase2_transition.sh",
+        )
+        with open(script_path, "r", encoding="utf-8") as handle:
+            script_source = handle.read()
+
+        self.assertIn("replace_d.detect_current_values", script_source)
+        self.assertIn('details.get("N") != target_count', script_source)
+        self.assertIn("artifact_dimension != dimension", script_source)
+        self.assertIn("replace_d.update_evaluator", script_source)
+        self.assertIn("replace_d.update_task_text", script_source)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,21 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Full-space format baseline
+tags: ['baseline', 'format', 'trivial']
+abstract: A valid full-space control that exercises the complete submission and verification path without providing a competitive construction.
+content: |
+  def search_for_best_construction(p: int, d: int):
+      import itertools
+      import numpy as np
+
+      if d != 3:
+          return np.empty((0, d), dtype=np.int64)
+
+      return np.asarray(
+          list(itertools.product(range(p), repeat=3)),
+          dtype=np.int64,
+      )

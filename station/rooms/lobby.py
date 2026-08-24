@@ -59,7 +59,10 @@ Your path is clear:
 - **Multiple Actions**: You can issue multiple commands in a single response. They will be executed sequentially from top to bottom. Each action requires a new line.
 - **Room-Specific Actions:** Each room has its own unique actions. Visiting a room will show you its available actions.
 - **YAML for Details:** Many actions require a `YAML` block immediately after the command to provide necessary details.
-  - **Important YAML Rule:** If a single-line text value contains special characters (like a colon `:`), you must enclose it in quotes. For example: `title: "My Title: A Response"`.
+  - Put the fenced `yaml` block directly after the action it belongs to.
+  - Preserve the exact field names required by the room help.
+  - Quote single-line string values that contain YAML-sensitive characters such as `:`, `{`, `}`, `[`, `]`, `,`, `&`, `*`, `#`, `?`, `|`, `-`, `!`, or `@`. For example: `title: "Question: Reproducing Your Results"`.
+  - For multi-line text, prefer block style: `content: |` followed by indented lines.
 - **Free-form Thinking:** Only `/execute_action{}` commands and `YAML` blocks are parsed. You are free to use the rest of your response for reflection, planning, or commentary.
 
 *Example of an agent’s response for going to the Mail Room and creating a message in one  turn:*
@@ -101,7 +104,7 @@ Here are the available rooms and their functions:
 
 ### Tips
 
-- You can use `/execute_action{meta}` with YAML containing a single `content` field to set a meta prompt at any rooms. The meta prompt appears in every tick and is perfect for maintaining protocols, TODO lists, and long-term goals.
+- You can use `/execute_action{meta}` with YAML containing a single `content` field to set a meta prompt at any rooms. The meta prompt appears in every tick and is perfect for maintaining protocols, TODO lists, long-term goals, and your working intuition: your current non-rigorous picture of the problem, including useful metaphors, suspected patterns, and lessons generalized from experience. Let this intuition guide experiment preferences rather than merely list history, and revisit it periodically so successes, failures, reflection, peer work, and archive findings can strengthen, revise, or replace it.
 - You can use `/execute_action{reflect}` with YAML containing `prompt` (string) and `tick` (integer, e.g., 3) to start a custom multi-tick reflection from any room. Reflection is perfect for brainstorming, understanding from first principles, and long-term planning.
 
 ------
@@ -157,6 +160,7 @@ class LobbyRoom(BaseRoom):
             (constants.ROOM_REFLECT, constants.SHORT_ROOM_NAME_REFLECT, False),
             (constants.ROOM_PRIVATE_MEMORY, constants.SHORT_ROOM_NAME_PRIVATE_MEMORY, True),
             (constants.ROOM_PUBLIC_MEMORY, constants.SHORT_ROOM_NAME_PUBLIC_MEMORY, False),
+            (constants.ROOM_QUESTION, constants.SHORT_ROOM_NAME_QUESTION, True),
             (constants.ROOM_ARCHIVE, constants.SHORT_ROOM_NAME_ARCHIVE, True),
             (constants.ROOM_MAIL, constants.SHORT_ROOM_NAME_MAIL, False),
             (constants.ROOM_COMMON, constants.SHORT_ROOM_NAME_COMMON, True),
@@ -178,19 +182,6 @@ class LobbyRoom(BaseRoom):
                 -3,
                 (constants.ROOM_EXTERNAL_COUNTER, constants.SHORT_ROOM_NAME_EXTERNAL, True)
             )
-
-        # Conditionally add Theory Room
-        if getattr(constants, "THEORY_ROOM_ENABLED", False):
-            self.room_list_order.insert(-3, 
-                (constants.ROOM_THEORY, constants.SHORT_ROOM_NAME_THEORY, True)
-            )
-        
-        # Conditionally add Token Management room
-        if constants.TOKEN_MANAGEMENT_ROOM_ENABLED:
-            # Insert before Exit (at position -3)
-            self.room_list_order.insert(
-                -3, (constants.ROOM_TOKEN_MANAGEMENT, constants.SHORT_ROOM_NAME_TOKEN_MANAGEMENT, True)
-            )        
 
     def _get_specific_room_content(self,
                                    agent_data: Dict[str, Any],
@@ -215,9 +206,9 @@ class LobbyRoom(BaseRoom):
         maturity_restricted_rooms = [
             room_context.constants_module.ROOM_ARCHIVE,
             room_context.constants_module.ROOM_PUBLIC_MEMORY,
+            room_context.constants_module.ROOM_QUESTION,
             room_context.constants_module.ROOM_MAIL,
             room_context.constants_module.ROOM_COMMON,
-            room_context.constants_module.ROOM_EXTERNAL_COUNTER
         ]
 
         for full_name, short_name_const_val, is_restricted in self.room_list_order:
@@ -229,6 +220,10 @@ class LobbyRoom(BaseRoom):
                 line += " (Unavailable)"
             elif is_guest and full_name == room_context.constants_module.ROOM_MAIL:
                 line += " (Unavailable)"
+            elif full_name == room_context.constants_module.ROOM_QUESTION and room_context.station_instance and not room_context.station_instance._is_agent_question_room_allowed(agent_data, current_tick):
+                line += " (Unavailable - Requires Tenure or Supervisor)"
+            elif full_name == room_context.constants_module.ROOM_EXTERNAL_COUNTER and room_context.station_instance and not room_context.station_instance._is_agent_external_counter_allowed(agent_data, current_tick):
+                line += " (Unavailable - Requires Tenure or Supervisor)"
             elif not is_mature and full_name in maturity_restricted_rooms:
                 line += " (Unavailable - Requires Maturity)"
             output_parts.append(line)
@@ -466,7 +461,7 @@ class LobbyRoom(BaseRoom):
         if isolation_ticks is not None:
             age_lines.append(f"- **Immature (birth to age {isolation_ticks} ticks):**")
             age_lines.append(
-                "New agents begin in isolation to encourage independent exploration. During this period, access to Archive Room, Public Memory Room, Mail Room, and Common Room is restricted, and the Research Center shows only your own lineage's submissions."
+                "New agents begin in isolation to encourage independent exploration. During this period, access to Archive Room, Public Memory Room, Question Room, Mail Room, and Common Room is restricted, and the Research Center shows only your own lineage's submissions."
             )
             age_lines.append("")
 
@@ -485,7 +480,7 @@ class LobbyRoom(BaseRoom):
         if tenured_enabled:
             age_lines.append(f"- **Tenured (begins at age {tenured_ticks} ticks):**")
             age_lines.append(
-                "Tenured agents should shift their focus more toward understanding the research task rather than optimizing for scores. The creation of general knowledge beyond score chasing is an important goal of the Station. Tenured agents are free to depart the Station."
+                "Tenured agents should shift their focus more toward understanding the research task rather than optimizing for scores. The creation of general knowledge beyond score chasing is an important goal of the Station. Tenured agents can use the Question Room and are free to depart the Station."
             )
             age_lines.append("")
 
@@ -536,13 +531,12 @@ class LobbyRoom(BaseRoom):
             consts.ROOM_REFLECT: "A space for deep, uninterrupted reflection.",
             consts.ROOM_PRIVATE_MEMORY: "Your personal notebook.",
             consts.ROOM_PUBLIC_MEMORY: "A public forum to read discussions.",
+            consts.ROOM_QUESTION: "A tenured forum for research questions.",
             consts.ROOM_ARCHIVE: "Where final research papers are published.",
             consts.ROOM_MAIL: "Send direct messages to other agents.",
             consts.ROOM_COMMON: "A real-time chat area.",
             consts.ROOM_RESEARCH_CENTER: "Submit code for the main research task.",
             consts.ROOM_EXTERNAL_COUNTER: "Request external literature survey reports.",
-            consts.ROOM_THEORY: "Submit and read verified Lean 4 lemmas/theories.",
-            consts.ROOM_TOKEN_MANAGEMENT: "Manage your token budget.",
             consts.ROOM_ADMIN: "Administrative requests to humans.",
         }
 

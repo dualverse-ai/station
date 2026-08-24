@@ -174,13 +174,6 @@ class MetaReflectionHandler(ReflectionHandler):
         override, _error_message = _get_meta_reflection_model_override(self.room_context.constants_module)
         return override
 
-    def get_dialogue_tick_protection(self) -> Optional[Dict[str, str]]:
-        return {
-            "reason": constants.PROTECTED_DIALOGUE_REASON_META_REFLECTION,
-            "source": "meta_reflect",
-        }
-
-
 def _is_meta_reflection_enabled(constants_module: Any) -> bool:
     interval = getattr(constants_module, "REFLECTION_META_INTERVAL", None)
     try:
@@ -309,6 +302,10 @@ class ReflectionChamber(BaseRoom):
                 unconditional_prompts,
                 agent_data,
                 constants_module=room_context.constants_module,
+                is_tenured=(
+                    room_context.station_instance._get_agent_age_status(agent_data, current_tick)
+                    == "tenured"
+                ),
             )
             if not prompt_candidates:
                 actions_executed_strings.append("Action failed: No eligible meta reflection prompts are available.")

@@ -39,6 +39,9 @@ class _ConcurrentNotificationAgentManager:
     def get_all_active_agent_names(self) -> List[str]:
         return list(self._active_names)
 
+    def get_active_recursive_agent_names(self) -> List[str]:
+        return list(self._active_names)
+
     def load_agent_data(self, agent_name: str):
         return agent_module.load_agent_data(agent_name)
 
@@ -124,6 +127,50 @@ class CrossAgentNotificationAtomicTests(unittest.TestCase):
         self.assertTrue(
             any("A new public memory capsule (#1)" in message for message in notifications)
         )
+
+    def test_public_memory_reply_notification_includes_content_and_marks_read_for_thread_participant(self):
+        self._save_agent("Author")
+        self._save_agent("Replier")
+        manager = _ConcurrentNotificationAgentManager(
+            ["Author", "Replier"],
+            "Author",
+            "background evaluator finished",
+        )
+        reply_content = "Full reply body for a thread participant."
+
+        PublicMemoryRoom()._after_reply_added(
+            {
+                constants.CAPSULE_AUTHOR_NAME_KEY: "Author",
+                constants.CAPSULE_TITLE_KEY: "Shared Thread",
+                constants.CAPSULE_ID_KEY: "public_1",
+                constants.CAPSULE_MESSAGES_KEY: [
+                    {
+                        constants.MESSAGE_ID_KEY: "public_1-1",
+                        constants.MESSAGE_AUTHOR_NAME_KEY: "Author",
+                        constants.MESSAGE_CONTENT_KEY: "Opening note.",
+                    }
+                ],
+            },
+            {
+                constants.MESSAGE_ID_KEY: "public_1-2",
+                constants.MESSAGE_AUTHOR_NAME_KEY: "Replier",
+                constants.MESSAGE_CONTENT_KEY: reply_content,
+                constants.MESSAGE_POSTED_AT_TICK_KEY: 5,
+            },
+            {
+                constants.AGENT_NAME_KEY: "Replier",
+            },
+            self._room_context(manager),
+            current_tick=5,
+        )
+
+        updated = agent_module.load_agent_data("Author")
+        notifications = updated[constants.AGENT_NOTIFICATIONS_PENDING_KEY]
+        self.assertTrue(any(reply_content in message for message in notifications))
+        read_status = updated[constants.SHORT_ROOM_NAME_PUBLIC_MEMORY][
+            constants.AGENT_ROOM_STATE_READ_STATUS_KEY
+        ]
+        self.assertTrue(read_status["public_1-2"])
 
     def test_common_invite_preserves_concurrent_notification(self):
         self._save_agent("Sender")

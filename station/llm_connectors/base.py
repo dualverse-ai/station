@@ -104,9 +104,11 @@ class BaseLLMConnector(abc.ABC):
         
         self._apply_runtime_proxy_snapshot(runtime_proxy_snapshot)
         
-        # Load pruning blocks and store a copy to detect changes
+        # Load context filters and store copies to detect changes.
         self.agent_prune_blocks: List[Dict[str, Any]] = self._load_prune_blocks_from_agent_data()
         self._last_known_prune_blocks: List[Dict[str, Any]] = copy.deepcopy(self.agent_prune_blocks)
+        self.context_history_start_tick: Optional[int] = self._load_context_history_start_tick()
+        self._last_known_context_history_start_tick: Optional[int] = self.context_history_start_tick
         self._last_known_system_prompt: Optional[str] = self.system_prompt
         self._debug_station_id: Optional[str] = None
         if not hasattr(self, "api_runtime_provider_id"):
@@ -171,7 +173,7 @@ class BaseLLMConnector(abc.ABC):
 
 
     def _load_prune_blocks_from_agent_data(self) -> List[Dict[str, Any]]:
-        """Loads pruning blocks from agent data for summary handling."""
+        """Load system-service pruning blocks from agent data."""
         try:
             agent_full_data = agent_module.load_agent_data(self.agent_name, include_ended=True, include_ascended=True)
             if agent_full_data:
@@ -180,6 +182,21 @@ class BaseLLMConnector(abc.ABC):
         except Exception as e:
             self._log("ERROR", f"Failed to load prune blocks: {e}")
             return []
+
+    def _load_context_history_start_tick(self) -> Optional[int]:
+        try:
+            agent_full_data = agent_module.load_agent_data(self.agent_name, include_ended=True, include_ascended=True)
+            if not agent_full_data:
+                return None
+            anchors = [
+                int(event[constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY])
+                for event in agent_module.get_context_compaction_events(agent_full_data)
+                if event.get(constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY) is not None
+            ]
+            return max(anchors) if anchors else None
+        except Exception as e:
+            self._log("ERROR", f"Failed to load context compaction anchor: {e}")
+            return getattr(self, "_last_known_context_history_start_tick", None)
 
     def _bypass_agent_data_system_prompt_reload(self) -> bool:
         """
@@ -236,16 +253,35 @@ class BaseLLMConnector(abc.ABC):
                                    raw_history_entries: List[Dict[str, Any]]
                                    ) -> List[Dict[str, Any]]:
         """
-        Filters history based on pruning blocks and inserts summary replacements.
+        Applies context compaction anchors and system-service pruning blocks.
         Input entries: List of {'tick': int, 'role': str, 'text_content': str}
         Output entries: List of {'role': str, 'text_content': str} with summary replacements
         """
         if not raw_history_entries:
             return []
 
-        # Parse prune blocks into ranges with summaries
+        context_history_start_tick = getattr(self, "context_history_start_tick", None)
+        if context_history_start_tick is not None:
+            start_tick = context_history_start_tick
+            anchored_entries = []
+            for entry in raw_history_entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    entry_tick = int(entry.get("tick"))
+                except (TypeError, ValueError):
+                    continue
+                if entry_tick >= start_tick:
+                    normalized_entry = dict(entry)
+                    normalized_entry["tick"] = entry_tick
+                    anchored_entries.append(normalized_entry)
+            raw_history_entries = anchored_entries
+            if not raw_history_entries:
+                return []
+
+        # Parse system-service prune blocks into ranges with summaries.
         pruned_ranges = []  # [(start_tick, end_tick, summary), ...]
-        for block in self.agent_prune_blocks:
+        for block in getattr(self, "agent_prune_blocks", []):
             ticks_input = block.get(constants.PRUNE_TICKS_KEY)
             summary = block.get(constants.PRUNE_SUMMARY_KEY, "")
 
@@ -255,13 +291,15 @@ class BaseLLMConnector(abc.ABC):
                     start_tick, end_tick = min(block_ticks), max(block_ticks)
                     pruned_ranges.append((start_tick, end_tick, summary))
 
-        # Get protected ticks
         protected_ticks = self._get_protected_ticks(raw_history_entries)
 
-        # Filter out entries within pruned ranges (except protected ticks)
+        # Filter out entries within system-service compacted ranges.
         filtered_entries = []
         for entry in raw_history_entries:
-            tick = entry.get('tick')
+            try:
+                tick = int(entry.get('tick'))
+            except (TypeError, ValueError):
+                tick = None
             role = entry.get('role')
             text_content = entry.get('text_content', '')
 
@@ -278,7 +316,6 @@ class BaseLLMConnector(abc.ABC):
                 filtered_entries.append(preserved_entry)
                 continue
 
-            # Check if this tick is in any pruned range
             is_pruned = any(start <= tick <= end for start, end, _ in pruned_ranges)
             if not is_pruned:
                 preserved_entry = dict(entry)
@@ -315,12 +352,12 @@ class BaseLLMConnector(abc.ABC):
                 final_entries.append({
                     'role': 'user',
                     'text_content': (
-                        f"{tick_label} {verb} pruned by the agent in the Token Management Room.\n"
-                        "Summary submitted by the agent:\n"
+                        f"{tick_label} {verb} compacted by the Station.\n"
+                        "Summary:\n"
                         f"{stripped_summary}"
                     ),
                 })
-                final_entries.append({'role': 'model', 'text_content': "Dialogue pruned."})
+                final_entries.append({'role': 'model', 'text_content': "Dialogue compacted."})
 
         # Add remaining entries after all pruned ranges
         while current_entry_index < len(filtered_entries):
@@ -333,7 +370,7 @@ class BaseLLMConnector(abc.ABC):
         if self._debug_api_enabled():
             self._log(
                 "DEBUG",
-                f"History pruning raw_entries={len(raw_history_entries)} "
+                f"Context filtering raw_entries={len(raw_history_entries)} "
                 f"active_entries={len(final_entries)}",
             )
         return final_entries
@@ -578,19 +615,11 @@ class BaseLLMConnector(abc.ABC):
 
     def _get_protected_ticks(self, raw_history_entries: List[Dict[str, Any]]) -> set:
         """
-        Identify ticks that must remain visible after pruning.
-        Returns a set of tick numbers that should not be pruned.
+        Identify ticks that must remain visible to system-service pruning.
+        Normal agent protected context is stored in agent YAML and rendered by
+        the compaction anchor prompt, not preserved by raw dialogue tick.
         """
-        try:
-            agent_full_data = agent_module.load_agent_data(
-                self.agent_name,
-                include_ended=True,
-                include_ascended=True,
-            )
-        except Exception as e:
-            self._log("ERROR", f"Failed to load protected dialogue ticks: {e}")
-            agent_full_data = None
-        return agent_module.get_protected_dialogue_ticks(agent_full_data, raw_history_entries)
+        return set()
 
     @abc.abstractmethod
     def _send_message_implementation(self, user_prompt: str, current_tick: int, attempt_number: int = 0) -> Tuple[str, Optional[str], Dict[str, Optional[int]]]:
@@ -609,7 +638,7 @@ class BaseLLMConnector(abc.ABC):
         return None
 
     def _run_provider_base_recovery_probe(self, snapshot: Dict[str, Any]) -> bool:
-        """Hook for connectors to probe the base endpoint with their current model."""
+        """Hook for connectors to probe an earlier endpoint with their current model."""
         return False
 
     def _provider_fallback_enabled(self) -> bool:
@@ -661,25 +690,38 @@ class BaseLLMConnector(abc.ABC):
         provider_id = str(self.api_runtime_provider_id)
         env_names = tuple(getattr(self, "api_runtime_env_names", ()) or ())
         current_endpoint_index = self._current_provider_endpoint_index()
-        probe_snapshot = runtime_api_config.claim_provider_base_recovery_probe(provider_id, env_names)
-        if probe_snapshot is not None:
-            success = False
-            try:
-                success = self._run_provider_base_recovery_probe(probe_snapshot)
-            except Exception as probe_error:
-                self._log(
-                    "INFO",
-                    f"Provider base recovery probe for {provider_id} failed: "
-                    f"{self._format_retry_error_for_log(probe_error)}",
-                )
-            finally:
-                runtime_api_config.complete_provider_base_recovery_probe(provider_id, success)
-            if success:
-                self._log(
-                    "INFO",
-                    f"Provider base recovery probe for {provider_id} "
-                    f"succeeded (base_url={self._provider_base_url_from_snapshot(probe_snapshot) or 'provider_default'})."
-                )
+        probe_snapshots = runtime_api_config.claim_provider_recovery_probes(provider_id, env_names)
+        if probe_snapshots:
+            probe_results = []
+            for probe_snapshot in probe_snapshots:
+                endpoint = probe_snapshot.get("provider_endpoint") or {}
+                try:
+                    probe_endpoint_index = int(endpoint.get("index", 0))
+                except Exception:
+                    probe_endpoint_index = 0
+                success = False
+                try:
+                    success = self._run_provider_base_recovery_probe(probe_snapshot)
+                except Exception as probe_error:
+                    self._log(
+                        "INFO",
+                        f"Provider recovery probe for {provider_id} endpoint "
+                        f"{endpoint.get('name', probe_endpoint_index)} "
+                        f"(index={probe_endpoint_index}) failed: "
+                        f"{self._format_retry_error_for_log(probe_error)}",
+                    )
+                probe_results.append((probe_endpoint_index, success))
+                if success:
+                    self._log(
+                        "INFO",
+                        f"Provider recovery probe for {provider_id} endpoint "
+                        f"{endpoint.get('name', probe_endpoint_index)} "
+                        f"(index={probe_endpoint_index}, "
+                        f"base_url={self._provider_base_url_from_snapshot(probe_snapshot) or 'provider_default'}) "
+                        "succeeded."
+                    )
+                    break
+            runtime_api_config.complete_provider_recovery_probes(provider_id, probe_results)
 
         default_snapshot = runtime_api_config.get_config_snapshot(env_names, provider_id=provider_id)
         if not self._provider_snapshot_matches_current(default_snapshot):
@@ -735,14 +777,17 @@ class BaseLLMConnector(abc.ABC):
         if retry_state.get("endpoint_index") != current_endpoint_index:
             retry_state["endpoint_index"] = current_endpoint_index
             retry_state["failure_streak"] = 0
-        retry_state["failure_streak"] = int(retry_state.get("failure_streak", 0)) + 1
+        decision = runtime_api_config.advance_provider_fallback_after_failure(
+            provider_id,
+            current_endpoint_index,
+            int(retry_state.get("failure_streak", 0)),
+            env_names,
+        )
+        retry_state["failure_streak"] = int(decision.get("failure_streak", 0))
+        if not decision.get("handled"):
+            return False
 
-        if retry_state["failure_streak"] < 2:
-            runtime_api_config.record_provider_failure(
-                provider_id,
-                current_endpoint_index,
-                promote_default=False,
-            )
+        if decision.get("retry_same_endpoint"):
             self._log(
                 "INFO",
                 f"{provider_id} endpoint index={current_endpoint_index} failed "
@@ -750,13 +795,7 @@ class BaseLLMConnector(abc.ABC):
             )
             return True
 
-        retry_snapshot = runtime_api_config.record_provider_failure_and_get_retry_snapshot(
-            provider_id,
-            current_endpoint_index,
-            env_names,
-        )
-        if retry_snapshot is None:
-            return False
+        retry_snapshot = decision.get("retry_snapshot")
         endpoint = retry_snapshot.get("provider_endpoint") or {}
         self._log(
             "INFO",
@@ -768,8 +807,7 @@ class BaseLLMConnector(abc.ABC):
         )
         self._apply_provider_runtime_snapshot(retry_snapshot)
         retry_state["endpoint_index"] = self._current_provider_endpoint_index()
-        retry_state["failure_streak"] = 0
-        if retry_snapshot.get("provider_endpoint_cycle_wrapped"):
+        if decision.get("cycle_wrapped"):
             retry_state["cycle_count"] = int(retry_state.get("cycle_count", 0)) + 1
             retry_delay = self._calculate_retry_delay(int(retry_state["cycle_count"]))
             endpoint_count = endpoint.get("endpoint_count", "?")
@@ -795,8 +833,8 @@ class BaseLLMConnector(abc.ABC):
         """
         Synchronize connector state with agent data on disk.
 
-        Checks if pruning blocks have changed and re-initializes the chat session
-        or system prompt if needed, then recounts tokens. This method is idempotent - calling it
+        Checks if context filters or the system prompt changed and re-initializes
+        the chat session if needed, then recounts tokens. This method is idempotent - calling it
         multiple times with unchanged state has no effect (no wasted computation).
 
         Called before generating observations and before sending messages to ensure
@@ -807,33 +845,41 @@ class BaseLLMConnector(abc.ABC):
 
         current_prune_blocks_on_disk = self._load_prune_blocks_from_agent_data()
         current_system_prompt = self._load_system_prompt_from_agent_data()
+        current_context_start_tick = self._load_context_history_start_tick()
 
-        # Idempotent check - if pruning blocks unchanged, this is a no-op
+        # Idempotent check - if context filters are unchanged, this is a no-op.
         prune_changed = current_prune_blocks_on_disk != self._last_known_prune_blocks
         prompt_changed = current_system_prompt != self._last_known_system_prompt
+        context_start_changed = current_context_start_tick != self._last_known_context_history_start_tick
 
-        if prune_changed or prompt_changed:
+        if prune_changed or prompt_changed or context_start_changed:
             if prune_changed:
-                self._log("INFO", "Pruning blocks changed. Re-initializing chat session.")
+                self._log("INFO", "Service pruning blocks changed. Re-initializing chat session.")
                 self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
                 self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
+            if context_start_changed:
+                self._log("INFO", "Context compaction anchor changed. Re-initializing chat session.")
+                self.context_history_start_tick = current_context_start_tick
+                self._last_known_context_history_start_tick = current_context_start_tick
             if prompt_changed:
                 self._log("INFO", "System prompt changed. Re-initializing chat session.")
                 self.system_prompt = current_system_prompt
                 self._last_known_system_prompt = current_system_prompt
                 self._handle_system_prompt_update()
             try:
-                self._initialize_chat_session() # Re-initialize with new pruning rules
+                self._initialize_chat_session()
 
                 # Count tokens after re-initialization and update agent's budget.
                 # If pruning changed but this provider cannot recount the rebuilt
                 # session, do not persist a stale last-known count.
                 can_count_authoritatively = self._can_count_current_session_tokens_authoritatively()
-                if prune_changed and not can_count_authoritatively:
+                if (prune_changed or context_start_changed) and not can_count_authoritatively:
                     self._mark_agent_token_budget_stale(
-                        constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
+                        constants.TOKEN_BUDGET_STALE_REASON_CONTEXT_COMPACTED
+                        if context_start_changed
+                        else constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_CONTEXT_FILTER
                     )
-                    self._log("WARNING", "Token count unavailable after pruning; marking token budget stale.")
+                    self._log("WARNING", "Token count unavailable after context rebuild; marking token budget stale.")
                     return
 
                 self._log("INFO", "Counting tokens after re-initialization.")
@@ -847,22 +893,26 @@ class BaseLLMConnector(abc.ABC):
                             agent_data.pop(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY, None)
                             agent_data.pop(constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY, None)
                             agent_module.save_agent_data(self.agent_name, agent_data)
-                            self._log("INFO", f"Token budget updated to {new_token_count} after pruning.")
+                            self._log("INFO", f"Token budget updated to {new_token_count} after context rebuild.")
                         else:
-                            self._log("WARNING", "Could not load agent data to update token count after pruning.")
+                            self._log("WARNING", "Could not load agent data to update token count after context rebuild.")
                 else:
-                    if prune_changed:
+                    if context_start_changed:
                         self._mark_agent_token_budget_stale(
-                            constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
+                            constants.TOKEN_BUDGET_STALE_REASON_CONTEXT_COMPACTED
                         )
-                    self._log("WARNING", "Could not count tokens after pruning re-initialization.")
+                    elif prune_changed:
+                        self._mark_agent_token_budget_stale(
+                            constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_CONTEXT_FILTER
+                        )
+                    self._log("WARNING", "Could not count tokens after context re-initialization.")
 
             except Exception as e_reinit:
-                self._log("ERROR", f"Failed to re-initialize chat session after pruning update: {e_reinit}.")
+                self._log("ERROR", f"Failed to re-initialize chat session after context filter update: {e_reinit}.")
                 # Note: We don't raise here to allow the caller to proceed, but state may be stale
 
     def send_message(self, user_prompt: str, current_tick: int) -> Tuple[str, Dict[str, Optional[int]]]:
-        # Synchronize state (pruning blocks, token recount) before sending
+        # Synchronize state (context filters, token recount) before sending.
         # This is idempotent - if sync_state() was already called earlier (e.g., before request_status),
         # this will be a no-op with no wasted computation
         self.sync_state()
@@ -1008,8 +1058,8 @@ class BaseLLMConnector(abc.ABC):
     @abc.abstractmethod
     def get_current_total_session_tokens(self) -> Optional[int]:
         """
-        Calculates and returns the total number of tokens for the current,
-        possibly pruned, chat session history as understood by the LLM.
+        Calculates and returns the total number of tokens for the current
+        connector-visible chat session history as understood by the LLM.
         This should reflect the actual history that would be used for context.
         """
         pass
@@ -1032,44 +1082,14 @@ class BaseLLMConnector(abc.ABC):
         agent_data[constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY] = reason
         agent_module.save_agent_data(self.agent_name, agent_data)
 
-    def force_refresh_and_get_current_session_tokens(self) -> Optional[int]:
-        """
-        Forces a refresh of the pruning blocks, re-initializes the chat session
-        if pruning info has changed, and then returns the current total session tokens.
-        """
-        current_prune_blocks_on_disk = self._load_prune_blocks_from_agent_data()
-
-        # Check if pruning blocks actually changed to avoid unnecessary re-initialization
-        if current_prune_blocks_on_disk != self._last_known_prune_blocks:
-            self._log("INFO", "Pruning blocks changed (detected by force_refresh). Re-initializing chat session.")
-            self.agent_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
-            self._last_known_prune_blocks = copy.deepcopy(current_prune_blocks_on_disk)
-            try:
-                self._initialize_chat_session()
-            except Exception as e_reinit:
-                self._log(
-                    "ERROR",
-                    f"Failed to re-initialize chat session during force_refresh: {e_reinit}. "
-                    "Token count may be inaccurate.",
-                )
-                return None # Indicate failure to get accurate count
-            if not self._can_count_current_session_tokens_authoritatively():
-                self._mark_agent_token_budget_stale(
-                    constants.TOKEN_BUDGET_STALE_REASON_PROVIDER_COUNT_UNAVAILABLE_AFTER_PRUNE
-                )
-                self._log("WARNING", "Token count unavailable after pruning force-refresh; marking token budget stale.")
-                return None
-        else:
-            self._log("INFO", "Pruning blocks unchanged. Proceeding to get current token count.")
-
-        return self.get_current_total_session_tokens()
-
     def reload_session_from_disk(self) -> None:
         """
         Rebuild provider-specific in-memory chat state from the canonical history file.
         """
         self.agent_prune_blocks = self._load_prune_blocks_from_agent_data()
         self._last_known_prune_blocks = copy.deepcopy(self.agent_prune_blocks)
+        self.context_history_start_tick = self._load_context_history_start_tick()
+        self._last_known_context_history_start_tick = self.context_history_start_tick
         self.system_prompt = self._load_system_prompt_from_agent_data()
         self._last_known_system_prompt = self.system_prompt
         self._handle_system_prompt_update()

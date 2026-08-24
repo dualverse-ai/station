@@ -12,7 +12,7 @@ while [ $# -gt 0 ]; do
             ;;
         -h|--help)
             echo "Usage: ./stop.sh [--force]"
-            echo "  Default: pause the station and wait for queued/running experiments to finish before stopping."
+            echo "  Default: pause the station and wait for queued/running Station jobs (including Research, Archive Surveyor, and External Counter requests) and web Surveyor requests to finish before stopping."
             echo "  --force: bypass pause/drain checks and run immediate cleanup."
             exit 0
             ;;
@@ -60,6 +60,8 @@ STOP_API_TIMEOUT_SECONDS=${STOP_API_TIMEOUT_SECONDS:-10}
 STOP_STATS_API_TIMEOUT_SECONDS=${STOP_STATS_API_TIMEOUT_SECONDS:-60}
 STOP_STATS_RETRIES=${STOP_STATS_RETRIES:-3}
 STOP_STATS_RETRY_DELAY_SECONDS=${STOP_STATS_RETRY_DELAY_SECONDS:-5}
+MULTISTART_STOP_TIMEOUT_SECONDS=${MULTISTART_STOP_TIMEOUT_SECONDS:-7200}
+SKIP_EXTERNAL_RETRY_DRAIN=false
 
 api_curl() {
     env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
@@ -125,10 +127,85 @@ find_station_gunicorn_pids() {
 
 find_station_nginx_pids() {
     local nginx_conf_path="$CURRENT_DIR/$DEPLOYMENT_DIR/nginx.conf"
+    local pid
+    local args
     if [ ! -f "$nginx_conf_path" ]; then
         return 0
     fi
-    ps aux | grep -E "nginx.*master.*$nginx_conf_path" | grep -v grep | awk '{print $2}' | tr '\n' ' '
+    while read -r pid args; do
+        if [[ "$args" == *"nginx: master process"* && "$args" == *"$nginx_conf_path"* ]]; then
+            printf '%s ' "$pid"
+        fi
+    done < <(ps -eo pid=,args= 2>/dev/null)
+}
+
+wait_for_pid_to_exit() {
+    local pid="$1"
+    local timeout_seconds="${2:-10}"
+    local waited=0
+    while ps -p "$pid" >/dev/null 2>&1; do
+        if [ "$waited" -ge "$timeout_seconds" ]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 0
+}
+
+stop_station_nginx_processes() {
+    local nginx_conf_path="$CURRENT_DIR/$DEPLOYMENT_DIR/nginx.conf"
+    local pids
+    local pid
+    local remaining=()
+
+    pids=$(find_station_nginx_pids)
+    if [ -z "$pids" ] && [ -f "$NGINX_PID_FILE" ]; then
+        pid=$(cat "$NGINX_PID_FILE" 2>/dev/null || true)
+        if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
+            pids="$pid"
+        fi
+    fi
+
+    if [ -z "$pids" ]; then
+        rm -f "$NGINX_PID_FILE"
+        echo "✓ No nginx found for this station."
+        return 0
+    fi
+
+    echo "Found nginx process(es) for this station: $pids"
+    if [ -f "$nginx_conf_path" ]; then
+        if nginx -c "$nginx_conf_path" -s quit 2>/dev/null; then
+            echo "✓ Nginx graceful stop requested."
+        elif command -v sudo >/dev/null 2>&1 && sudo nginx -c "$nginx_conf_path" -s quit 2>/dev/null; then
+            echo "✓ Nginx graceful stop requested."
+        else
+            echo "Graceful nginx stop command failed; falling back to direct process termination."
+        fi
+    fi
+
+    for pid in $pids; do
+        if wait_for_pid_to_exit "$pid" 10; then
+            continue
+        fi
+        echo "Nginx PID $pid did not exit after graceful quit; terminating it."
+        if command -v sudo >/dev/null 2>&1; then
+            sudo kill "$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        else
+            kill "$pid" 2>/dev/null || true
+        fi
+        if ! wait_for_pid_to_exit "$pid" 5; then
+            remaining+=("$pid")
+        fi
+    done
+
+    rm -f "$NGINX_PID_FILE"
+    if [ "${#remaining[@]}" -gt 0 ]; then
+        echo "ERROR: Could not stop nginx process(es) for this station: ${remaining[*]}"
+        return 1
+    fi
+    echo "✓ Nginx stopped."
+    return 0
 }
 
 has_running_station_services() {
@@ -164,9 +241,9 @@ else:
 PY
 }
 
-parse_experiment_counts() {
+parse_station_job_counts() {
     local response="$1"
-    RESPONSE="$response" python3 - <<'PY'
+    RESPONSE="$response" SKIP_EXTERNAL_RETRY_DRAIN="$SKIP_EXTERNAL_RETRY_DRAIN" python3 - <<'PY'
 import json
 import os
 import sys
@@ -176,9 +253,72 @@ try:
 except Exception:
     sys.exit(1)
 stats = payload.get("statistics") or {}
-running = int(stats.get("running_experiments_count") or 0)
-queued = int(stats.get("queued_experiments_count") or 0)
+skip_external = os.environ.get("SKIP_EXTERNAL_RETRY_DRAIN") == "true"
+
+def count_jobs(list_key, drainable_count_key, count_key, legacy_count_key):
+    jobs = stats.get(list_key)
+    if isinstance(jobs, list):
+        return sum(
+            1
+            for job in jobs
+            if isinstance(job, dict)
+            and job.get("drainable", True) is not False
+            and not (skip_external and job.get("job_type") == "external_report")
+        )
+    return int(stats.get(
+        drainable_count_key,
+        stats.get(count_key, stats.get(legacy_count_key)),
+    ) or 0)
+
+running = count_jobs(
+    "running_jobs",
+    "drainable_running_jobs_count",
+    "running_jobs_count",
+    "running_experiments_count",
+)
+queued = count_jobs(
+    "queued_jobs",
+    "drainable_queued_jobs_count",
+    "queued_jobs_count",
+    "queued_experiments_count",
+)
 print(f"{running} {queued}")
+PY
+}
+
+update_external_retry_drain_state() {
+    local status_response="$1"
+    local pause_reason
+    pause_reason=$(parse_orchestrator_status_field "$status_response" "pause_reason") || return 0
+    if [[ "$pause_reason" == *"External report"* && "$pause_reason" == *"failed and is being requeued"* ]]; then
+        SKIP_EXTERNAL_RETRY_DRAIN=true
+    fi
+}
+
+read_web_archive_survey_counts() {
+    local index_path="$CURRENT_DIR/station_data/web_interface/archive_surveyor/index/web_archive_surveys.sqlite3"
+    if [ ! -f "$index_path" ]; then
+        echo "0 0"
+        return 0
+    fi
+
+    python3 - "$index_path" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+from urllib.parse import quote
+
+path = Path(sys.argv[1]).resolve()
+uri = f"file:{quote(str(path))}?mode=ro"
+try:
+    with sqlite3.connect(uri, uri=True, timeout=30) as connection:
+        rows = dict(connection.execute(
+            "SELECT status, COUNT(*) FROM surveys WHERE status IN ('running', 'queued') GROUP BY status"
+        ).fetchall())
+except Exception as exc:
+    print(f"ERROR: Could not read web Surveyor queue: {exc}", file=sys.stderr)
+    sys.exit(1)
+print(f"{int(rows.get('running', 0))} {int(rows.get('queued', 0))}")
 PY
 }
 
@@ -210,6 +350,7 @@ wait_for_station_to_pause() {
         echo "ERROR: Could not parse orchestrator status. Use ./stop.sh --force to bypass checks."
         return 1
     fi
+    update_external_retry_drain_state "$status_response"
 
     if [ "$is_running" != "true" ]; then
         echo "✓ Orchestrator is not running; no pause needed."
@@ -245,6 +386,7 @@ wait_for_station_to_pause() {
             echo "ERROR: Could not parse orchestrator status while waiting for pause."
             return 1
         fi
+        update_external_retry_drain_state "$status_response"
         if [ "$is_running" != "true" ]; then
             echo ""
             echo "✓ Orchestrator stopped while pause was pending."
@@ -259,29 +401,38 @@ wait_for_station_to_pause() {
     done
 }
 
-wait_for_experiments_to_finish() {
+wait_for_station_jobs_to_finish() {
     local stats_response
     local counts
     local running_count
     local queued_count
+    local web_counts
+    local web_running_count
+    local web_queued_count
 
     echo "Reading station statistics (timeout: ${STOP_STATS_API_TIMEOUT_SECONDS}s)..."
     if ! stats_response=$(read_station_statistics); then
         echo "ERROR: Could not read station statistics. Use ./stop.sh --force to bypass checks."
         return 1
     fi
-    if ! counts=$(parse_experiment_counts "$stats_response"); then
+    if ! counts=$(parse_station_job_counts "$stats_response"); then
         echo "ERROR: Could not parse station statistics. Use ./stop.sh --force to bypass checks."
         return 1
     fi
     read -r running_count queued_count <<< "$counts"
+    if ! web_counts=$(read_web_archive_survey_counts); then
+        echo "ERROR: Could not read web Surveyor state. Use ./stop.sh --force to bypass checks."
+        return 1
+    fi
+    read -r web_running_count web_queued_count <<< "$web_counts"
 
-    if [ "${running_count:-0}" -eq 0 ] && [ "${queued_count:-0}" -eq 0 ]; then
-        echo "✓ No queued or running Research Center experiments."
+    if [ "${running_count:-0}" -eq 0 ] && [ "${queued_count:-0}" -eq 0 ] && \
+       [ "${web_running_count:-0}" -eq 0 ] && [ "${web_queued_count:-0}" -eq 0 ]; then
+        echo "✓ No queued or running Station jobs, External Counter requests, or web Surveyor requests."
         return 0
     fi
 
-    echo "Waiting for Research Center experiments to finish (running: ${running_count:-0}, queued: ${queued_count:-0})..."
+    echo "Waiting for Station jobs, including Research, Archive Surveyor, and External Counter requests, plus web Surveyor requests to finish (Station running: ${running_count:-0}, Station queued: ${queued_count:-0}, web Surveyor running: ${web_running_count:-0}, web Surveyor queued: ${web_queued_count:-0})..."
     while true; do
         sleep 10
         if ! stats_response=$(read_station_statistics); then
@@ -289,16 +440,22 @@ wait_for_experiments_to_finish() {
             echo "       Use ./stop.sh --force to bypass checks."
             return 1
         fi
-        if ! counts=$(parse_experiment_counts "$stats_response"); then
-            echo "ERROR: Could not parse station statistics while waiting for experiments."
+        if ! counts=$(parse_station_job_counts "$stats_response"); then
+            echo "ERROR: Could not parse station statistics while waiting for jobs."
             return 1
         fi
         read -r running_count queued_count <<< "$counts"
-        if [ "${running_count:-0}" -eq 0 ] && [ "${queued_count:-0}" -eq 0 ]; then
-            echo "✓ Research Center experiments finished."
+        if ! web_counts=$(read_web_archive_survey_counts); then
+            echo "ERROR: Could not read web Surveyor state while waiting."
+            return 1
+        fi
+        read -r web_running_count web_queued_count <<< "$web_counts"
+        if [ "${running_count:-0}" -eq 0 ] && [ "${queued_count:-0}" -eq 0 ] && \
+           [ "${web_running_count:-0}" -eq 0 ] && [ "${web_queued_count:-0}" -eq 0 ]; then
+            echo "✓ Station jobs, including External Counter requests, and web Surveyor requests finished."
             return 0
         fi
-        echo "Still waiting for experiments (running: ${running_count:-0}, queued: ${queued_count:-0})..."
+        echo "Still waiting (Station running: ${running_count:-0}, Station queued: ${queued_count:-0}, web Surveyor running: ${web_running_count:-0}, web Surveyor queued: ${web_queued_count:-0})..."
     done
 }
 
@@ -330,90 +487,53 @@ activate_station_conda() {
     return 0
 }
 
+stop_multistart_controller() {
+    if [ "${STATION_MULTISTART_SKIP_CONTROLLER_STOP:-}" = "1" ]; then
+        return 0
+    fi
+    activate_station_conda || true
+    if ! command -v python >/dev/null 2>&1; then
+        echo "ERROR: Python executable not available; cannot verify that multistart processes stopped."
+        return 1
+    fi
+    echo "Stopping multistart controller/branches (graceful timeout: ${MULTISTART_STOP_TIMEOUT_SECONDS}s)..."
+    if [ "$FORCE_STOP" = true ]; then
+        if ! python -m station.multistart.controller stop --repo "$CURRENT_DIR" --force; then
+            echo "ERROR: Failed to force-stop multistart controller/branches."
+            return 1
+        fi
+    else
+        if ! python -m station.multistart.controller stop --repo "$CURRENT_DIR" --timeout-seconds "$MULTISTART_STOP_TIMEOUT_SECONDS"; then
+            echo "ERROR: Multistart controller/branches did not stop cleanly."
+            echo "       Wait longer by setting MULTISTART_STOP_TIMEOUT_SECONDS, or use ./stop.sh --force if you want to bypass the graceful wait."
+            return 1
+        fi
+    fi
+    echo "✓ Multistart controller/branches stopped."
+}
+
+stop_multistart_controller || exit 1
+
 if [ "$FORCE_STOP" != true ]; then
+    if [ -z "$(find_station_gunicorn_pids)" ] && ! pid_file_is_running "$PID_FILE" && [ -n "$(find_station_nginx_pids)" ]; then
+        echo "Only stale nginx process(es) are running for this station; cleaning them before safe-stop checks."
+        stop_station_nginx_processes || exit 1
+    fi
+
     if ! has_running_station_services; then
         echo "✓ No running production services found for this station. Nothing to stop."
         exit 0
     fi
 
     wait_for_station_to_pause || exit 1
-    wait_for_experiments_to_finish || exit 1
+    wait_for_station_jobs_to_finish || exit 1
 else
-    echo "Force stop requested; bypassing pause and experiment drain checks."
+    echo "Force stop requested; bypassing pause and job drain checks. Active External Counter and web Surveyor requests may be requeued during shutdown."
 fi
 
 # --- Stop Nginx ---
 echo "Stopping Nginx..."
-# Use local PID file
-if [ -f "$NGINX_PID_FILE" ]; then
-    NGINX_PID=$(cat "$NGINX_PID_FILE")
-    if ps -p $NGINX_PID > /dev/null 2>&1; then
-        echo "Found nginx process (PID: $NGINX_PID)"
-        # Try to stop using our config file which has the correct pid path
-        NGINX_CONF="$DEPLOYMENT_DIR/nginx.conf"
-        if [ -f "$NGINX_CONF" ]; then
-            # Try without sudo first, then with sudo if available
-            if nginx -c "$(pwd)/$NGINX_CONF" -s quit 2>/dev/null; then
-                echo "✓ Nginx stopped gracefully."
-            elif command -v sudo >/dev/null 2>&1 && sudo nginx -c "$(pwd)/$NGINX_CONF" -s quit 2>/dev/null; then
-                echo "✓ Nginx stopped gracefully."
-            else
-                # Fallback: kill the specific process
-                echo "Graceful stop failed, killing nginx process directly..."
-                if command -v sudo >/dev/null 2>&1; then
-                    sudo kill $NGINX_PID 2>/dev/null || kill $NGINX_PID 2>/dev/null
-                else
-                    kill $NGINX_PID 2>/dev/null
-                fi
-                echo "✓ Nginx process killed."
-            fi
-        else
-            # No config file, kill the process directly
-            echo "No config file found, killing nginx process directly..."
-            if command -v sudo >/dev/null 2>&1; then
-                sudo kill $NGINX_PID 2>/dev/null || kill $NGINX_PID 2>/dev/null
-            else
-                kill $NGINX_PID 2>/dev/null
-            fi
-            echo "✓ Nginx process killed."
-        fi
-        rm -f "$NGINX_PID_FILE"
-    else
-        echo "✓ Nginx not running (stale PID file found)."
-        rm -f "$NGINX_PID_FILE"
-    fi
-else
-    echo "✓ No nginx found for this station (no PID file)."
-fi
-
-# Also check for orphaned nginx processes using this station's config file
-NGINX_CONF_PATH="$(pwd)/$DEPLOYMENT_DIR/nginx.conf"
-if [ -f "$NGINX_CONF_PATH" ]; then
-    # Find nginx master processes using our config file
-    ORPHANED_NGINX_PIDS=$(ps aux | grep -E "nginx.*master.*$NGINX_CONF_PATH" | grep -v grep | awk '{print $2}' | tr '\n' ' ')
-    if [ -n "$ORPHANED_NGINX_PIDS" ]; then
-        echo "Found orphaned nginx processes using this station's config: $ORPHANED_NGINX_PIDS"
-        echo "Attempting to stop orphaned nginx processes..."
-        for PID in $ORPHANED_NGINX_PIDS; do
-            if command -v sudo >/dev/null 2>&1; then
-                # Try graceful stop first with sudo
-                if sudo nginx -c "$NGINX_CONF_PATH" -s quit 2>/dev/null; then
-                    echo "✓ Orphaned nginx stopped gracefully."
-                else
-                    # Force kill if graceful stop fails
-                    sudo kill $PID 2>/dev/null && echo "✓ Orphaned nginx process $PID killed."
-                fi
-            else
-                # Try without sudo
-                if nginx -c "$NGINX_CONF_PATH" -s quit 2>/dev/null; then
-                    echo "✓ Orphaned nginx stopped gracefully."
-                else
-                    kill $PID 2>/dev/null && echo "✓ Orphaned nginx process $PID killed."
-                fi
-            fi
-        done
-    fi
-fi
+stop_station_nginx_processes || exit 1
 
 # --- Stop Gunicorn ---
 echo "Stopping Gunicorn..."
@@ -421,7 +541,7 @@ if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
     if ps -p $PID > /dev/null; then
         # Try graceful station cleanup via API first
-        if [ -f "$ENV_FILE" ]; then
+        if [ "$FORCE_STOP" != true ] && [ -f "$ENV_FILE" ]; then
             FLASK_PORT=${FLASK_PORT:-5000}
             echo "Requesting graceful station cleanup..."
             if command -v curl >/dev/null 2>&1; then

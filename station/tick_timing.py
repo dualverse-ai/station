@@ -55,7 +55,6 @@ def _append_event(event: Dict[str, Any], *, base_path: Optional[str] = None) -> 
 
 def record_tick_start(
     tick: int,
-    sync_mode: str,
     *,
     turn_order: Optional[List[str]] = None,
     base_path: Optional[str] = None,
@@ -69,7 +68,6 @@ def record_tick_start(
     event: Dict[str, Any] = {
         "event": "tick_start",
         "tick": tick,
-        "sync_mode": sync_mode,
         "started_timestamp": started_timestamp,
         "started_at": started_at,
     }
@@ -84,7 +82,6 @@ def record_tick_start(
 def record_tick_end(
     tick: int,
     next_tick: int,
-    sync_mode: str,
     *,
     base_path: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -96,7 +93,6 @@ def record_tick_end(
         "event": "tick_end",
         "tick": tick,
         "next_tick": next_tick,
-        "sync_mode": sync_mode,
         "ended_timestamp": ended_timestamp,
         "ended_at": ended_at,
     }
@@ -111,7 +107,6 @@ def record_tick_end(
 def record_phase(
     tick: int,
     phase: str,
-    sync_mode: str,
     duration_seconds: float,
     *,
     started_timestamp: Optional[float] = None,
@@ -125,7 +120,6 @@ def record_phase(
     event: Dict[str, Any] = {
         "event": "phase",
         "tick": tick,
-        "sync_mode": sync_mode,
         "phase": phase,
         "duration_seconds": max(0.0, float(duration_seconds)),
         "started_timestamp": start_ts,
@@ -142,7 +136,6 @@ def record_phase(
 def time_phase(
     tick: int,
     phase: str,
-    sync_mode: str,
     *,
     base_path: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -156,7 +149,6 @@ def time_phase(
         record_phase(
             tick,
             phase,
-            sync_mode,
             ended_timestamp - started_timestamp,
             started_timestamp=started_timestamp,
             ended_timestamp=ended_timestamp,
@@ -198,7 +190,6 @@ def _save_latest_timing_state(event: Dict[str, Any], *, base_path: Optional[str]
             "latest_tick": event.get("tick"),
             "latest_tick_started_timestamp": event.get("started_timestamp"),
             "latest_tick_started_at": event.get("started_at"),
-            "latest_tick_sync_mode": event.get("sync_mode"),
         })
     elif event.get("event") == "tick_end":
         recent_ticks = _updated_recent_ticks(state, event)
@@ -251,7 +242,6 @@ def _updated_recent_ticks(state: Dict[str, Any], event: Dict[str, Any]) -> List[
     recent_ticks.append({
         "tick": event_tick,
         "next_tick": event.get("next_tick"),
-        "sync_mode": event.get("sync_mode") or existing_record.get("sync_mode") or state.get("latest_tick_sync_mode"),
         "started_timestamp": started_timestamp,
         "started_at": state.get("latest_tick_started_at") if latest_matches_event else existing_record.get("started_at"),
         "ended_timestamp": ended_timestamp,
@@ -295,7 +285,6 @@ def _get_latest_tick_start_event_from_state(state: Dict[str, Any], *, current_ti
         "tick": latest_tick,
         "started_timestamp": started_timestamp,
         "started_at": state.get("latest_tick_started_at"),
-        "sync_mode": state.get("latest_tick_sync_mode"),
     }
 
 

@@ -191,7 +191,7 @@ def extract_next_role_definition(agent_response: str) -> Optional[str]:
 
 def replace_blocked_role_definition(prompt: str) -> Tuple[str, Optional[str]]:
     """
-    Replace blocked role definitions with a role from the fresh-guest sampling pool.
+    Replace blocked role definitions with a role from the initial fresh-guest sampling pool.
     If the pool is empty, return a blank prompt.
     """
     match = _BLOCKED_DESCENDANT_PROMPT_PATTERN.search(prompt)

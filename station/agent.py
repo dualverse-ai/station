@@ -24,7 +24,7 @@ import os
 import errno
 import re # For _generate_unique_guest_name
 import random
-from typing import Any, List, Dict, Optional, Set
+from typing import Any, List, Dict, Optional
 import traceback
 import fcntl
 import time
@@ -113,57 +113,13 @@ def _load_init_role_definitions() -> List[str]:
         pass
     return []
 
-def _load_departed_next_role_definitions() -> List[str]:
-    """Load descendant role definitions left by departed agents."""
-    role_definitions: List[str] = []
-    agents_dir = os.path.join(constants.BASE_STATION_DATA_PATH, constants.AGENTS_DIR_NAME)
-    if not file_io_utils.dir_exists(agents_dir):
-        return role_definitions
-
-    try:
-        agent_files = file_io_utils.list_files(agents_dir, constants.YAML_EXTENSION)
-    except Exception:
-        return role_definitions
-
-    for agent_file_name in agent_files:
-        if not agent_file_name.endswith(constants.YAML_EXTENSION):
-            continue
-        agent_name = agent_file_name[:-len(constants.YAML_EXTENSION)]
-        try:
-            agent_data = load_agent_data(
-                agent_name,
-                include_ascended=True,
-                include_ended=True,
-            )
-        except Exception:
-            continue
-        if not isinstance(agent_data, dict):
-            continue
-        if not agent_data.get(constants.AGENT_SESSION_ENDED_KEY, False):
-            continue
-        if agent_data.get(constants.AGENT_ROLE_KEY) in {
-            constants.ROLE_SUPERVISOR,
-            constants.ROLE_THEORIST,
-        }:
-            continue
-
-        if constants.AGENT_NEXT_ROLE_DEFINITION_KEY not in agent_data:
-            continue
-
-        role_definition = agent_data.get(constants.AGENT_NEXT_ROLE_DEFINITION_KEY)
-        if isinstance(role_definition, str):
-            role_definitions.append(role_definition.strip())
-
-    return role_definitions
-
 def get_role_definition_sampling_pool() -> List[str]:
-    """Return the full pool used when a fresh guest has no explicit role."""
-    return _load_init_role_definitions() + _load_departed_next_role_definitions()
+    """Return the role pool used when a fresh guest has no explicit role."""
+    return _load_init_role_definitions()
 
 def pick_random_init_role_definition() -> Optional[str]:
     """
-    Pick an initial role definition from the full fresh-guest sampling pool:
-    init role definitions plus descendant role definitions left by departed agents.
+    Pick an initial role definition from the fresh-guest sampling pool.
     """
     role_definitions = get_role_definition_sampling_pool()
     if not role_definitions:
@@ -227,10 +183,10 @@ def _compact_optional_string(value: Any) -> str:
     return str(value).strip()
 
 
-def _normalized_protection_records(agent_data: Optional[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+def _normalized_protected_context_items(agent_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not isinstance(agent_data, dict):
         return []
-    raw_records = agent_data.get(key, [])
+    raw_records = agent_data.get(constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY, [])
     if not isinstance(raw_records, list):
         return []
 
@@ -238,240 +194,211 @@ def _normalized_protection_records(agent_data: Optional[Dict[str, Any]], key: st
     for raw_record in raw_records:
         if not isinstance(raw_record, dict):
             continue
-        tick = _coerce_tick(raw_record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
-        reason = _compact_optional_string(raw_record.get(constants.PROTECTED_DIALOGUE_REASON_KEY))
-        if key == constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY and tick is None:
-            continue
-        if not reason:
+        tick = _coerce_tick(raw_record.get(constants.PROTECTED_CONTEXT_TICK_KEY))
+        kind = _compact_optional_string(raw_record.get(constants.PROTECTED_CONTEXT_KIND_KEY))
+        content = str(raw_record.get(constants.PROTECTED_CONTEXT_CONTENT_KEY) or "").strip()
+        if tick is None or not kind or not content:
             continue
         record: Dict[str, Any] = {
-            constants.PROTECTED_DIALOGUE_REASON_KEY: reason,
+            constants.PROTECTED_CONTEXT_TICK_KEY: tick,
+            constants.PROTECTED_CONTEXT_KIND_KEY: kind,
+            constants.PROTECTED_CONTEXT_CONTENT_KEY: content,
         }
-        if tick is not None:
-            record[constants.PROTECTED_DIALOGUE_TICK_KEY] = tick
-        source = _compact_optional_string(raw_record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY))
+        source = _compact_optional_string(raw_record.get(constants.PROTECTED_CONTEXT_SOURCE_KEY))
+        title = _compact_optional_string(raw_record.get(constants.PROTECTED_CONTEXT_TITLE_KEY))
+        metadata = raw_record.get(constants.PROTECTED_CONTEXT_METADATA_KEY)
         if source:
-            record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source
-        metadata = raw_record.get(constants.PROTECTED_DIALOGUE_METADATA_KEY)
+            record[constants.PROTECTED_CONTEXT_SOURCE_KEY] = source
+        if title:
+            record[constants.PROTECTED_CONTEXT_TITLE_KEY] = title
         if isinstance(metadata, dict) and metadata:
-            record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
+            record[constants.PROTECTED_CONTEXT_METADATA_KEY] = dict(metadata)
         records.append(record)
-    return records
-
-
-def _meta_reflection_protected_tick_limit() -> Optional[int]:
-    raw_limit = getattr(constants, "REFLECTION_META_PROTECTED_TICK_LIMIT", 4)
-    if raw_limit is None:
-        return None
-    try:
-        limit = int(raw_limit)
-    except (TypeError, ValueError):
-        return 4
-    if limit < 0:
-        return None
-    return limit
-
-
-def _sort_protection_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         records,
         key=lambda item: (
-            int(item.get(constants.PROTECTED_DIALOGUE_TICK_KEY, 0)),
-            str(item.get(constants.PROTECTED_DIALOGUE_REASON_KEY, "")),
-            str(item.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "")),
+            int(item.get(constants.PROTECTED_CONTEXT_TICK_KEY, 0)),
+            str(item.get(constants.PROTECTED_CONTEXT_KIND_KEY, "")),
+            str(item.get(constants.PROTECTED_CONTEXT_SOURCE_KEY, "")),
+            str(item.get(constants.PROTECTED_CONTEXT_TITLE_KEY, "")),
         ),
     )
 
 
-def _limit_meta_reflection_protection_records(
-    records: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    limit = _meta_reflection_protected_tick_limit()
-    if limit is None:
-        return records
-
-    meta_tick_set: Set[int] = set()
-    for record in records:
-        if (
-            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY)
-            != constants.PROTECTED_DIALOGUE_REASON_META_REFLECTION
-        ):
-            continue
-        tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
-        if tick is not None:
-            meta_tick_set.add(tick)
-    meta_ticks = sorted(meta_tick_set, reverse=True)
-    protected_meta_ticks = set(meta_ticks[:limit])
-
-    limited_records: List[Dict[str, Any]] = []
-    for record in records:
-        if (
-            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY)
-            == constants.PROTECTED_DIALOGUE_REASON_META_REFLECTION
-        ):
-            tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
-            if tick not in protected_meta_ticks:
-                continue
-        limited_records.append(record)
-    return limited_records
-
-
-def protect_dialogue_tick(
+def add_protected_context_item(
     agent_data: Dict[str, Any],
+    *,
     tick: int,
-    reason: str,
+    kind: str,
+    content: str,
     source: str = "",
+    title: str = "",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Mark a whole Station dialogue tick as not prunable in agent YAML."""
-    if not isinstance(agent_data, dict):
-        return False
+    """Append an exact protected context item to agent YAML."""
     tick_int = _coerce_tick(tick)
-    reason_text = _compact_optional_string(reason)
+    kind_text = _compact_optional_string(kind)
     source_text = _compact_optional_string(source)
-    if tick_int is None or not reason_text:
+    title_text = _compact_optional_string(title)
+    content_text = str(content or "").strip()
+    if tick_int is None or not kind_text or not content_text:
         return False
 
-    records = _normalized_protection_records(
-        agent_data,
-        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY,
-    )
-    original_records = list(records)
-    for record in records:
-        if (
-            record.get(constants.PROTECTED_DIALOGUE_TICK_KEY) == tick_int
-            and record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) == reason_text
-            and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") == source_text
-        ):
-            limited_records = _limit_meta_reflection_protection_records(
-                _sort_protection_records(records)
-            )
-            agent_data[constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY] = limited_records
-            return limited_records != original_records
-
+    records = _normalized_protected_context_items(agent_data)
     new_record: Dict[str, Any] = {
-        constants.PROTECTED_DIALOGUE_TICK_KEY: tick_int,
-        constants.PROTECTED_DIALOGUE_REASON_KEY: reason_text,
+        constants.PROTECTED_CONTEXT_TICK_KEY: tick_int,
+        constants.PROTECTED_CONTEXT_KIND_KEY: kind_text,
+        constants.PROTECTED_CONTEXT_CONTENT_KEY: content_text,
     }
     if source_text:
-        new_record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source_text
+        new_record[constants.PROTECTED_CONTEXT_SOURCE_KEY] = source_text
+    if title_text:
+        new_record[constants.PROTECTED_CONTEXT_TITLE_KEY] = title_text
     if isinstance(metadata, dict) and metadata:
-        new_record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
-    records.append(new_record)
-    records = _limit_meta_reflection_protection_records(_sort_protection_records(records))
-    agent_data[constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY] = records
-    return records != original_records
+        new_record[constants.PROTECTED_CONTEXT_METADATA_KEY] = dict(metadata)
 
-
-def queue_dialogue_tick_protection(
-    agent_data: Dict[str, Any],
-    reason: str,
-    source: str = "",
-    metadata: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """Queue a protection to be applied to the next rendered Station response."""
-    if not isinstance(agent_data, dict):
-        return False
-    reason_text = _compact_optional_string(reason)
-    source_text = _compact_optional_string(source)
-    if not reason_text:
-        return False
-
-    records = _normalized_protection_records(
-        agent_data,
-        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY,
-    )
     for record in records:
-        if (
-            record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) == reason_text
-            and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") == source_text
-        ):
-            agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = records
+        if record == new_record:
+            agent_data[constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY] = records
             return False
 
-    new_record: Dict[str, Any] = {
-        constants.PROTECTED_DIALOGUE_REASON_KEY: reason_text,
-    }
-    if source_text:
-        new_record[constants.PROTECTED_DIALOGUE_SOURCE_KEY] = source_text
-    if isinstance(metadata, dict) and metadata:
-        new_record[constants.PROTECTED_DIALOGUE_METADATA_KEY] = dict(metadata)
     records.append(new_record)
-    agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = records
+    agent_data[constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY] = _normalized_protected_context_items(
+        {constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY: records}
+    )
     return True
 
 
-def apply_pending_dialogue_tick_protections(agent_data: Dict[str, Any], tick: int) -> bool:
-    """Apply queued protection records to the current Station response tick."""
-    if not isinstance(agent_data, dict):
-        return False
-    pending = _normalized_protection_records(
-        agent_data,
-        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY,
-    )
-    if not pending and constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY not in agent_data:
-        return False
-
-    changed = False
-    for record in pending:
-        changed = protect_dialogue_tick(
-            agent_data,
-            tick,
-            str(record.get(constants.PROTECTED_DIALOGUE_REASON_KEY, "")),
-            source=str(record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "")),
-            metadata=record.get(constants.PROTECTED_DIALOGUE_METADATA_KEY),
-        ) or changed
-    agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = []
-    return changed or bool(pending)
-
-
-def has_dialogue_tick_protection(
+def get_protected_context_items(
     agent_data: Optional[Dict[str, Any]],
     *,
-    reason: Optional[str] = None,
-    source: Optional[str] = None,
-    include_pending: bool = True,
-) -> bool:
-    """Return whether agent YAML already has a matching protection record."""
-    reason_text = _compact_optional_string(reason)
-    source_text = _compact_optional_string(source)
-    keys = [constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY]
-    if include_pending:
-        keys.append(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY)
-
-    for key in keys:
-        for record in _normalized_protection_records(agent_data, key):
-            if reason_text and record.get(constants.PROTECTED_DIALOGUE_REASON_KEY) != reason_text:
-                continue
-            if source_text and record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, "") != source_text:
-                continue
-            return True
-    return False
+    up_to_tick: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    records = _normalized_protected_context_items(agent_data)
+    if up_to_tick is None:
+        return records
+    tick_int = _coerce_tick(up_to_tick)
+    if tick_int is None:
+        return []
+    return [
+        record for record in records
+        if int(record.get(constants.PROTECTED_CONTEXT_TICK_KEY, -1)) <= tick_int
+    ]
 
 
-def get_protected_dialogue_ticks(
-    agent_data: Optional[Dict[str, Any]],
-    raw_entries: Optional[List[Dict[str, Any]]] = None,
-) -> Set[int]:
-    """Return Station dialogue ticks that pruning must preserve.
+def _normalized_context_compaction_events(agent_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(agent_data, dict):
+        return []
+    raw_events = agent_data.get(constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY, [])
+    if not isinstance(raw_events, list):
+        return []
 
-    ``raw_entries`` is accepted for compatibility with older call sites, but
-    protection is now read only from explicit agent YAML records. Legacy keyword
-    migration happens once at startup.
-    """
-    _ = raw_entries
-    protected_ticks: Set[int] = set()
-    records = _limit_meta_reflection_protection_records(
-        _normalized_protection_records(
-            agent_data,
-            constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY,
-        )
+    events: List[Dict[str, Any]] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            continue
+        compacted_after_tick = _coerce_tick(raw_event.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY))
+        summary = str(raw_event.get(constants.CONTEXT_COMPACTION_SUMMARY_KEY) or "").strip()
+        if compacted_after_tick is None:
+            continue
+        event: Dict[str, Any] = {
+            constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY: compacted_after_tick,
+            constants.CONTEXT_COMPACTION_SUMMARY_KEY: summary,
+            constants.CONTEXT_COMPACTION_STATUS_KEY: str(
+                raw_event.get(constants.CONTEXT_COMPACTION_STATUS_KEY)
+                or constants.CONTEXT_COMPACTION_STATUS_PENDING_ANCHOR
+            ),
+        }
+        anchor_tick = _coerce_tick(raw_event.get(constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY))
+        if anchor_tick is not None:
+            event[constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY] = anchor_tick
+            event[constants.CONTEXT_COMPACTION_STATUS_KEY] = constants.CONTEXT_COMPACTION_STATUS_ANCHORED
+        events.append(event)
+    return sorted(
+        events,
+        key=lambda item: int(item.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY, -1)),
     )
-    for record in records:
-        tick = _coerce_tick(record.get(constants.PROTECTED_DIALOGUE_TICK_KEY))
-        if tick is not None:
-            protected_ticks.add(tick)
-    return protected_ticks
+
+
+def add_context_compaction_event(
+    agent_data: Dict[str, Any],
+    *,
+    compacted_after_tick: int,
+    summary: str,
+) -> bool:
+    compacted_after_tick_int = _coerce_tick(compacted_after_tick)
+    summary_text = str(summary or "").strip()
+    if compacted_after_tick_int is None:
+        return False
+
+    events = _normalized_context_compaction_events(agent_data)
+    for event in events:
+        if event.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY) == compacted_after_tick_int:
+            event[constants.CONTEXT_COMPACTION_SUMMARY_KEY] = summary_text
+            event[constants.CONTEXT_COMPACTION_STATUS_KEY] = constants.CONTEXT_COMPACTION_STATUS_PENDING_ANCHOR
+            event.pop(constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY, None)
+            agent_data[constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY] = events
+            return True
+
+    events.append({
+        constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY: compacted_after_tick_int,
+        constants.CONTEXT_COMPACTION_SUMMARY_KEY: summary_text,
+        constants.CONTEXT_COMPACTION_STATUS_KEY: constants.CONTEXT_COMPACTION_STATUS_PENDING_ANCHOR,
+    })
+    agent_data[constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY] = _normalized_context_compaction_events(
+        {constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY: events}
+    )
+    return True
+
+
+def get_context_compaction_events(agent_data: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return _normalized_context_compaction_events(agent_data)
+
+
+def get_pending_context_compaction_event(agent_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for event in reversed(_normalized_context_compaction_events(agent_data)):
+        if event.get(constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY) is None:
+            return event
+    return None
+
+
+def mark_context_compaction_anchored(
+    agent_data: Dict[str, Any],
+    *,
+    compacted_after_tick: int,
+    anchor_tick: int,
+) -> bool:
+    compacted_after_tick_int = _coerce_tick(compacted_after_tick)
+    anchor_tick_int = _coerce_tick(anchor_tick)
+    if compacted_after_tick_int is None or anchor_tick_int is None:
+        return False
+    events = _normalized_context_compaction_events(agent_data)
+    changed = False
+    for event in events:
+        if event.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY) == compacted_after_tick_int:
+            event[constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY] = anchor_tick_int
+            event[constants.CONTEXT_COMPACTION_STATUS_KEY] = constants.CONTEXT_COMPACTION_STATUS_ANCHORED
+            changed = True
+            break
+    if changed:
+        agent_data[constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY] = events
+    return changed
+
+
+def latest_context_compaction_anchor_at_or_before(
+    agent_data: Optional[Dict[str, Any]],
+    tick: int,
+) -> Optional[int]:
+    tick_int = _coerce_tick(tick)
+    if tick_int is None:
+        return None
+    anchors = [
+        int(event[constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY])
+        for event in _normalized_context_compaction_events(agent_data)
+        if event.get(constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY) is not None
+        and int(event[constants.CONTEXT_COMPACTION_ANCHOR_TICK_KEY]) <= tick_int
+    ]
+    return max(anchors) if anchors else None
 
 
 def _message_is_architect_message(message: str) -> bool:
@@ -582,8 +509,11 @@ def update_agent_fields(agent_name: str, delta_updates: Dict[str, Any]) -> bool:
 def add_pending_notification_atomic(
     agent_name: str,
     message: str,
-    protection_reason: Optional[str] = None,
-    protection_source: str = "",
+    protected_context_kind: Optional[str] = None,
+    protected_context_source: str = "",
+    protected_context_title: str = "",
+    protected_context_tick: Optional[int] = None,
+    protected_context_content: Optional[str] = None,
 ) -> bool:
     """
     Add a notification to an agent's pending notifications list atomically.
@@ -610,17 +540,21 @@ def add_pending_notification_atomic(
             return
 
         agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY] = current_notifications + [message]
-        if protection_reason:
-            queue_dialogue_tick_protection(
+        context_kind = protected_context_kind
+        context_title = protected_context_title
+        context_source = protected_context_source
+        if not context_kind and _message_is_architect_message(message):
+            context_kind = constants.PROTECTED_CONTEXT_KIND_ARCHITECT_MESSAGE
+            context_title = context_title or "Architect Message"
+            context_source = context_source or "architect_message_notification"
+        if context_kind and protected_context_tick is not None:
+            add_protected_context_item(
                 agent_data,
-                protection_reason,
-                source=protection_source,
-            )
-        elif _message_is_architect_message(message):
-            queue_dialogue_tick_protection(
-                agent_data,
-                constants.PROTECTED_DIALOGUE_REASON_ARCHITECT_MESSAGE,
-                source="architect_message_notification",
+                tick=protected_context_tick,
+                kind=context_kind,
+                source=context_source,
+                title=context_title,
+                content=protected_context_content if protected_context_content is not None else message,
             )
     
     return update_agent_with_function(agent_name, update_func)
@@ -733,8 +667,8 @@ def create_guest_agent(model_name: str,
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
         constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
-        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: [],
-        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: [],
+        constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY: [],
+        constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY: [],
         # Tick tracking fields
         constants.AGENT_TICK_BIRTH_KEY: current_tick,
         constants.AGENT_TICK_ASCEND_KEY: None,
@@ -805,8 +739,8 @@ def create_recursive_agent(model_name: str,
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
         constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
-        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: [],
-        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: [],
+        constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY: [],
+        constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY: [],
         # Tick tracking fields
         constants.AGENT_TICK_BIRTH_KEY: current_tick,
         constants.AGENT_TICK_ASCEND_KEY: current_tick,  # Recursive agents are born ascended
@@ -888,11 +822,11 @@ def ascend_agent(guest_agent_name: str,
         constants.AGENT_ASCENDED_TO_NAME_KEY: None,
         constants.AGENT_SESSION_ENDED_KEY: False,
         constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY: False,
-        constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY: list(
-            original_guest_data.get(constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY, [])
+        constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY: list(
+            original_guest_data.get(constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY, [])
         ),
-        constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY: list(
-            original_guest_data.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY, [])
+        constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY: list(
+            original_guest_data.get(constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY, [])
         ),
         # Tick tracking fields - carry over birth, set ascend
         constants.AGENT_TICK_BIRTH_KEY: original_guest_data.get(constants.AGENT_TICK_BIRTH_KEY),
@@ -929,17 +863,6 @@ def ascend_agent(guest_agent_name: str,
             else:
                 new_recursive_agent_data[short_room_name_key_asc] = original_guest_data[short_room_name_key_asc].copy()
 
-    # --- ADD THESE LINES for Capsule Protocol Help Status ---
-    capsule_help_shown_key = constants.AGENT_STATE_CAPSULE_PROTOCOL_HELP_SHOWN_KEY
-    global_state_key = constants.AGENT_STATE_DATA_KEY # This is where capsule help shown is stored
-
-    original_global_state_data = original_guest_data.get(global_state_key, {})
-    if isinstance(original_global_state_data, dict) and capsule_help_shown_key in original_global_state_data:
-        if global_state_key not in new_recursive_agent_data or not isinstance(new_recursive_agent_data[global_state_key], dict):
-            new_recursive_agent_data[global_state_key] = {}
-        new_recursive_agent_data[global_state_key][capsule_help_shown_key] = original_global_state_data[capsule_help_shown_key]
-    # --- END OF ADDED LINES ---
-    
     # --- Carry over meta prompt ---
     if constants.AGENT_META_PROMPT_KEY in original_guest_data:
         new_recursive_agent_data[constants.AGENT_META_PROMPT_KEY] = original_guest_data[constants.AGENT_META_PROMPT_KEY]
@@ -1107,8 +1030,11 @@ def update_agent_token_budget(agent_data: Dict[str, Any], cost: int) -> bool:
 def add_pending_notification(
     agent_data: Dict[str, Any],
     notification_message: str,
-    protection_reason: Optional[str] = None,
-    protection_source: str = "",
+    protected_context_kind: Optional[str] = None,
+    protected_context_source: str = "",
+    protected_context_title: str = "",
+    protected_context_tick: Optional[int] = None,
+    protected_context_content: Optional[str] = None,
 ) -> None: # MODIFIED type hint
     """Adds a message string to the agent's pending notification list."""
     if constants.AGENT_NOTIFICATIONS_PENDING_KEY not in agent_data or \
@@ -1124,17 +1050,21 @@ def add_pending_notification(
         agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY].append(str(notification_message))
 
     message_text = notification_message if isinstance(notification_message, str) else str(notification_message)
-    if protection_reason:
-        queue_dialogue_tick_protection(
+    context_kind = protected_context_kind
+    context_title = protected_context_title
+    context_source = protected_context_source
+    if not context_kind and _message_is_architect_message(message_text):
+        context_kind = constants.PROTECTED_CONTEXT_KIND_ARCHITECT_MESSAGE
+        context_title = context_title or "Architect Message"
+        context_source = context_source or "architect_message_notification"
+    if context_kind and protected_context_tick is not None:
+        add_protected_context_item(
             agent_data,
-            protection_reason,
-            source=protection_source,
-        )
-    elif _message_is_architect_message(message_text):
-        queue_dialogue_tick_protection(
-            agent_data,
-            constants.PROTECTED_DIALOGUE_REASON_ARCHITECT_MESSAGE,
-            source="architect_message_notification",
+            tick=protected_context_tick,
+            kind=context_kind,
+            source=context_source,
+            title=context_title,
+            content=protected_context_content if protected_context_content is not None else message_text,
         )
 
 

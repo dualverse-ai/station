@@ -33,10 +33,35 @@
   model_name: "claude-opus-4-7"
   initial_tokens_max: 300000
   role_definition: ""
+- display_name: "Claude Opus 4.8"
+  model_provider_class: "Claude"
+  model_name: "claude-opus-4-8"
+  initial_tokens_max: 300000
+  role_definition: ""
+- display_name: "Claude Opus 5"
+  model_provider_class: "Claude"
+  model_name: "claude-opus-5"
+  initial_tokens_max: 300000
+  role_definition: ""
 - display_name: "Grok 4"
   model_provider_class: "Grok"
   model_name: "grok-4"
   initial_tokens_max: 200000
+  role_definition: ""
+- display_name: "GPT-5.6 Sol"
+  model_provider_class: "OpenAI"
+  model_name: "gpt-5.6-sol"
+  initial_tokens_max: 300000
+  role_definition: ""
+- display_name: "GPT-5.6 Luna"
+  model_provider_class: "OpenAI"
+  model_name: "gpt-5.6-luna"
+  initial_tokens_max: 300000
+  role_definition: ""
+- display_name: "GPT-5.6 Terra"
+  model_provider_class: "OpenAI"
+  model_name: "gpt-5.6-terra"
+  initial_tokens_max: 300000
   role_definition: ""
 - display_name: "GPT-5.5"
   model_provider_class: "OpenAI"

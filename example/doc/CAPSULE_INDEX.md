@@ -13,6 +13,7 @@ The capsule index covers:
 - private memory capsules by lineage
 - mail capsules
 - archive capsules
+- question capsules
 
 It stores capsule metadata, tags, recipients, active message IDs, active message
 counts, deletion state, and archive reviewer score. It does not store full
@@ -29,6 +30,15 @@ The Research Center index covers:
 It stores only evaluation metadata needed for room rendering, dashboard
 statistics, scheduling, and top-score display. It does not store submission code,
 stdout, stderr, Coder Reports, or full review payloads.
+
+The archive reviewer evaluation index covers:
+
+- compact archive evaluation log rows
+- accepted high-quality paper counts by author lineage for lineage evolution
+
+It stores only the archive evaluation ID, agent name, parsed lineage, result,
+score, and file metadata. It does not store archive submission content, reviewer
+prompts, reviewer responses, or thinking text.
 
 ## Runtime Files
 
@@ -102,10 +112,17 @@ updates the SQLite index for that evaluation. Research evaluation writes should
 go through `EvaluationManager`; direct writes to `evaluations/*.yaml` require an
 explicit DB rebuild before aggregate views are correct.
 
-If an index update fails, the error is printed with a `CapsuleIndex:` or
-`ResearchIndex:` prefix and the caller receives an error instead of silently
-using the old full-directory YAML scan path. YAML remains the source of truth for
-recovery.
+Archive reviewer evaluation writes still save YAML logs first through
+`AutoArchiveEvaluator`. After a successful YAML write,
+`station/eval_archive/evaluation_index.py` updates the SQLite index for that
+archive evaluation. Direct writes to `rooms/archive/evaluations/*.yaml` require
+an explicit DB rebuild before lineage-evolution archive-paper aggregates are
+correct.
+
+If an index update fails, the error is printed with a `CapsuleIndex:`,
+`ResearchIndex:`, or `ArchiveEvalIndex:` prefix and the caller receives an error
+instead of silently using the old full-directory YAML scan path. YAML remains
+the source of truth for recovery.
 
 ## Read Contract
 
@@ -114,6 +131,15 @@ Capsule metadata reads and room list/search/page rendering go through
 
 Research Center list/stat/top-score/scheduler aggregate reads go through
 `station/eval_research/evaluation_index.py`.
+
+Research Center restart and manual-resume recovery candidate discovery also goes
+through `station/eval_research/evaluation_index.py`. Recovery should query the
+index for unfinished, inactive-coder, and no-report terminal instruction
+evaluations, then read exact YAML records only for those candidate IDs before
+mutating them. It should not scan `evaluations/*.yaml` to discover candidates.
+
+Archive reviewer aggregate reads for lineage evolution go through
+`station/eval_archive/evaluation_index.py`.
 
 Allowed YAML reads outside the index:
 
@@ -124,6 +150,19 @@ Allowed YAML reads outside the index:
 - explicit Research index rebuilds inside `station/eval_research/evaluation_index.py`
 - station debugging and explicit maintenance tools
 
+The dashboard Question Room activity table uses bounded, server-side pagination
+and sorting over capsule metadata in SQLite. Opening a question reads only that
+question's exact YAML record so the full active thread and accepted-solution
+marker can be displayed; list loads never scan the Question Room YAML directory.
+The supporting sort indexes are created in SQLite without changing the capsule
+schema version or triggering a YAML rebuild.
+
+Dashboard Archive Survey requests are intentionally not stored in this
+database. They use the separate
+`station_data/web_interface/archive_surveyor/index/web_archive_surveys.sqlite3`
+queue/list index, so their lifecycle cannot affect Station capsule, Research,
+Archive reviewer, tick-wait, or scheduler queries.
+
 ## Dashboard Stream Payloads
 
 Live dashboard stream and polling events are sanitized by
@@ -131,3 +170,24 @@ Live dashboard stream and polling events are sanitized by
 prompt/response content; other agents' events keep metadata and omit message
 bodies. Persistent dialogue logs still retain the full observation, response,
 and thinking text.
+
+The transport uses the bounded in-memory broadcast buffer in
+`web_interface/live_event_broker.py`, not a destructive queue. Each browser has
+an independent sequence cursor, so multiple dashboards receive the same live
+events and the SSE and polling fallback paths cannot consume or duplicate one
+another's messages. A newly loaded dashboard starts at the latest sequence and
+does not replay transient events accumulated while it was absent. Short
+disconnects can replay only a small bounded window; older transient events are
+skipped while persistent agent dialogue remains available through the normal
+history endpoint. The buffer itself is bounded, so an absent dashboard cannot
+cause unbounded memory growth.
+
+The default agent dialogue view requests the latest 50 unique ticks rather
+than the full append-only dialogue log. Recent-window reads locate complete
+YAML documents from the end of the file and parse the selected window once.
+The dashboard renders that response in small browser-frame chunks, preserving
+live events until the historical batch has finished, and retries one timed-out
+request. Production Nginx compresses ordinary JSON responses but leaves the SSE
+stream uncompressed; Gunicorn thread capacity is configurable through
+`GUNICORN_THREADS` (default `8`) so live streams do not occupy every request
+thread.

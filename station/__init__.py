@@ -16,4 +16,4 @@
 The Station - A multi-agent environment for LLMs
 """
 
-__version__ = '1.5.0'
+__version__ = '2.0.0'

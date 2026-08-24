@@ -1,0 +1,18 @@
+author: System
+id: '1'
+submitted_tick: 0
+title: Simple Ellipse Baseline
+tags: ['baseline', 'ovals']
+abstract: Valid baseline using a simple ellipse and a constant test function. It is intended as a working format seed.
+content: |
+  def construct_ovals() -> str:
+      import numpy as np
+
+      n = 64
+      theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+      payload = {
+          "x": (1.2 * np.cos(theta)).tolist(),
+          "y": (0.8 * np.sin(theta)).tolist(),
+          "phi": np.ones(n).tolist(),
+      }
+      return repr(payload)

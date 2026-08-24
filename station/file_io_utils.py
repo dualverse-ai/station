@@ -20,7 +20,9 @@ saving data in YAML, YAML Lines, and plain text formats, with atomic writes.
 
 import os
 import json
+import mmap
 import shutil
+import uuid
 import yaml # Requires PyYAML: pip install PyYAML
 import re # For parsing IDs from filenames
 from typing import Any, List, Dict, Optional, Union
@@ -243,6 +245,62 @@ def _load_yaml_documents_from_text(text: str, filepath: str) -> List[Dict[str, A
         print(f"Error parsing YAML Lines window from {filepath}: {e}")
     return entries
 
+
+_YAML_DOCUMENT_SEPARATOR_BYTES = b"\n---\n"
+_TOP_LEVEL_TICK_BYTES_PATTERN = re.compile(
+    br"(?m)^tick:\s*['\"]?([+-]?\d+)['\"]?\s*$"
+)
+
+
+def _load_recent_yaml_tick_window(
+    filepath: str,
+    *,
+    tick_limit: int,
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Read the recent tick documents once, without repeatedly parsing larger tails."""
+    file_size = os.path.getsize(filepath)
+    if file_size <= 0:
+        return [], False
+
+    selected_documents: List[bytes] = []
+    unique_ticks = set()
+    saw_outside_window = False
+
+    with open(filepath, "rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            document_end = file_size
+            while document_end > 0:
+                separator_index = mapped.rfind(
+                    _YAML_DOCUMENT_SEPARATOR_BYTES,
+                    0,
+                    document_end,
+                )
+                document_start = (
+                    separator_index + len(_YAML_DOCUMENT_SEPARATOR_BYTES)
+                    if separator_index >= 0
+                    else 0
+                )
+                document = bytes(mapped[document_start:document_end])
+                tick_match = _TOP_LEVEL_TICK_BYTES_PATTERN.search(document)
+                tick = int(tick_match.group(1)) if tick_match else None
+
+                if tick is not None and tick not in unique_ticks and len(unique_ticks) >= tick_limit:
+                    saw_outside_window = True
+                    break
+
+                selected_documents.append(document)
+                if tick is not None:
+                    unique_ticks.add(tick)
+
+                if separator_index < 0:
+                    break
+                document_end = separator_index
+
+    selected_text = _YAML_DOCUMENT_SEPARATOR_BYTES.join(
+        reversed(selected_documents)
+    ).decode("utf-8", errors="replace")
+    return _load_yaml_documents_from_text(selected_text, filepath), saw_outside_window
+
 def load_yaml_lines_tick_window(
     filepath: str,
     *,
@@ -292,40 +350,10 @@ def load_yaml_lines_tick_window(
             saw_outside_window=saw_outside_window,
         )
 
-    file_size = os.path.getsize(filepath)
-    # Start small and expand until the tail contains enough unique ticks.
-    read_size = min(file_size, max(256 * 1024, tick_limit * 16 * 1024))
-    entries: List[Dict[str, Any]] = []
-    saw_outside_window = False
-
-    while True:
-        with open(filepath, "rb") as f:
-            f.seek(max(0, file_size - read_size))
-            raw = f.read(read_size)
-
-        text = raw.decode("utf-8", errors="replace")
-        if read_size < file_size:
-            sep_index = text.find("\n---\n")
-            if sep_index >= 0:
-                text = text[sep_index + 5:]
-
-        candidate_entries = _load_yaml_documents_from_text(text, filepath)
-        ticks = [entry.get("tick") for entry in candidate_entries if entry.get("tick") is not None]
-        if len(set(ticks)) >= tick_limit or read_size >= file_size:
-            unique_recent_ticks = sorted(set(ticks), reverse=True)[:tick_limit]
-            if unique_recent_ticks:
-                cutoff_tick = min(unique_recent_ticks)
-                entries = [
-                    entry for entry in candidate_entries
-                    if entry.get("tick") is None or entry.get("tick") >= cutoff_tick
-                ]
-                saw_outside_window = len(set(ticks)) > tick_limit or read_size < file_size
-            else:
-                entries = candidate_entries
-                saw_outside_window = read_size < file_size
-            break
-
-        read_size = min(file_size, read_size * 2)
+    entries, saw_outside_window = _load_recent_yaml_tick_window(
+        filepath,
+        tick_limit=tick_limit,
+    )
 
     return entries, _build_tick_window_meta(
         entries,
@@ -366,7 +394,7 @@ def save_yaml(data: Any,
     temp_path_dir = os.path.join(base_dir, constants.TEMP_DIR_NAME)
     ensure_dir_exists(temp_path_dir)
 
-    temp_file_name = f"{os.path.basename(file_path)}.{os.getpid()}.{id(data)}.tmp"
+    temp_file_name = f"{os.path.basename(file_path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     temp_file_path = os.path.join(temp_path_dir, temp_file_name)
 
     # Custom representer for multi-line strings to use literal style
@@ -423,18 +451,27 @@ def save_yaml(data: Any,
                 except OSError: # Log this if logging is available
                     pass
 
-def save_text(content: str, file_path: str) -> None:
+def save_text(content: str, file_path: str, file_mode: Optional[int] = None) -> None:
     """Saves text content to a file atomically."""
     _ensure_base_dir_exists(file_path)
     base_dir = os.path.dirname(file_path) or "."
     temp_path_dir = os.path.join(base_dir, constants.TEMP_DIR_NAME)
     ensure_dir_exists(temp_path_dir)
 
-    temp_file_name = f"{os.path.basename(file_path)}.{os.getpid()}.{id(content)}.tmp"
+    temp_file_name = f"{os.path.basename(file_path)}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     temp_file_path = os.path.join(temp_path_dir, temp_file_name)
 
     try:
-        with open(temp_file_path, 'w', encoding='utf-8') as f:
+        if file_mode is None:
+            handle = open(temp_file_path, 'w', encoding='utf-8')
+        else:
+            descriptor = os.open(
+                temp_file_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                int(file_mode),
+            )
+            handle = os.fdopen(descriptor, 'w', encoding='utf-8')
+        with handle as f:
             f.write(content)
         shutil.move(temp_file_path, file_path)
     except (IOError, OSError) as e:

@@ -23,22 +23,21 @@ import os
 import copy
 import time
 import traceback
-import subprocess
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Dict, Optional, Tuple, Type, cast
 
-from station import __version__
 from station import constants
 from station import file_io_utils
+from station import station_config
 from station import agent as agent_module
 from station import agent_summary
+from station import context_compaction
+from station import dashboard_statistics
 from station import capsule as capsule_module
 from station import capsule_index
 from station import supervisor_utils
 from station import system_messages
 from station import session_end_flow
-from station import tick_timing
 from station.action_parser import ActionParser # Assuming ActionParser is a class
 from station.lineage_evolution import LineageEvolutionManager
 from station.stagnation_protocol import StagnationProtocol
@@ -49,22 +48,21 @@ from station.rooms.lobby import LobbyRoom
 from station.rooms.reflect import ReflectionChamber
 from station.rooms.common import CommonRoom
 from station.rooms.public_memory import PublicMemoryRoom
+from station.rooms.question import QuestionRoom
 from station.rooms.private_memory import PrivateMemoryRoom 
 from station.rooms.archive import ArchiveRoom 
 from station.rooms.mail import MailRoom
 from station.rooms.misc import MiscRoom
 from station.rooms.admin import AdminCounter
-from station.rooms.token_management import TokenManagementRoom
 from station.rooms.research_center import ResearchCenter
 from station.rooms.external_counter import ExternalCounter
 from station.rooms.maze import MazeRoom
-from station.rooms.theory import TheoryRoom
 from station.rooms.exit import ExitRoom
 from station.eval_research import AutoResearchEvaluator, EvaluationManager, get_evaluation_display_info
 from station.eval_research.runtime_paths import ensure_runtime_layout
 from station.eval_archive import AutoArchiveEvaluator
+from station.eval_archive import evaluation_index as archive_evaluation_index
 from station.eval_archive.surveyor import AutoArchiveSurveyor
-from station.eval_theory import AutoTheoryEvaluator
 from station.eval_external import AutoExternalReporter
 # Add other room imports here as they are created:
 # from station.rooms.reflection_chamber import ReflectionChamber
@@ -100,97 +98,56 @@ def _merge_pending_notifications_after_turn(
     return _merge_unique_list_items(turn_pending_notifications, latest_unshown_notifications)
 
 
-def _merge_pending_dialogue_tick_protections_after_turn(
-    turn_pending_records: Any,
-    latest_pending_records: Any,
-    turn_start_pending_records: Any,
+def _merge_protected_context_items_after_turn(
+    turn_records: Any,
+    latest_records: Any,
+    turn_start_records: Any,
 ) -> List[Any]:
-    turn_values = turn_pending_records if isinstance(turn_pending_records, list) else []
-    latest_values = latest_pending_records if isinstance(latest_pending_records, list) else []
-    start_values = turn_start_pending_records if isinstance(turn_start_pending_records, list) else []
-    concurrent_values = [
-        record
-        for record in latest_values
-        if record not in start_values
-    ]
-    return _merge_unique_list_items(turn_values, concurrent_values)
-
-
-def _merge_protected_dialogue_ticks_after_turn(
-    turn_protected_records: Any,
-    latest_protected_records: Any,
-    turn_start_protected_records: Any,
-) -> List[Any]:
-    turn_values = turn_protected_records if isinstance(turn_protected_records, list) else []
-    latest_values = latest_protected_records if isinstance(latest_protected_records, list) else []
-    start_values = turn_start_protected_records if isinstance(turn_start_protected_records, list) else []
-    new_turn_values = [
-        record
-        for record in turn_values
-        if record not in start_values
-    ]
+    turn_values = turn_records if isinstance(turn_records, list) else []
+    latest_values = latest_records if isinstance(latest_records, list) else []
+    start_values = turn_start_records if isinstance(turn_start_records, list) else []
+    new_turn_values = [record for record in turn_values if record not in start_values]
     return _merge_unique_list_items(latest_values, new_turn_values)
 
 
-def _pending_notification_texts(agent_data: Dict[str, Any]) -> List[str]:
-    pending_notifications = agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, [])
-    if not isinstance(pending_notifications, list):
-        return []
-    return [
-        notification
-        for notification in pending_notifications
-        if isinstance(notification, str)
-    ]
+def _compaction_event_key(event: Any) -> Optional[int]:
+    if not isinstance(event, dict):
+        return None
+    try:
+        return int(event.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY))
+    except (TypeError, ValueError):
+        return None
 
 
-def _has_pending_help_notification(source: str, pending_texts: List[str]) -> bool:
-    if not source.startswith("room:"):
-        return False
-    short_room_name = source.removeprefix("room:")
-    full_room_name = constants.SHORT_ROOM_NAME_TO_FULL_MAP.get(short_room_name)
-    if not full_room_name:
-        return False
-    return any(f"Help for {full_room_name}:" in text for text in pending_texts)
+def _merge_context_compaction_events_after_turn(
+    turn_events: Any,
+    latest_events: Any,
+    turn_start_events: Any,
+) -> List[Any]:
+    turn_values = turn_events if isinstance(turn_events, list) else []
+    latest_values = latest_events if isinstance(latest_events, list) else []
+    start_values = turn_start_events if isinstance(turn_start_events, list) else []
 
+    merged = copy.deepcopy(latest_values)
+    index_by_key: Dict[int, int] = {}
+    for index, event in enumerate(merged):
+        key = _compaction_event_key(event)
+        if key is not None:
+            index_by_key[key] = index
 
-def _drop_stale_pending_dialogue_tick_protections(agent_data: Dict[str, Any]) -> bool:
-    if not isinstance(agent_data, dict):
-        return False
-
-    pending = agent_data.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY)
-    if not isinstance(pending, list):
-        return False
-
-    pending_texts = _pending_notification_texts(agent_data)
-    filtered_pending: List[Any] = []
-    for record in pending:
-        if not isinstance(record, dict):
-            filtered_pending.append(record)
+    for event in turn_values:
+        if event in start_values:
             continue
+        key = _compaction_event_key(event)
+        if key is not None and key in index_by_key:
+            merged[index_by_key[key]] = copy.deepcopy(event)
+        else:
+            if event not in merged:
+                if key is not None:
+                    index_by_key[key] = len(merged)
+                merged.append(copy.deepcopy(event))
 
-        reason = record.get(constants.PROTECTED_DIALOGUE_REASON_KEY)
-        source = str(record.get(constants.PROTECTED_DIALOGUE_SOURCE_KEY, ""))
-        if (
-            reason == constants.PROTECTED_DIALOGUE_REASON_RESEARCH_TASK_READ
-            and not agent_data.get(constants.AGENT_PENDING_CURRENT_RESEARCH_TASK_READ_KEY)
-        ):
-            continue
-        if (
-            reason == constants.PROTECTED_DIALOGUE_REASON_ARCHITECT_MESSAGE
-            and not any("**Architect Message**" in text for text in pending_texts)
-        ):
-            continue
-        if (
-            reason == constants.PROTECTED_DIALOGUE_REASON_ROOM_HELP
-            and not _has_pending_help_notification(source, pending_texts)
-        ):
-            continue
-        filtered_pending.append(record)
-
-    if len(filtered_pending) == len(pending):
-        return False
-    agent_data[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = filtered_pending
-    return True
+    return merged
 
 
 def _gemini_response_reminder_for_agent(agent_data: Dict[str, Any], constants_module: Any = constants) -> Optional[str]:
@@ -252,7 +209,6 @@ def _save_request_status_snapshot_atomically(
     snapshot_agent_data: Dict[str, Any],
     *,
     refresh_shown_notifications: bool = False,
-    apply_pending_protections_tick: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Persist a request-status snapshot without overwriting concurrent updates."""
     update_agent = getattr(agent_manager, "update_agent_with_function", None)
@@ -295,16 +251,16 @@ def _save_request_status_snapshot_atomically(
                     target[key] = list(snapshot_value) if isinstance(snapshot_value, list) else []
                     continue
 
-                if top_level and key == constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY:
-                    target[key] = _merge_pending_dialogue_tick_protections_after_turn(
+                if top_level and key == constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY:
+                    target[key] = _merge_protected_context_items_after_turn(
                         snapshot_value,
                         target.get(key, []),
                         start_value,
                     )
                     continue
 
-                if top_level and key == constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY:
-                    target[key] = _merge_protected_dialogue_ticks_after_turn(
+                if top_level and key == constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY:
+                    target[key] = _merge_context_compaction_events_after_turn(
                         snapshot_value,
                         target.get(key, []),
                         start_value,
@@ -329,11 +285,6 @@ def _save_request_status_snapshot_atomically(
                     target[key] = copy.deepcopy(snapshot_value)
 
         _merge_snapshot_into_target(latest_agent_data, turn_start_agent_data, snapshot_agent_data, top_level=True)
-        if apply_pending_protections_tick is not None:
-            _drop_stale_pending_dialogue_tick_protections(latest_agent_data)
-            apply_pending = getattr(agent_manager, "apply_pending_dialogue_tick_protections", None)
-            if callable(apply_pending):
-                apply_pending(latest_agent_data, apply_pending_protections_tick)
         if refresh_shown_notifications:
             latest_pending_notifications = latest_agent_data.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, [])
             if not isinstance(latest_pending_notifications, list):
@@ -344,6 +295,47 @@ def _save_request_status_snapshot_atomically(
     if not update_agent(agent_name, update_func):
         return None
     return rendered_agent_data
+
+
+def _same_tick_pending_observation(agent_data: Dict[str, Any], current_tick: int) -> Optional[str]:
+    try:
+        pending_tick = int(agent_data.get(constants.AGENT_PENDING_OBSERVATION_TICK_KEY))
+    except (TypeError, ValueError):
+        return None
+    pending_text = agent_data.get(constants.AGENT_PENDING_OBSERVATION_TEXT_KEY)
+    if pending_tick == current_tick and isinstance(pending_text, str) and pending_text.strip():
+        return pending_text
+    return None
+
+
+def _save_pending_observation_atomically(
+    agent_manager: Any,
+    agent_name: str,
+    current_tick: int,
+    observation_text: str,
+) -> bool:
+    update_agent = getattr(agent_manager, "update_agent_with_function", None)
+    if not callable(update_agent):
+        return False
+
+    def update_func(latest_agent_data: Dict[str, Any]) -> None:
+        latest_agent_data[constants.AGENT_PENDING_OBSERVATION_TICK_KEY] = current_tick
+        latest_agent_data[constants.AGENT_PENDING_OBSERVATION_TEXT_KEY] = observation_text
+
+    return bool(update_agent(agent_name, update_func))
+
+
+def _clear_pending_observation_atomically(agent_manager: Any, agent_name: str) -> bool:
+    update_agent = getattr(agent_manager, "update_agent_with_function", None)
+    if not callable(update_agent):
+        return False
+
+    def update_func(latest_agent_data: Dict[str, Any]) -> None:
+        latest_agent_data.pop(constants.AGENT_PENDING_OBSERVATION_TICK_KEY, None)
+        latest_agent_data.pop(constants.AGENT_PENDING_OBSERVATION_TEXT_KEY, None)
+
+    return bool(update_agent(agent_name, update_func))
+
 
 class Station:
     """
@@ -373,6 +365,15 @@ class Station:
         except Exception as e:
             print(f"CapsuleIndex: initialization failed: {e}")
             raise
+
+        try:
+            archive_evaluation_index.ensure_archive_evaluation_index(
+                rebuild=archive_evaluation_index.should_rebuild_from_process_args(),
+                log_status=True,
+            )
+        except Exception as e:
+            print(f"ArchiveEvalIndex: initialization failed: {e}")
+            raise
         
         self.research_eval_manager: Optional[EvaluationManager] = None
         research_paths = None
@@ -398,6 +399,7 @@ class Station:
             constants.ROOM_REFLECT: ReflectionChamber(),
             constants.ROOM_COMMON: CommonRoom(),
             constants.ROOM_PUBLIC_MEMORY: PublicMemoryRoom(),
+            constants.ROOM_QUESTION: QuestionRoom(),
             constants.ROOM_MAIL: MailRoom(),
             constants.ROOM_PRIVATE_MEMORY: PrivateMemoryRoom(), 
             constants.ROOM_ARCHIVE: ArchiveRoom(),
@@ -406,9 +408,6 @@ class Station:
             constants.ROOM_EXIT: ExitRoom(),
         }
 
-        if constants.TOKEN_MANAGEMENT_ROOM_ENABLED:
-            self.rooms[constants.ROOM_TOKEN_MANAGEMENT] = TokenManagementRoom()
-        
         # Add Research Center room
         if constants.RESEARCH_CENTER_ENABLED:
             self.rooms[constants.ROOM_RESEARCH_CENTER] = ResearchCenter(
@@ -419,10 +418,6 @@ class Station:
         # Add External Counter room
         if getattr(constants, "EXTERNAL_COUNTER_ENABLED", False):
             self.rooms[constants.ROOM_EXTERNAL_COUNTER] = ExternalCounter()
-
-        # Add Theory Room
-        if getattr(constants, "THEORY_ROOM_ENABLED", False):
-            self.rooms[constants.ROOM_THEORY] = TheoryRoom()
 
         # Add Maze room (hidden, conditionally available)
         if constants.MAZE_ENABLED:
@@ -443,9 +438,6 @@ class Station:
         # Initialize auto external reporter
         self.auto_external_reporter: Optional[AutoExternalReporter] = None
 
-        # Initialize auto theory evaluator
-        self.auto_theory_evaluator: Optional[AutoTheoryEvaluator] = None
-        
         # Initialize auto archive evaluator
         self.auto_archive_evaluator: Optional[AutoArchiveEvaluator] = None
         self.auto_archive_surveyor: Optional[AutoArchiveSurveyor] = None
@@ -460,96 +452,23 @@ class Station:
 
         print("Station initialized.")
 
-    @staticmethod
-    def _ensure_top_submission_config_defaults(config_data: Dict[str, Any]) -> None:
-        """Ensure top submission config fields exist in station config."""
-        config_data.setdefault(constants.STATION_CONFIG_TOP_EVALUATION_ID, None)
-        config_data.setdefault(constants.STATION_CONFIG_TOP_TITLE, None)
-        config_data.setdefault(constants.STATION_CONFIG_TOP_SCORE, None)
-        config_data.setdefault(constants.STATION_CONFIG_TOP_TICK, None)
-        config_data.setdefault(constants.STATION_CONFIG_TOP_AGENT_NAME, None)
-
     def _load_or_create_config(self) -> Dict[str, Any]:
         """Loads station config or creates a default one if not found."""
         config_data = file_io_utils.load_yaml(self.config_path)
         if config_data is None:
             self.is_new_station = True
             print(f"Station config not found at '{self.config_path}'. Creating default config.")
-            
-            # Get git commit hash
-            try:
-                git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'], 
-                                                  cwd=os.path.dirname(__file__),
-                                                  text=True).strip()
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                git_hash = "unknown"
-            
-            # Get current date for spawn date
-            spawn_date = datetime.now().isoformat()
-
-            # Generate station ID for new station
-            station_id = str(uuid.uuid4())
-
-            default_config = {
-                constants.STATION_CONFIG_CURRENT_TICK: 0,
-                constants.STATION_CONFIG_AGENT_TURN_ORDER: [],
-                constants.STATION_CONFIG_STATION_STATUS: "Healthy",
-                constants.STATION_CONFIG_SOFTWARE_VERSION: __version__,
-                # MODIFICATION: Add default for next agent index
-                constants.STATION_CONFIG_NEXT_AGENT_INDEX: 0,
-                # Station metadata fields
-                constants.STATION_CONFIG_NAME: "",
-                constants.STATION_CONFIG_DESCRIPTION: "",
-                constants.STATION_CONFIG_LAST_SUPERVISOR_DEPARTURE_TICK: 0,
-                constants.STATION_CONFIG_STAGNATION_COUNTER: 0,
-                constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK: None,
-                constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK: None,
-                constants.STATION_ID_KEY: station_id,
-                # Add version, git hash, and spawn date
-                'version': __version__,
-                'git_commit': git_hash,
-                'spawn_date': spawn_date,
-                # Initialize status history
-                'status_history': [
-                    {'status': 'Healthy', 'start_tick': 0}
-                ]
-            }
-            self._ensure_top_submission_config_defaults(default_config)
-            print(f"Generated new station ID: {station_id}")
+            default_config = station_config.build_default_station_config()
+            print(f"Generated new station ID: {default_config[constants.STATION_ID_KEY]}")
             file_io_utils.ensure_dir_exists(os.path.dirname(self.config_path)) # Ensure base_station_data exists
             file_io_utils.save_yaml(default_config, self.config_path)
             return default_config
         
-        # Ensure new keys have defaults if loading an older config
-        if constants.STATION_CONFIG_NEXT_AGENT_INDEX not in config_data:
-            config_data[constants.STATION_CONFIG_NEXT_AGENT_INDEX] = 0
-        if constants.STATION_CONFIG_NAME not in config_data:
-            config_data[constants.STATION_CONFIG_NAME] = ""
-        if constants.STATION_CONFIG_DESCRIPTION not in config_data:
-            config_data[constants.STATION_CONFIG_DESCRIPTION] = ""
-        if constants.STATION_CONFIG_LAST_SUPERVISOR_DEPARTURE_TICK not in config_data:
-            config_data[constants.STATION_CONFIG_LAST_SUPERVISOR_DEPARTURE_TICK] = 0
-        if constants.STATION_CONFIG_STAGNATION_COUNTER not in config_data:
-            config_data[constants.STATION_CONFIG_STAGNATION_COUNTER] = 0
-        if constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK not in config_data:
-            config_data[constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK] = None
-        if constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK not in config_data:
-            config_data[constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK] = None
-        self._ensure_top_submission_config_defaults(config_data)
-
-        # Ensure status history exists
-        if 'status_history' not in config_data:
-            current_tick = config_data.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
-            current_status = config_data.get(constants.STATION_CONFIG_STATION_STATUS, "Healthy")
-            config_data['status_history'] = [
-                {'status': current_status, 'start_tick': current_tick}
-            ]
-
-        # Ensure station has a unique ID
-        if constants.STATION_ID_KEY not in config_data or not config_data.get(constants.STATION_ID_KEY):
-            config_data[constants.STATION_ID_KEY] = str(uuid.uuid4())
-            print(f"Generated new station ID: {config_data[constants.STATION_ID_KEY]}")
-            # Save config with new station ID
+        had_station_id = bool(config_data.get(constants.STATION_ID_KEY)) if isinstance(config_data, dict) else False
+        config_data, changed = station_config.apply_station_config_defaults(config_data)
+        if changed:
+            if not had_station_id:
+                print(f"Generated new station ID: {config_data[constants.STATION_ID_KEY]}")
             file_io_utils.save_yaml(config_data, self.config_path)
 
         return config_data
@@ -563,17 +482,24 @@ class Station:
             # or if the key was somehow deleted. Default to 0.
             self.config[constants.STATION_CONFIG_NEXT_AGENT_INDEX] = 0
             print(f"Warning: '{constants.STATION_CONFIG_NEXT_AGENT_INDEX}' was missing from config during save. Defaulted to 0.")
-        self._ensure_top_submission_config_defaults(self.config)
+        station_config.ensure_top_submission_config_defaults(self.config)
 
         file_io_utils.save_yaml(self.config, self.config_path)
 
     def sync_top_research_submission_config(self, top_submission: Optional[Dict[str, Any]]) -> None:
         """Persist the current top research submission summary into station config."""
+        top_score = top_submission.get("score") if top_submission else None
+        top_sort_key = top_submission.get("sort_key") if top_submission else None
+        if top_submission and top_sort_key is None and top_score is not None:
+            top_sort_key = [top_score]
         self.config[constants.STATION_CONFIG_TOP_EVALUATION_ID] = top_submission.get("evaluation_id") if top_submission else None
         self.config[constants.STATION_CONFIG_TOP_TITLE] = top_submission.get("title") if top_submission else None
-        self.config[constants.STATION_CONFIG_TOP_SCORE] = top_submission.get("score") if top_submission else None
+        self.config[constants.STATION_CONFIG_TOP_SCORE] = top_score
+        self.config[constants.STATION_CONFIG_TOP_SORT_KEY] = copy.deepcopy(top_sort_key)
         self.config[constants.STATION_CONFIG_TOP_TICK] = top_submission.get("submitted_tick") if top_submission else None
         self.config[constants.STATION_CONFIG_TOP_AGENT_NAME] = top_submission.get("agent_name") if top_submission else None
+        self.config[constants.STATION_CONFIG_TOP_TAGS] = copy.deepcopy(top_submission.get("tags") or []) if top_submission else []
+        self.config[constants.STATION_CONFIG_TOP_ABSTRACT] = top_submission.get("abstract") or "" if top_submission else ""
         self._save_config()
 
     def update_station_status(self, new_status: str, current_tick: Optional[int] = None) -> None:
@@ -621,7 +547,6 @@ class Station:
                 # Use the new status update method to track history
                 current_tick = self.config.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
                 self.update_station_status(status, current_tick)
-                self.clear_stagnation_holiday_window()
                 if self.stagnation_protocol:
                     self.stagnation_protocol.handle_manual_status_update(status, current_tick)
                 else:
@@ -710,38 +635,12 @@ class Station:
         """Returns the current station tick from the config."""
         return self.config.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
 
-    def set_stagnation_holiday_window(self, start_tick: int, end_tick: int) -> None:
-        """Set stagnation holiday window in config (inclusive)."""
-        self.config[constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK] = int(start_tick)
-        self.config[constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK] = int(end_tick)
-
-    def clear_stagnation_holiday_window(self) -> None:
-        """Clear any stagnation-triggered holiday window."""
-        self.config[constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK] = None
-        self.config[constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK] = None
-
-    def get_stagnation_holiday_window(self) -> Tuple[Optional[int], Optional[int]]:
-        """Return stagnation holiday window as (start_tick, end_tick)."""
-        start_tick = self.config.get(constants.STATION_CONFIG_STAGNATION_HOLIDAY_START_TICK)
-        end_tick = self.config.get(constants.STATION_CONFIG_STAGNATION_HOLIDAY_END_TICK)
-        return start_tick, end_tick
-
     def is_holiday_tick(self, tick: Optional[int] = None) -> bool:
-        """
-        Check if a tick is a holiday.
-        Includes periodic holiday mode and stagnation-triggered holiday window.
-        """
+        """Check if a tick is a periodic holiday."""
         tick_to_check = self._get_current_tick() if tick is None else tick
-        periodic_holiday = (
+        return (
             constants.HOLIDAY_MODE_ENABLED and constants.is_holiday_tick(tick_to_check)
         )
-        start_tick, end_tick = self.get_stagnation_holiday_window()
-        stagnation_holiday = (
-            isinstance(start_tick, int)
-            and isinstance(end_tick, int)
-            and start_tick <= tick_to_check <= end_tick
-        )
-        return periodic_holiday or stagnation_holiday
     
     def _get_agent_dialogue_log_path(self, agent_name: str) -> str:
         """Helper to get the dialogue log file path for a specific agent."""
@@ -755,7 +654,9 @@ class Station:
         """Appends an entry to the agent's dialogue log."""
         try:
             log_path = self._get_agent_dialogue_log_path(agent_name)
-            file_io_utils.append_yaml_line(entry, log_path)
+            persisted_entry = dict(entry)
+            persisted_entry.setdefault("timestamp", time.time())
+            file_io_utils.append_yaml_line(persisted_entry, log_path)
         except Exception as e:
             print(f"Error writing to dialogue log for agent {agent_name}: {e}\n{traceback.format_exc()}")
 
@@ -1120,20 +1021,7 @@ class Station:
                 all_actions_executed_strings_for_return.extend(current_single_action_results)
                 continue
 
-            # MODIFICATION: Handle global /execute_action{help capsule}
-            if action_command == constants.ACTION_HELP and action_args == constants.SHORT_ROOM_NAME_CAPSULE_PROTOCOL:
-                notification_message = constants.TEXT_CAPSULE_PROTOCOL_HELP
-                self.agent_module.add_pending_notification(current_turn_agent_data, notification_message)
-                action_str = "The Capsule Protocol guidelines have been sent to your System Messages."
-                current_single_action_results.append(action_str)
-                
-                # Log this action to the current room the agent is in, for history consistency
-                effective_room_for_log = current_turn_agent_data[constants.AGENT_CURRENT_LOCATION_KEY]
-                if effective_room_for_log not in ordered_rooms_with_actions:
-                    ordered_rooms_with_actions.append(effective_room_for_log)
-                actions_by_room_log.setdefault(effective_room_for_log, []).append(action_str)
-
-            elif action_command == constants.ACTION_META:
+            if action_command == constants.ACTION_META:
                 # Handle universal meta prompt action
                 if yaml_data and constants.YAML_META_CONTENT in yaml_data:
                     content = yaml_data[constants.YAML_META_CONTENT]
@@ -1204,11 +1092,25 @@ class Station:
                         return message
 
                     # Check maturity restrictions for certain rooms
-                    if (target_room_full_name in [constants.ROOM_ARCHIVE, constants.ROOM_PUBLIC_MEMORY, constants.ROOM_MAIL, constants.ROOM_COMMON, constants.ROOM_EXTERNAL_COUNTER] and
+                    if (target_room_full_name in [constants.ROOM_ARCHIVE, constants.ROOM_PUBLIC_MEMORY, constants.ROOM_MAIL, constants.ROOM_COMMON] and
                           not self._is_agent_mature(current_turn_agent_data, self._get_current_tick())):
                         action_str = f"Access denied. {target_room_full_name} is restricted to mature agents ({constants.AGENT_ISOLATION_TICKS}+ ticks old). As an immature agent, you are expected to continuously research independently by proposing ideas and submitting experiments. Please do not wait idly to become mature to access the room."
                         current_single_action_results.append(action_str)
                         # Log failure in current room
+                        if room_context_for_this_action not in ordered_rooms_with_actions:
+                            ordered_rooms_with_actions.append(room_context_for_this_action)
+                        actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
+                    elif (target_room_full_name == constants.ROOM_EXTERNAL_COUNTER and
+                          not self._is_agent_external_counter_allowed(current_turn_agent_data, self._get_current_tick())):
+                        action_str = "Access denied. External Counter is restricted to tenured Recursive Agents and Supervisors."
+                        current_single_action_results.append(action_str)
+                        if room_context_for_this_action not in ordered_rooms_with_actions:
+                            ordered_rooms_with_actions.append(room_context_for_this_action)
+                        actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
+                    elif (target_room_full_name == constants.ROOM_QUESTION and
+                          not self._is_agent_question_room_allowed(current_turn_agent_data, self._get_current_tick())):
+                        action_str = "Access denied. Question Room is restricted to tenured Recursive Agents and Supervisors."
+                        current_single_action_results.append(action_str)
                         if room_context_for_this_action not in ordered_rooms_with_actions:
                             ordered_rooms_with_actions.append(room_context_for_this_action)
                         actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
@@ -1221,41 +1123,6 @@ class Station:
                         if room_context_for_this_action not in ordered_rooms_with_actions:
                             ordered_rooms_with_actions.append(room_context_for_this_action)
                         actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
-                    elif target_room_full_name == constants.ROOM_TOKEN_MANAGEMENT:
-                        # Restrict access until usage reaches pre-warning threshold
-                        is_guest_for_access = current_turn_agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST
-                        effective_max_budget_tm = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_MAX_KEY)
-                        if is_guest_for_access and effective_max_budget_tm is not None:
-                            effective_max_budget_tm = min(effective_max_budget_tm, constants.GUEST_MAX_TOKENS_CEILING)
-                        elif is_guest_for_access and effective_max_budget_tm is None:
-                            effective_max_budget_tm = constants.GUEST_MAX_TOKENS_CEILING
-
-                        current_tokens_used_tm = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY)
-                        token_count_stale_tm = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY, False)
-                        pre_warning_ratio_tm = constants.GUEST_PRE_WARNING_RATIO if is_guest_for_access else constants.RECURSIVE_PRE_WARNING_RATIO
-                        threshold_percent_tm = int(pre_warning_ratio_tm * 100)
-
-                        if (
-                            effective_max_budget_tm is None
-                            or effective_max_budget_tm <= 0
-                            or token_count_stale_tm
-                            or not isinstance(current_tokens_used_tm, (int, float))
-                        ):
-                            action_str = "Access denied. Token budget data is unavailable; try again after your next turn."
-                            current_single_action_results.append(action_str)
-                            if room_context_for_this_action not in ordered_rooms_with_actions:
-                                ordered_rooms_with_actions.append(room_context_for_this_action)
-                            actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
-                        elif current_tokens_used_tm < pre_warning_ratio_tm * effective_max_budget_tm:
-                            action_str = f"Token Management Room not needed yet. Your current token usage is below {threshold_percent_tm}%, indicating a healthy status. Please proceed with normal activities."
-                            current_single_action_results.append(action_str)
-                            if room_context_for_this_action not in ordered_rooms_with_actions:
-                                ordered_rooms_with_actions.append(room_context_for_this_action)
-                            actions_by_room_log.setdefault(room_context_for_this_action, []).append(action_str)
-                        else:
-                            # Allow navigation once threshold reached
-                            action_str = finalize_navigation(target_room_full_name, f"You went to the {target_room_full_name}.")
-                            current_single_action_results.append(action_str)
                     else:
                         # Allow navigation
                         action_str = finalize_navigation(target_room_full_name, f"You went to the {target_room_full_name}.")
@@ -1280,15 +1147,15 @@ class Station:
                     help_text = room_instance.get_help_message(current_turn_agent_data, self.room_context)
                     notification_message = f"Help for {target_room_full_name_for_help}:\n{help_text}"
                     help_source = f"room:{target_room_short_name_for_help}"
-                    help_protection_reason = None
                     help_already_shown = self.agent_module.get_agent_room_state(
                         current_turn_agent_data,
                         target_room_short_name_for_help,
                         constants.AGENT_ROOM_STATE_FIRST_VISIT_HELP_SHOWN_KEY,
                         default=False,
                     )
+                    protected_context_kind = None
                     if not help_already_shown:
-                        help_protection_reason = constants.PROTECTED_DIALOGUE_REASON_ROOM_HELP
+                        protected_context_kind = constants.PROTECTED_CONTEXT_KIND_ROOM_HELP
                         self.agent_module.set_agent_room_state(
                             current_turn_agent_data,
                             target_room_short_name_for_help,
@@ -1298,8 +1165,10 @@ class Station:
                     self.agent_module.add_pending_notification(
                         current_turn_agent_data,
                         notification_message,
-                        protection_reason=help_protection_reason,
-                        protection_source=help_source,
+                        protected_context_kind=protected_context_kind,
+                        protected_context_source=help_source,
+                        protected_context_title=f"Help Message - {target_room_full_name_for_help}",
+                        protected_context_tick=current_station_tick,
                     )
                     action_str = f"You requested help for the {target_room_full_name_for_help}. It will appear in your System Messages."
                     current_single_action_results.append(action_str)
@@ -1379,16 +1248,6 @@ class Station:
                 ordered_rooms_with_actions.append(effective_room_for_log)
             actions_by_room_log.setdefault(effective_room_for_log, []).append(ascension_action_filter_warning)
 
-        if actual_handler_from_room:
-            protection = actual_handler_from_room.get_dialogue_tick_protection()
-            if isinstance(protection, dict):
-                self.agent_module.protect_dialogue_tick(
-                    current_turn_agent_data,
-                    current_station_tick,
-                    str(protection.get("reason", "")),
-                    source=str(protection.get("source", "")),
-                )
-
         # ... (existing logic to construct turn_history_log_for_agent_file and save agent data) ...
         for room_name_hist in ordered_rooms_with_actions:
             if room_name_hist in actions_by_room_log and actions_by_room_log[room_name_hist]:
@@ -1414,20 +1273,22 @@ class Station:
                 final_agent_data_to_save.get(constants.AGENT_NOTIFICATIONS_PENDING_KEY, []),
                 shown_notifications,
             )
-            final_agent_data_to_save[constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY] = (
-                _merge_pending_dialogue_tick_protections_after_turn(
-                    current_turn_agent_data.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY, []),
-                    final_agent_data_to_save.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY, []),
-                    agent_data_at_turn_start.get(constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY, []),
+            final_agent_data_to_save[constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY] = (
+                _merge_protected_context_items_after_turn(
+                    current_turn_agent_data.get(constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY, []),
+                    final_agent_data_to_save.get(constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY, []),
+                    agent_data_at_turn_start.get(constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY, []),
                 )
             )
-            final_agent_data_to_save[constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY] = (
-                _merge_protected_dialogue_ticks_after_turn(
-                    current_turn_agent_data.get(constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY, []),
-                    final_agent_data_to_save.get(constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY, []),
-                    agent_data_at_turn_start.get(constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY, []),
+            final_agent_data_to_save[constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY] = (
+                _merge_context_compaction_events_after_turn(
+                    current_turn_agent_data.get(constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY, []),
+                    final_agent_data_to_save.get(constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY, []),
+                    agent_data_at_turn_start.get(constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY, []),
                 )
             )
+            final_agent_data_to_save.pop(constants.AGENT_PENDING_OBSERVATION_TICK_KEY, None)
+            final_agent_data_to_save.pop(constants.AGENT_PENDING_OBSERVATION_TEXT_KEY, None)
 
             # Define keys that should not be copied from current_turn_agent_data
             protected_keys = {
@@ -1435,8 +1296,10 @@ class Station:
                 constants.AGENT_IS_ASCENDED_KEY, constants.AGENT_ASCENDED_TO_NAME_KEY,
                 constants.AGENT_SESSION_ENDED_KEY, constants.AGENT_ROOM_OUTPUT_HISTORY_KEY,
                 constants.AGENT_CURRENT_LOCATION_KEY, constants.AGENT_NOTIFICATIONS_PENDING_KEY,
-                constants.AGENT_PENDING_DIALOGUE_TICK_PROTECTIONS_KEY,
-                constants.AGENT_PROTECTED_DIALOGUE_TICKS_KEY,
+                constants.AGENT_PROTECTED_CONTEXT_ITEMS_KEY,
+                constants.AGENT_CONTEXT_COMPACTION_EVENTS_KEY,
+                constants.AGENT_PENDING_OBSERVATION_TICK_KEY,
+                constants.AGENT_PENDING_OBSERVATION_TEXT_KEY,
             }
 
             # Copy all non-protected keys from current_turn_agent_data to final_agent_data_to_save
@@ -1539,6 +1402,22 @@ class Station:
                  return None, f"Agent '{agent_name}' session has ended."
             return None, f"Agent '{agent_name}' not found."
         current_station_tick = self._get_current_tick()
+        pending_observation = _same_tick_pending_observation(agent_data, current_station_tick)
+        if pending_observation is not None:
+            self._log_dialogue_entry(agent_name, {
+                "tick": current_station_tick,
+                "speaker": "Station",
+                "type": "observation",
+                "content": pending_observation,
+                "reused_pending_observation": True,
+            })
+            return pending_observation, None
+        if (
+            constants.AGENT_PENDING_OBSERVATION_TICK_KEY in agent_data
+            or constants.AGENT_PENDING_OBSERVATION_TEXT_KEY in agent_data
+        ):
+            _clear_pending_observation_atomically(self.agent_module, agent_name)
+
         turn_start_agent_data = copy.deepcopy(agent_data)
         current_turn_agent_data = copy.deepcopy(agent_data)
         markdown_lines: List[str] = []
@@ -1553,16 +1432,6 @@ class Station:
             lobby_room = cast(LobbyRoom, self.rooms[constants.ROOM_LOBBY])
             lobby_room.ensure_guest_ascension_state(current_turn_agent_data, self.room_context)
                 
-        stored_max_budget_for_warning = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_MAX_KEY) # station.py:659
-        effective_max_budget_for_warning = stored_max_budget_for_warning # station.py:659
-        is_guest_for_warning_check = current_turn_agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST # station.py:661
-        if is_guest_for_warning_check and stored_max_budget_for_warning is not None: # station.py:661
-            effective_max_budget_for_warning = min(stored_max_budget_for_warning, constants.GUEST_MAX_TOKENS_CEILING) # station.py:662
-        elif is_guest_for_warning_check and stored_max_budget_for_warning is None: # station.py:663
-             effective_max_budget_for_warning = constants.GUEST_MAX_TOKENS_CEILING # station.py:664
-        
-        current_turn_agent_data = self._check_and_apply_token_warnings(current_turn_agent_data, effective_max_budget_for_warning)
-        
         # Check for inactivity warnings
         current_turn_agent_data = self._check_and_apply_inactivity_warning(current_turn_agent_data, current_station_tick)
 
@@ -1575,13 +1444,30 @@ class Station:
         # Check for supervisor report reminders
         current_turn_agent_data = self._check_and_apply_supervisor_report_reminder(current_turn_agent_data, current_station_tick)
 
-        # Pending notification protections are queued when the message is created
-        # and applied to the tick where that message is actually rendered.
-        _drop_stale_pending_dialogue_tick_protections(current_turn_agent_data)
-        self.agent_module.apply_pending_dialogue_tick_protections(current_turn_agent_data, current_station_tick)
         if current_turn_agent_data.get(constants.AGENT_PENDING_CURRENT_RESEARCH_TASK_READ_KEY):
             current_turn_agent_data[constants.AGENT_HAS_READ_CURRENT_RESEARCH_TASK_KEY] = True
             current_turn_agent_data[constants.AGENT_PENDING_CURRENT_RESEARCH_TASK_READ_KEY] = False
+
+        pending_compaction_event = self.agent_module.get_pending_context_compaction_event(current_turn_agent_data)
+        if pending_compaction_event:
+            compacted_after_tick = pending_compaction_event.get(constants.CONTEXT_COMPACTION_COMPACTED_AFTER_TICK_KEY)
+            summary = str(pending_compaction_event.get(constants.CONTEXT_COMPACTION_SUMMARY_KEY) or "").strip()
+            protected_items = self.agent_module.get_protected_context_items(
+                current_turn_agent_data,
+                up_to_tick=compacted_after_tick,
+            )
+            intro = context_compaction.build_compaction_anchor_intro(
+                agent_name=agent_name,
+                protected_items=protected_items,
+                summary=summary,
+            )
+            markdown_lines.append(intro)
+            markdown_lines.append("\n---\n")
+            self.agent_module.mark_context_compaction_anchored(
+                current_turn_agent_data,
+                compacted_after_tick=compacted_after_tick,
+                anchor_tick=current_station_tick,
+            )
 
         # Atomically persist the warning/reminder state and re-read the latest
         # pending notifications before we mark them as shown in this turn.
@@ -1591,7 +1477,6 @@ class Station:
             turn_start_agent_data,
             current_turn_agent_data,
             refresh_shown_notifications=True,
-            apply_pending_protections_tick=current_station_tick,
         )
         if saved_turn_data is None:
             print(f"Warning: Agent '{agent_name}' data could not be reloaded while saving status snapshot.")
@@ -1617,37 +1502,6 @@ class Station:
         if meta_prompt:
             markdown_lines.append(f"- Agent Meta Prompt:\n```\n{meta_prompt}\n```")
 
-        tokens_used_so_far = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY)
-        stored_max_budget_tokens = current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_MAX_KEY)
-        token_budget_count_is_trusted = (
-            isinstance(tokens_used_so_far, (int, float))
-            and not current_turn_agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY, False)
-        )
-        
-        # MODIFICATION: Display logic considering guest ceiling
-        display_max_budget = stored_max_budget_tokens
-        is_guest_for_display = agent_status == constants.AGENT_STATUS_GUEST
-
-        if is_guest_for_display and stored_max_budget_tokens is not None:
-            display_max_budget = min(stored_max_budget_tokens, constants.GUEST_MAX_TOKENS_CEILING)
-        elif is_guest_for_display and stored_max_budget_tokens is None: # Should ideally not happen if create_guest_agent sets a default
-             display_max_budget = constants.GUEST_MAX_TOKENS_CEILING
-
-
-        pre_warning_ratio_display = constants.GUEST_PRE_WARNING_RATIO if is_guest_for_display else constants.RECURSIVE_PRE_WARNING_RATIO
-
-        if display_max_budget is not None and token_budget_count_is_trusted and display_max_budget > 0:
-            percentage_used = (tokens_used_so_far / display_max_budget) * 100
-            if percentage_used >= pre_warning_ratio_display * 100:
-                budget_line = f"- Agent Token Budget: {tokens_used_so_far:,} / {display_max_budget:,} used ({percentage_used:.0f}%)"
-                if is_guest_for_display and stored_max_budget_tokens is not None and stored_max_budget_tokens > constants.GUEST_MAX_TOKENS_CEILING:
-                    budget_line += f" (Guest ceiling of {constants.GUEST_MAX_TOKENS_CEILING:,} applied)"
-                if is_guest_for_display:
-                    budget_line += " - Critical: Ascend as soon as possible (`/execute_action{ascend_inherit}` or `/execute_action{ascend_new}`) to unlock pruning."
-                else:
-                    budget_line += f" - Critical: Please proceed to the Token Management Room ASAP by `/execute_action{{goto {constants.SHORT_ROOM_NAME_TOKEN_MANAGEMENT}}}`!"
-                markdown_lines.append(budget_line)
-        
         # Display Agent Age
         birth_tick = current_turn_agent_data.get(constants.AGENT_TICK_BIRTH_KEY)
         if birth_tick is not None:
@@ -1789,6 +1643,13 @@ class Station:
         markdown_lines.append("")
 
         markdown_output_final = "\n".join(markdown_lines)
+        if not _save_pending_observation_atomically(
+            self.agent_module,
+            agent_name,
+            current_station_tick,
+            markdown_output_final,
+        ):
+            print(f"Warning: Agent '{agent_name}' pending station observation could not be saved.")
         self._log_dialogue_entry(agent_name, {
             "tick": current_station_tick,
             "speaker": "Station",
@@ -2024,11 +1885,17 @@ class Station:
             return False
         return self.auto_external_reporter.has_pending_or_running()
 
-    def has_pending_theory_evaluations(self) -> bool:
-        """Check if there are any pending (queued) or running theory evaluations"""
-        if not self.auto_theory_evaluator:
+    def has_drainable_external_reports(self) -> bool:
+        """Check for External reports that graceful shutdown should await."""
+        if not self.auto_external_reporter:
             return False
-        return self.auto_theory_evaluator.has_pending_or_running()
+        return self.auto_external_reporter.has_drainable_pending_or_running()
+
+    def has_failed_requeued_external_reports(self) -> bool:
+        """Check for External reports that already exhausted their retry budget."""
+        if not self.auto_external_reporter:
+            return False
+        return self.auto_external_reporter.has_failed_requeued()
 
     def has_pending_archive_surveys(self) -> bool:
         """Check if there are any pending (queued) or running archive surveys."""
@@ -2038,11 +1905,13 @@ class Station:
     
     def should_wait_for_research_evaluations_at_tick_boundary(self) -> bool:
         """
-        Checks if orchestrator should wait for running research evaluations at tick boundary.
-        Returns True if any evaluation has reached its MAX_TICK limit.
+        Checks if orchestrator should wait for Research Center work at tick boundary.
+        Returns True if any active evaluation has reached its MAX_TICK limit.
         """
-        if not self.auto_research_evaluator:
+        if not (constants.AUTO_EVAL_RESEARCH and constants.RESEARCH_CENTER_ENABLED):
             return False
+        if not self.auto_research_evaluator or not self.auto_research_evaluator.is_running:
+            raise RuntimeError("Required Research evaluator is missing or stopped; refusing to advance the station tick.")
         try:
             current_tick = self._get_current_tick()
             eval_manager = getattr(self.auto_research_evaluator, 'eval_manager', None)
@@ -2062,17 +1931,6 @@ class Station:
             return self.auto_external_reporter.should_wait_at_tick(current_tick)
         except Exception as e:
             print(f"Error checking external report tick boundaries: {e}")
-            return False
-
-    def should_wait_for_theory_evaluations_at_tick_boundary(self) -> bool:
-        """Return True if a theory evaluation has reached the tick limit."""
-        if not self.auto_theory_evaluator:
-            return False
-        try:
-            current_tick = self._get_current_tick()
-            return self.auto_theory_evaluator.should_wait_at_tick(current_tick)
-        except Exception as e:
-            print(f"Error checking theory evaluation tick boundaries: {e}")
             return False
 
     def should_wait_for_archive_surveys_at_tick_boundary(self) -> bool:
@@ -2167,12 +2025,12 @@ class Station:
                 )
                 print(f"Station: Failed to start auto research evaluator after {time.perf_counter() - started_at:.3f}s")
                 self.auto_research_evaluator = None
-                return False
+                raise RuntimeError("Required Research evaluator failed to start.")
                 
         except Exception as e:
             print(f"Station: Error starting auto research evaluator after {time.perf_counter() - started_at:.3f}s: {e}")
             self.auto_research_evaluator = None
-            return False
+            raise
     
     def stop_auto_research_evaluator(self):
         """Stop the auto research evaluator"""
@@ -2212,49 +2070,13 @@ class Station:
             self.auto_external_reporter = None
             return False
 
-    def stop_auto_external_reporter(self):
+    def stop_auto_external_reporter(self, wait: bool = True):
         """Stop the auto external reporter"""
         if self.auto_external_reporter:
-            self.auto_external_reporter.stop_reporter_loop()
+            self.auto_external_reporter.stop_reporter_loop(wait=wait)
             self.auto_external_reporter = None
             print("Station: Auto external reporter stopped")
 
-    def start_auto_theory_evaluator(self, log_queue=None) -> bool:
-        """Start the auto theory evaluator if enabled"""
-        if not (getattr(constants, "AUTO_EVAL_THEORY", False) and getattr(constants, "THEORY_ROOM_ENABLED", False)):
-            print("Station: Auto theory evaluation is disabled")
-            return False
-
-        if self.auto_theory_evaluator and self.auto_theory_evaluator.is_running:
-            print("Station: Auto theory evaluator is already running")
-            return True
-
-        try:
-            if not self.auto_theory_evaluator:
-                self.auto_theory_evaluator = AutoTheoryEvaluator(
-                    station_instance=self,
-                    storage_manager=getattr(self.rooms.get(constants.ROOM_THEORY, None), "storage", None),
-                    enabled=getattr(constants, "AUTO_EVAL_THEORY", False),
-                )
-            if self.auto_theory_evaluator.start_evaluation_loop():
-                print("Station: Auto theory evaluator started successfully")
-                return True
-            else:
-                print("Station: Failed to start auto theory evaluator")
-                self.auto_theory_evaluator = None
-                return False
-        except Exception as e:
-            print(f"Station: Error starting auto theory evaluator: {e}")
-            self.auto_theory_evaluator = None
-            return False
-
-    def stop_auto_theory_evaluator(self):
-        """Stop the auto theory evaluator"""
-        if self.auto_theory_evaluator:
-            self.auto_theory_evaluator.stop_evaluation_loop()
-            self.auto_theory_evaluator = None
-            print("Station: Auto theory evaluator stopped")
-    
     def start_auto_archive_evaluator(self, log_queue=None) -> bool:
         """Start the auto archive evaluator if enabled"""
         if getattr(constants, 'EVAL_ARCHIVE_MODE', 'none') != 'auto':
@@ -2385,90 +2207,8 @@ class Station:
         return awaiting_agents
     
     def get_station_statistics(self) -> Dict[str, Any]:
-        """
-        Get station-wide statistics including pending human requests and top research submission.
-        
-        Returns:
-            Dictionary with statistics including:
-            - pending_human_requests: List of request IDs and associated agents
-            - top_research_submission: Information about the highest scoring research submission
-        """
-        current_tick_getter = getattr(self, "_get_current_tick", None)
-        current_tick = (
-            current_tick_getter()
-            if callable(current_tick_getter)
-            else self.config.get(constants.STATION_CONFIG_CURRENT_TICK, 0)
-        )
-        stats = {
-            'pending_human_requests': {
-                'request_ids': [],
-                'agents': [],
-                'agent_request_map': {}
-            },
-            'current_tick': current_tick,
-            'top_research_submission': None,
-            'running_experiments_count': 0,
-            'running_experiments': [],
-            'queued_experiments_count': 0,
-            'queued_experiments': [],
-            'running_jobs_count': 0,
-            'running_jobs': [],
-            'queued_jobs_count': 0,
-            'queued_jobs': [],
-            'tick_timing': tick_timing.get_timing_summary(),
-        }
-        
-        # Get pending human requests from Administrative Counter
-        if constants.ROOM_ADMIN in self.rooms:
-            admin_counter = self.rooms[constants.ROOM_ADMIN]
-            # Get active agents from turn order
-            active_agents = self.config.get(constants.STATION_CONFIG_AGENT_TURN_ORDER, [])
-            # Filter to only those actually awaiting intervention
-            agents_awaiting = []
-            for agent_name in active_agents:
-                fields = agent_summary.get_agent_human_intervention_fields(
-                    agent_name,
-                    base_path=self.room_context.constants_module.BASE_STATION_DATA_PATH,
-                )
-                if agent_summary.agent_has_human_intervention_request(fields):
-                    agents_awaiting.append(agent_name)
-            
-            # Get summary from administrative counter
-            summary = admin_counter.get_pending_requests_summary(active_agents=agents_awaiting)
-            stats['pending_human_requests'] = summary
-        
-        # Get comprehensive evaluation statistics from Research Evaluation Manager
-        if constants.RESEARCH_CENTER_ENABLED:
-            eval_manager = getattr(self, "research_eval_manager", None)
-            if eval_manager is None and hasattr(self, 'auto_research_evaluator') and self.auto_research_evaluator:
-                eval_manager = self.auto_research_evaluator.eval_manager
-            if eval_manager is None:
-                eval_manager = EvaluationManager()
-
-            eval_stats = eval_manager.get_evaluation_statistics()
-            if constants.RESEARCH_NO_SCORE:
-                stats['top_research_submission'] = None
-            else:
-                stats['top_research_submission'] = eval_stats['top_submission']
-            stats['running_experiments_count'] = eval_stats['running_count']
-            stats['running_experiments'] = eval_stats['running_evaluations']
-            stats['queued_experiments_count'] = eval_stats.get('queued_count', 0)
-            stats['queued_experiments'] = eval_stats.get('queued_evaluations', [])
-
-            stats['running_jobs_count'] = eval_stats['running_count']
-            stats['running_jobs'] = list(eval_stats['running_evaluations'])
-            stats['queued_jobs_count'] = eval_stats.get('queued_count', 0)
-            stats['queued_jobs'] = list(eval_stats.get('queued_evaluations', []))
-
-        auto_archive_surveyor = getattr(self, "auto_archive_surveyor", None)
-        if getattr(constants, "ARCHIVE_SURVEY_ENABLED", False) and auto_archive_surveyor:
-            survey_stats = auto_archive_surveyor.get_job_statistics()
-            stats['running_jobs'].extend(survey_stats.get('running_jobs', []))
-            stats['queued_jobs'].extend(survey_stats.get('queued_jobs', []))
-            stats['running_jobs_count'] = len(stats['running_jobs'])
-            stats['queued_jobs_count'] = len(stats['queued_jobs'])
-
-        return stats
+        """Return fast dashboard statistics without historical index scans."""
+        return dashboard_statistics.build_station_statistics(self)
     
     def _update_agent_token_usage_only(self, agent_name: str, current_session_total_tokens_used: int) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """
@@ -2485,11 +2225,10 @@ class Station:
             print(f"Warning: Agent {agent_name} not found or inactive when trying to update token usage.") # station.py:1018
             return None, None
 
-        # Keep token usage monotonic for LLM-reported counts; allow decreases only right after pruning.
+        # Keep token usage monotonic for LLM-reported counts; allow decreases after
+        # an out-of-band context compaction has reset the effective chat history.
         existing_tokens_used = agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY)
-        last_prune_tick = agent_data.get(constants.AGENT_LAST_PRUNE_ACTION_TICK_KEY)
-        current_tick = self._get_current_tick()
-        allow_decrease = last_prune_tick is not None and current_tick is not None and last_prune_tick >= current_tick - 1
+        allow_decrease = bool(agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY))
         if not allow_decrease and existing_tokens_used is not None and current_session_total_tokens_used < existing_tokens_used:
             current_session_total_tokens_used = existing_tokens_used
         agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_KEY] = current_session_total_tokens_used # station.py:1027
@@ -2547,8 +2286,6 @@ class Station:
                     constants.ACTION_GO.lower(), 
                     constants.ACTION_GO_TO.lower(),
                     constants.ACTION_EXIT_TERMINATE.lower(),
-                    constants.ACTION_PRUNE_THOUGHT.lower(),
-                    constants.ACTION_PRUNE_RESPONSE.lower(),
                     constants.ACTION_META.lower(),
                     constants.ACTION_HELP.lower()
                 ]:
@@ -2612,23 +2349,13 @@ class Station:
         """
         return system_messages.check_and_apply_supervisor_report_reminder(self, agent_data, current_tick)
 
-    def _check_and_apply_token_warnings(self, agent_data: Dict[str, Any], effective_max_budget: Optional[int]) -> Dict[str, Any]:
-        """
-        Checks token budget warnings based on current usage in agent_data
-        and adds notifications to agent_data if necessary. Updates warning sent flags in agent_data.
-        Warning flags are reset when token usage drops below respective thresholds.
-        This method expects agent_data to have the latest AGENT_TOKEN_BUDGET_CURRENT_KEY.
-        Returns the (potentially modified) agent_data.
-        """
-        return system_messages.check_and_apply_token_warnings(self, agent_data, effective_max_budget)
-
     def update_agent_token_budget(self, agent_name: str, current_session_total_tokens_used: int) -> bool: # station.py:1012
         """
         Updates the agent's token budget usage.
         Station's configured token budget is advisory only.
         Hard termination is handled separately when the provider returns a real
         context-window overflow error (LLMContextOverflowError).
-        Warnings are generated by request_status via _check_and_apply_token_warnings.
+        Automatic context compaction is checked by the orchestrator after turns.
         Returns True if the usage update succeeded, False on update failure.
         """
         # Step 1: Update token usage in the agent's data file.
@@ -2645,6 +2372,49 @@ class Station:
         # returns a real context/window overflow error.
         # Warnings will be handled by request_status.
         return True # station.py:1077
+
+    def _effective_context_token_budget(self, agent_data: Dict[str, Any]) -> Optional[int]:
+        stored_max_budget = agent_data.get(constants.AGENT_TOKEN_BUDGET_MAX_KEY)
+        effective_max_budget = stored_max_budget
+        is_guest = agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_GUEST
+        if is_guest and stored_max_budget is not None:
+            effective_max_budget = min(stored_max_budget, constants.GUEST_MAX_TOKENS_CEILING)
+        elif is_guest and stored_max_budget is None:
+            effective_max_budget = constants.GUEST_MAX_TOKENS_CEILING
+        try:
+            effective_int = int(effective_max_budget)
+        except (TypeError, ValueError):
+            return None
+        return effective_int if effective_int > 0 else None
+
+    def should_compact_agent_context(self, agent_data: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(agent_data, dict):
+            return False
+        if self.agent_module.get_pending_context_compaction_event(agent_data):
+            return False
+        if agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY):
+            return False
+        current_tokens = agent_data.get(constants.AGENT_TOKEN_BUDGET_CURRENT_KEY)
+        if not isinstance(current_tokens, (int, float)):
+            return False
+        effective_max = self._effective_context_token_budget(agent_data)
+        if effective_max is None:
+            return False
+        return (float(current_tokens) / float(effective_max)) >= constants.CONTEXT_COMPACTION_TRIGGER_RATIO
+
+    def save_context_compaction_summary(self, agent_name: str, compacted_after_tick: int, summary: str) -> bool:
+        def update_func(agent_data: Dict[str, Any]) -> None:
+            self.agent_module.add_context_compaction_event(
+                agent_data,
+                compacted_after_tick=compacted_after_tick,
+                summary=summary,
+            )
+            agent_data[constants.AGENT_TOKEN_BUDGET_CURRENT_STALE_KEY] = True
+            agent_data[constants.AGENT_TOKEN_BUDGET_STALE_REASON_KEY] = (
+                constants.TOKEN_BUDGET_STALE_REASON_CONTEXT_COMPACTED
+            )
+
+        return self.agent_module.update_agent_with_function(agent_name, update_func)
 
     def _terminate_agent_session_with_broadcast(self, agent_name: str, reason: str, critical_notification: str) -> None:
         """
@@ -2752,6 +2522,22 @@ class Station:
             return True  # No birth tick, consider mature
 
         return age_status in ("mature", "tenured")
+
+    def _is_agent_question_room_allowed(self, agent_data: Dict[str, Any], current_tick: int) -> bool:
+        """Return True when the agent may access the Question Room."""
+        if agent_data.get(constants.AGENT_STATUS_KEY) != constants.AGENT_STATUS_RECURSIVE:
+            return False
+        if supervisor_utils.is_supervisor(agent_data, constants):
+            return True
+        return self._get_agent_age_status(agent_data, current_tick) == "tenured"
+
+    def _is_agent_external_counter_allowed(self, agent_data: Dict[str, Any], current_tick: int) -> bool:
+        """Return True for Supervisors or tenured Recursive Agents."""
+        if agent_data.get(constants.AGENT_STATUS_KEY) != constants.AGENT_STATUS_RECURSIVE:
+            return False
+        if supervisor_utils.is_supervisor(agent_data, constants):
+            return True
+        return self._get_agent_age_status(agent_data, current_tick) == "tenured"
     
     def _check_and_notify_maturity(self, agent_name: str, agent_data: Dict[str, Any], current_tick: int) -> None:
         """

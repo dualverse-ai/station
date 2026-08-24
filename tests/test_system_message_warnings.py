@@ -1,4 +1,5 @@
 import unittest
+import types
 
 from station import constants
 from station import system_messages
@@ -27,6 +28,84 @@ class FakeStation:
 
 
 class SystemMessageWarningTests(unittest.TestCase):
+    def test_life_warning_requires_abandoned_route_handoff(self):
+        agent_data = {
+            constants.AGENT_TICK_BIRTH_KEY: 0,
+            constants.AGENT_MAX_AGE_KEY: 30,
+            constants.AGENT_NOTIFICATIONS_PENDING_KEY: [],
+        }
+        station = FakeStation()
+
+        system_messages.check_and_apply_life_warnings(station, agent_data, current_tick=20)
+
+        notification = agent_data[constants.AGENT_NOTIFICATIONS_PENDING_KEY][0]
+        self.assertIn("leave a clear draft and handoff", notification)
+        self.assertIn("your descendant can polish and publish it", notification)
+        self.assertIn("every significant direction you demoted or abandoned", notification)
+        self.assertIn("what evidence could revive it", notification)
+        self.assertIn("where the relevant artifacts can be found", notification)
+
+    def test_tenured_prompt_audience(self):
+        self.assertTrue(
+            system_messages.prompt_audience_matches(
+                {"tenured"},
+                is_supervisor=False,
+                is_tenured=True,
+            )
+        )
+        self.assertFalse(
+            system_messages.prompt_audience_matches(
+                {"tenured"},
+                is_supervisor=False,
+                is_tenured=False,
+            )
+        )
+
+        eligible = [("tenured tip", {"tenured"}), ("general tip", {"all"})]
+        agent_data = {constants.AGENT_NAME_KEY: "Ada"}
+        self.assertEqual(
+            system_messages.select_prompt_candidates_for_agent(
+                eligible,
+                [],
+                agent_data,
+                is_tenured=False,
+            ),
+            ["general tip"],
+        )
+        self.assertEqual(
+            system_messages.select_prompt_candidates_for_agent(
+                eligible,
+                [],
+                agent_data,
+                is_tenured=True,
+            ),
+            ["tenured tip", "general tip"],
+        )
+
+    def test_prompt_conditions_support_numeric_comparisons(self):
+        constants_module = types.SimpleNamespace(RESEARCH_MAX_CONCURRENT_SUBMISSIONS=2)
+
+        self.assertTrue(
+            system_messages.is_prompt_condition_met(
+                "RESEARCH_MAX_CONCURRENT_SUBMISSIONS >= 2",
+                constants_module,
+            )
+        )
+        self.assertFalse(
+            system_messages.is_prompt_condition_met(
+                "RESEARCH_MAX_CONCURRENT_SUBMISSIONS > 2",
+                constants_module,
+            )
+        )
+
+        constants_module.RESEARCH_MAX_CONCURRENT_SUBMISSIONS = 1
+        self.assertFalse(
+            system_messages.is_prompt_condition_met(
+                "RESEARCH_MAX_CONCURRENT_SUBMISSIONS >= 2",
+                constants_module,
+            )
+        )
+
     def test_goto_only_warning_is_sent_once_per_agent_lifetime(self):
         agent_data = {
             constants.AGENT_STATUS_KEY: constants.AGENT_STATUS_RECURSIVE,

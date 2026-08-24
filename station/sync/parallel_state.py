@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 import yaml
 
+from station import agent as agent_module
 from station import constants, file_io_utils
 
 
@@ -54,6 +56,7 @@ class ParallelTickState:
 
     def begin_tick(self, tick: int, turn_order: Iterable[str], eval_manager: Any = None) -> Dict[str, Any]:
         self.ensure_layout()
+        self.cleanup_completed_run_dirs(tick)
         run_id = uuid.uuid4().hex
         state = {
             "schema_version": 1,
@@ -181,6 +184,54 @@ class ParallelTickState:
         state["completed_timestamp"] = time.time()
         self.save_current(state)
         self.clear_current()
+        self.cleanup_completed_run_dirs(state.get("tick"), exclude_run_id=str(state.get("run_id") or ""))
+
+    def cleanup_completed_run_dirs(
+        self,
+        current_tick: Any,
+        *,
+        retention_ticks: Optional[int] = None,
+        exclude_run_id: str = "",
+    ) -> List[str]:
+        """Remove old completed parallel tick prompt/response snapshot directories."""
+        try:
+            effective_current_tick = int(current_tick)
+        except (TypeError, ValueError):
+            return []
+
+        if retention_ticks is None:
+            retention_ticks = int(getattr(constants, "PARALLEL_TICK_SNAPSHOT_RETENTION_TICKS", 10))
+        try:
+            retention_ticks = int(retention_ticks)
+        except (TypeError, ValueError):
+            retention_ticks = 10
+        if retention_ticks < 0:
+            return []
+
+        if not os.path.isdir(self.run_dir):
+            return []
+
+        removed: List[str] = []
+        pattern = re.compile(r"^tick_(\d+)_([^/]+)$")
+        for entry_name in os.listdir(self.run_dir):
+            match = pattern.match(entry_name)
+            if not match:
+                continue
+            run_tick = self._coerce_int(match.group(1))
+            run_id = match.group(2)
+            if run_tick is None or run_id == exclude_run_id:
+                continue
+            if effective_current_tick - run_tick < retention_ticks:
+                continue
+            entry_path = os.path.join(self.run_dir, entry_name)
+            if not os.path.isdir(entry_path):
+                continue
+            try:
+                shutil.rmtree(entry_path)
+                removed.append(entry_path)
+            except Exception as exc:
+                print(f"ParallelTickState: failed to remove old snapshot dir {entry_path}: {exc}")
+        return removed
 
     def write_agent_text(
         self,
@@ -209,7 +260,7 @@ class ParallelTickState:
         it clears stale response flags and resets the saved agent index to 0 so
         the tick is retried from a clean tick boundary. Fast-lane Research
         evaluations and Archive surveys have explicit provisional metadata and
-        can be removed.
+        can be rolled back.
         """
 
         state = self.load_current()
@@ -322,12 +373,12 @@ class ParallelTickState:
             eval_run_id = str(parallel_meta.get("run_id") or "")
             numeric_id = self._coerce_int(eval_id_text)
 
-            should_delete = status == "provisional" and (
+            should_rollback = status == "provisional" and (
                 eval_id_text in explicit_ids
                 or (run_id and eval_run_id == run_id)
                 or (baseline is not None and numeric_id is not None and numeric_id > baseline)
             )
-            if should_delete:
+            if should_rollback:
                 candidates.append(eval_id_text)
 
         if not candidates:
@@ -338,10 +389,55 @@ class ParallelTickState:
         rolled_back: List[str] = []
         for eval_id in candidates:
             try:
-                if hasattr(eval_manager, "delete_evaluation") and eval_manager.delete_evaluation(eval_id):
+                eval_data = eval_manager.get_evaluation(eval_id) or {}
+                author = str(eval_data.get("author") or "")
+                notification_message = str((eval_data.get("notification") or {}).get("message") or "")
+                reason = "Rolled back incomplete parallel tick provisional submission."
+
+                def mark_rolled_back(record: Dict[str, Any]) -> None:
+                    now = time.time()
+                    record["parallel_commit_status"] = "rolled_back"
+                    parallel_meta = record.setdefault("parallel_tick", {})
+                    parallel_meta["rolled_back_timestamp"] = now
+                    parallel_meta["rollback_reason"] = reason
+                    record["status"] = "blocked"
+                    record["final"] = {
+                        "status": "blocked",
+                        "attempt": None,
+                        "primary_score": constants.RESEARCH_SCORE_NA,
+                        constants.EVALUATION_DETAILS_KEY: {"Message": reason},
+                        "sort_key": None,
+                        "progress_records": [],
+                        "artifacts": {},
+                        "error": reason,
+                    }
+                    for stage_name in ("coder", "audit"):
+                        stage = record.setdefault(stage_name, {})
+                        stage.update({
+                            "active": False,
+                            "active_pid": None,
+                            "status": "blocked",
+                            "completed_timestamp": now,
+                            "last_error": reason,
+                        })
+                    for attempt in record.get("attempts") or []:
+                        if str(attempt.get("status") or "").strip().lower() in {"queued", "running"}:
+                            attempt["status"] = "abandoned"
+                            attempt["completed_timestamp"] = attempt.get("completed_timestamp") or now
+                            attempt["error"] = reason
+                    record["notification"] = {
+                        "sent": True,
+                        "sent_timestamp": now,
+                        "message": None,
+                        "suppressed": True,
+                    }
+
+                if eval_manager.update_evaluation(eval_id, mark_rolled_back):
+                    if author and notification_message:
+                        agent_module.remove_pending_notification_atomic(author, notification_message)
                     rolled_back.append(str(eval_id))
             except Exception as exc:
-                print(f"ParallelTickState: failed to delete provisional evaluation {eval_id}: {exc}")
+                print(f"ParallelTickState: failed to roll back provisional evaluation {eval_id}: {exc}")
         return rolled_back
 
     def rollback_provisional_archive_surveys(self, state: Optional[Dict[str, Any]]) -> List[str]:

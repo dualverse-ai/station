@@ -34,6 +34,7 @@ from station import constants
 from station import file_io_utils
 from station import system_messages
 from station import capsule as capsule_module
+from station.eval_archive import evaluation_index as archive_evaluation_index
 from station.eval_research import build_evaluation_previews
 from station.eval_research.runtime_paths import load_task_spec_markdown
 from station.llm_connectors import create_llm_connector, LLMTransientAPIError, LLMPermanentAPIError, LLMSafetyBlockError, LLMContextOverflowError
@@ -47,6 +48,7 @@ class AutoArchiveEvaluator:
     
     # Class-level tracking to prevent duplicate instances
     _active_instances = {}
+    _PRUNED_HISTORY_ARCHIVE_DIR_NAME = "pruned_llm_history"
     
     def __init__(self, station_instance, room_context, enabled: bool = None, model_name: str = None, model_class: str = None, log_queue: Optional[Queue] = None):
         # Check for existing instances
@@ -86,11 +88,17 @@ class AutoArchiveEvaluator:
         self.evaluations_dir = os.path.join(self.archive_room_path, constants.ARCHIVE_EVALUATIONS_SUBDIR_NAME)
         
         if self.enabled:
-            self._initialize_llm_connector()
             self._load_evaluation_tick_counter()
+            # Compact already-pruned reviewer turns before connector startup so
+            # provider sessions and dashboard context start from the small live view.
+            if self.evaluation_tick_counter > 1:
+                self._compact_history_for_existing_pruning()
+            self._initialize_llm_connector()
             # Refresh tick 1 on restart if we have existing evaluation history
             if self.evaluation_tick_counter > 1:
-                self._update_initial_context_in_history_file()
+                context_changed = self._update_initial_context_in_history_file()
+                if context_changed:
+                    self._reload_llm_connector_from_disk()
 
         # Register this instance
         self._active_instances[station_id] = self
@@ -291,6 +299,249 @@ class AutoArchiveEvaluator:
                 "file": self.pending_archive_file
             })
             return []
+
+    def _get_reviewer_history_file_path(self) -> str:
+        """Return the reviewer LLM history file path with or without a live connector."""
+        if self.llm_connector and getattr(self.llm_connector, "history_file_path", None):
+            return self.llm_connector.history_file_path
+        return os.path.join(self.archive_room_path, "llm_chat_history.yamll")
+
+    def _coerce_tick(self, value: Any) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_prune_ticks_input(self, ticks_input: Any) -> set:
+        """Parse a pruning ticks value into concrete tick integers."""
+        if ticks_input is None:
+            return set()
+        if isinstance(ticks_input, int):
+            return {ticks_input}
+        if isinstance(ticks_input, (list, tuple, set)):
+            ticks = set()
+            for item in ticks_input:
+                tick = self._coerce_tick(item)
+                if tick is not None:
+                    ticks.add(tick)
+            return ticks
+
+        ticks = set()
+        for part in str(ticks_input).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_text, end_text = part.split("-", 1)
+                start = self._coerce_tick(start_text.strip())
+                end = self._coerce_tick(end_text.strip())
+                if start is None or end is None:
+                    continue
+                if end < start:
+                    start, end = end, start
+                ticks.update(range(start, end + 1))
+            else:
+                tick = self._coerce_tick(part)
+                if tick is not None:
+                    ticks.add(tick)
+        return ticks
+
+    def _format_tick_ranges(self, ticks: List[int]) -> List[str]:
+        """Render sorted ticks as compact consecutive range strings."""
+        sorted_ticks = sorted({tick for tick in ticks if tick is not None})
+        if not sorted_ticks:
+            return []
+
+        ranges = []
+        start = sorted_ticks[0]
+        end = sorted_ticks[0]
+        for tick in sorted_ticks[1:]:
+            if tick == end + 1:
+                end = tick
+                continue
+            ranges.append(str(start) if start == end else f"{start}-{end}")
+            start = end = tick
+        ranges.append(str(start) if start == end else f"{start}-{end}")
+        return ranges
+
+    def _coerce_prune_blocks(self, prune_blocks: Any) -> List[Dict[str, Any]]:
+        """Normalize old/new prune block containers to the current list-of-blocks shape."""
+        if isinstance(prune_blocks, list):
+            return [block for block in prune_blocks if isinstance(block, dict)]
+        if isinstance(prune_blocks, dict):
+            coerced_blocks = []
+            for ticks_input, summary in prune_blocks.items():
+                coerced_blocks.append({
+                    constants.PRUNE_TICKS_KEY: str(ticks_input),
+                    constants.PRUNE_SUMMARY_KEY: "" if summary is None else str(summary),
+                })
+            return coerced_blocks
+        return []
+
+    def _split_prune_blocks(self, prune_blocks: Any) -> Tuple[set, List[Dict[str, Any]]]:
+        """
+        Return complete-removal ticks plus non-empty-summary blocks.
+
+        Empty summaries mean complete removal and can be represented canonically.
+        Non-empty summaries carry content and must be preserved as-is.
+        """
+        empty_summary_ticks = set()
+        preserved_blocks = []
+        for block in self._coerce_prune_blocks(prune_blocks):
+            summary = block.get(constants.PRUNE_SUMMARY_KEY, "")
+            ticks = self._parse_prune_ticks_input(block.get(constants.PRUNE_TICKS_KEY))
+            if str(summary or "").strip():
+                preserved_blocks.append(dict(block))
+            else:
+                empty_summary_ticks.update(ticks)
+        return empty_summary_ticks, preserved_blocks
+
+    def _build_empty_prune_blocks(self, ticks: set) -> List[Dict[str, str]]:
+        return [
+            {
+                constants.PRUNE_TICKS_KEY: range_str,
+                constants.PRUNE_SUMMARY_KEY: "",
+            }
+            for range_str in self._format_tick_ranges(list(ticks))
+        ]
+
+    def _canonicalize_prune_blocks(
+        self,
+        prune_blocks: Any,
+        additional_ticks: List[int],
+    ) -> List[Dict[str, Any]]:
+        empty_summary_ticks, preserved_blocks = self._split_prune_blocks(prune_blocks)
+        for tick in additional_ticks or []:
+            tick_int = self._coerce_tick(tick)
+            if tick_int is not None and tick_int != 1:
+                empty_summary_ticks.add(tick_int)
+        return preserved_blocks + self._build_empty_prune_blocks(empty_summary_ticks)
+
+    def _render_yaml_documents(self, documents: List[Dict[str, Any]]) -> str:
+        rendered_parts = []
+        for document in documents:
+            yaml_str = yaml.dump(document, default_flow_style=False, allow_unicode=True).strip()
+            rendered_parts.append(yaml_str + "\n---\n")
+        return "".join(rendered_parts)
+
+    def _pruned_history_archive_dir(self) -> str:
+        return os.path.join(self.archive_room_path, self._PRUNED_HISTORY_ARCHIVE_DIR_NAME)
+
+    def _archive_pruned_history_entries(
+        self,
+        entries_to_archive: List[Dict[str, Any]],
+        ticks_to_archive: set,
+        history_file_path: str,
+    ) -> str:
+        archive_dir = self._pruned_history_archive_dir()
+        file_io_utils.ensure_dir_exists(archive_dir)
+
+        tick_ranges = self._format_tick_ranges(list(ticks_to_archive))
+        if not tick_ranges:
+            tick_label = "none"
+        elif len(tick_ranges) <= 3:
+            tick_label = "_".join(tick_ranges)
+        else:
+            tick_label = f"{min(ticks_to_archive)}-{max(ticks_to_archive)}_{len(tick_ranges)}ranges"
+        tick_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", tick_label)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_filename = (
+            f"auto_archive_pruned_{timestamp}_ticks_{tick_label}_"
+            f"{uuid.uuid4().hex[:8]}.yamll"
+        )
+        archive_path = os.path.join(archive_dir, archive_filename)
+        metadata = {
+            "archive_type": "auto_archive_evaluator_pruned_history",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_history_file": history_file_path,
+            "ticks": ",".join(tick_ranges),
+            "entry_count": len(entries_to_archive),
+        }
+        file_io_utils.save_text(
+            self._render_yaml_documents([metadata] + entries_to_archive),
+            archive_path,
+        )
+        return archive_path
+
+    def _compact_history_file_for_pruned_ticks(self, ticks_to_prune: List[int]) -> bool:
+        """Move complete-removal pruned entries out of the live reviewer history file."""
+        prune_ticks = {
+            tick
+            for tick in (self._coerce_tick(tick) for tick in ticks_to_prune or [])
+            if tick is not None and tick != 1
+        }
+        if not prune_ticks:
+            return False
+
+        history_file_path = self._get_reviewer_history_file_path()
+        if not file_io_utils.file_exists(history_file_path):
+            return False
+
+        history_entries = file_io_utils.load_yaml_lines(history_file_path)
+        if not history_entries:
+            return False
+
+        entries_to_keep = []
+        entries_to_archive = []
+        archived_ticks = set()
+        for entry in history_entries:
+            tick = self._coerce_tick(entry.get("tick")) if isinstance(entry, dict) else None
+            if tick in prune_ticks:
+                entries_to_archive.append(entry)
+                archived_ticks.add(tick)
+            else:
+                entries_to_keep.append(entry)
+
+        if not entries_to_archive:
+            return False
+
+        new_live_content = self._render_yaml_documents(entries_to_keep)
+        current_live_content = file_io_utils.load_text(history_file_path) or ""
+        if current_live_content == new_live_content:
+            return False
+
+        archive_path = self._archive_pruned_history_entries(
+            entries_to_archive,
+            archived_ticks,
+            history_file_path,
+        )
+        file_io_utils.save_text(new_live_content, history_file_path)
+        print(
+            "AutoArchiveEvaluator: Compacted reviewer history, moved "
+            f"{len(entries_to_archive)} entries to {archive_path}"
+        )
+        return True
+
+    def _compact_history_for_existing_pruning(self) -> bool:
+        """Apply physical compaction for already-recorded complete-removal prune blocks."""
+        try:
+            evaluator_agent_data = self.station.agent_module.load_agent_data(
+                "AutoArchiveEvaluator", include_ended=True, include_ascended=True
+            )
+            if not evaluator_agent_data:
+                return False
+            current_prune_blocks = evaluator_agent_data.get(constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY, [])
+            empty_summary_ticks, _ = self._split_prune_blocks(current_prune_blocks)
+            compacted = self._compact_history_file_for_pruned_ticks(list(empty_summary_ticks))
+            canonicalized = self._update_evaluator_pruning_info([])
+            return compacted or canonicalized
+        except Exception as e:
+            print(f"AutoArchiveEvaluator: Failed to compact existing pruned history: {e}")
+            return False
+
+    def _reload_llm_connector_from_disk(self):
+        """Reload connector state after changing the canonical reviewer history file."""
+        if not self.llm_connector:
+            return
+        try:
+            reload_fn = getattr(self.llm_connector, "reload_session_from_disk", None)
+            if callable(reload_fn):
+                reload_fn()
+            else:
+                self.llm_connector._initialize_chat_session()
+        except Exception as e:
+            print(f"AutoArchiveEvaluator: Failed to reload LLM connector after history update: {e}")
     
     def _manage_llm_history_size(self):
         """Manage LLM chat history size using the existing pruning mechanism"""
@@ -329,10 +580,13 @@ class AutoArchiveEvaluator:
                 if ticks_to_prune:
                     # Update the evaluator's agent data with pruning info
                     # The base connector will load this automatically in send_message()
-                    self._update_evaluator_pruning_info(ticks_to_prune)
+                    pruning_changed = self._update_evaluator_pruning_info(ticks_to_prune)
+                    compacted = self._compact_history_file_for_pruned_ticks(ticks_to_prune)
                     
                     # Refresh initial context with fresh research task and archive data
-                    self._update_initial_context_in_history_file()
+                    context_changed = self._update_initial_context_in_history_file()
+                    if pruning_changed or compacted or context_changed:
+                        self._reload_llm_connector_from_disk()
                     
                     print(f"AutoArchiveEvaluator: Marked {len(ticks_to_prune)} old evaluations for pruning and refreshed initial context")
                     
@@ -367,13 +621,16 @@ class AutoArchiveEvaluator:
             print(f"AutoArchiveEvaluator: Pruning {len(ticks_to_prune)} ticks for overflow recovery: {ticks_to_prune}")
             
             # Update pruning info
-            self._update_evaluator_pruning_info(ticks_to_prune)
+            pruning_changed = self._update_evaluator_pruning_info(ticks_to_prune)
+            compacted = self._compact_history_file_for_pruned_ticks(ticks_to_prune)
             
             # Refresh initial context with fresh data
-            self._update_initial_context_in_history_file()
+            context_changed = self._update_initial_context_in_history_file()
             
             # Note: LLM connector will automatically detect pruning changes and re-initialize
             # its session on the next send_message() call
+            if pruning_changed or compacted or context_changed:
+                self._reload_llm_connector_from_disk()
             
             print(f"AutoArchiveEvaluator: Context overflow recovery completed, pruned {len(ticks_to_prune)} ticks")
             return True
@@ -383,7 +640,7 @@ class AutoArchiveEvaluator:
             traceback.print_exc()
             return False
     
-    def _update_evaluator_pruning_info(self, ticks_to_prune: List[int]):
+    def _update_evaluator_pruning_info(self, ticks_to_prune: List[int]) -> bool:
         """Update the evaluator's agent data with new pruning information using YAML block format"""
         try:
             # Load existing evaluator agent data or create new
@@ -393,48 +650,24 @@ class AutoArchiveEvaluator:
 
             # Get existing prune blocks
             current_prune_blocks = evaluator_agent_data.get(constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY, [])
+            canonical_prune_blocks = self._canonicalize_prune_blocks(
+                current_prune_blocks,
+                ticks_to_prune,
+            )
 
-            # Convert ticks to consecutive ranges for efficient storage
-            if ticks_to_prune:
-                # Sort ticks and group into consecutive ranges
-                sorted_ticks = sorted(ticks_to_prune)
-                ranges = []
-                start = sorted_ticks[0]
-                end = sorted_ticks[0]
-
-                for tick in sorted_ticks[1:]:
-                    if tick == end + 1:
-                        end = tick
-                    else:
-                        # Add completed range
-                        if start == end:
-                            ranges.append(str(start))
-                        else:
-                            ranges.append(f"{start}-{end}")
-                        start = end = tick
-
-                # Add final range
-                if start == end:
-                    ranges.append(str(start))
-                else:
-                    ranges.append(f"{start}-{end}")
-
-                # Create new prune blocks for each range (with empty summary for complete removal)
-                for range_str in ranges:
-                    new_block = {
-                        constants.PRUNE_TICKS_KEY: range_str,
-                        constants.PRUNE_SUMMARY_KEY: ""  # Empty summary = complete removal
-                    }
-                    current_prune_blocks.append(new_block)
+            if canonical_prune_blocks == self._coerce_prune_blocks(current_prune_blocks):
+                return False
 
             # Update agent data with new block format
-            evaluator_agent_data[constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY] = current_prune_blocks
+            evaluator_agent_data[constants.AGENT_PRUNED_DIALOGUE_TICKS_KEY] = canonical_prune_blocks
 
             # Save the updated agent data
             self.station.agent_module.save_agent_data("AutoArchiveEvaluator", evaluator_agent_data)
+            return True
 
         except Exception as e:
             print(f"AutoArchiveEvaluator: Failed to update pruning info: {e}")
+            return False
     
     def _create_evaluator_agent_data(self) -> Dict[str, Any]:
         """Create minimal agent data structure for the evaluator"""
@@ -531,11 +764,22 @@ class AutoArchiveEvaluator:
                         print(f"AutoArchiveEvaluator: Max context overflow retries exceeded for {agent_name}")
                         raise Exception(f"Context overflow could not be resolved after {max_overflow_retries} attempts")
             
-            # Parse evaluation result
-            evaluation_result = self._parse_evaluation_response(llm_response)
+            # Parse evaluation result, asking the reviewer to reformat once if
+            # the response does not contain extractable comment/suggestion YAML.
+            evaluation_result, format_retry_data = self._parse_evaluation_with_format_retry(
+                llm_response=llm_response,
+                current_eval_tick=current_eval_tick,
+            )
             
             # Save evaluation log
-            self._save_evaluation_log(archive_entry, evaluation_prompt, llm_response, thinking_text, evaluation_result)
+            self._save_evaluation_log(
+                archive_entry,
+                evaluation_prompt,
+                llm_response,
+                thinking_text,
+                evaluation_result,
+                format_retry_data=format_retry_data,
+            )
             
             # Process evaluation result (create capsule if accepted, notify agent)
             self._process_evaluation_result(archive_entry, evaluation_result)
@@ -792,6 +1036,103 @@ class AutoArchiveEvaluator:
             })
             return False, {"error": error_message}
     
+    def _parse_evaluation_with_format_retry(self, llm_response: str, current_eval_tick: int) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Parse reviewer output, retrying once when required YAML fields are missing."""
+        evaluation_result = self._parse_evaluation_response(llm_response)
+        if not self._needs_format_retry(evaluation_result):
+            return evaluation_result, None
+
+        retry_prompt = self._create_format_retry_prompt()
+        retry_response = None
+        retry_thinking_text = None
+        retry_success = False
+        retry_error = None
+
+        print("AutoArchiveEvaluator: Reviewer response missing required YAML fields; requesting format-only retry")
+        self._push_log_event("auto_eval_event", {
+            "status": "format_retry",
+            "message": "Reviewer response was not valid YAML with score/comment/suggestion; requesting corrected YAML"
+        })
+
+        try:
+            retry_response, retry_thinking_text, retry_success = self._get_llm_evaluation(
+                retry_prompt,
+                current_eval_tick,
+            )
+        except LLMContextOverflowError:
+            raise
+        except Exception as exc:
+            retry_error = f"{type(exc).__name__}: {exc}"
+            retry_success = False
+
+        retry_result = self._parse_evaluation_response(retry_response or "") if retry_success and retry_response else None
+        format_retry_data = {
+            "prompt": retry_prompt,
+            "response": retry_response,
+            "thinking_text": retry_thinking_text,
+            "success": retry_success,
+            "error": retry_error,
+            "parsed_result": retry_result,
+        }
+
+        if retry_result and not self._needs_format_retry(retry_result):
+            return retry_result, format_retry_data
+
+        fallback_response = llm_response
+        fallback_score = self._choose_fallback_score(evaluation_result, retry_result)
+        fallback_result = self._build_raw_response_fallback_result(fallback_response, fallback_score)
+        format_retry_data["fallback_used"] = True
+        return fallback_result, format_retry_data
+
+    def _create_format_retry_prompt(self) -> str:
+        additional_fields = getattr(constants, 'AUTO_EVAL_ARCHIVE_ADDITIONAL_FIELDS', None) or []
+        additional_field_lines = ""
+        if additional_fields:
+            additional_field_lines = "\n" + "\n".join(f"{field}: <required value>" for field in additional_fields)
+
+        return (
+            "Your previous archive review response could not be parsed as a complete final YAML review.\n\n"
+            "Do not re-review the paper. Keep the same decision and feedback from your previous response, "
+            "but return ONLY a YAML document with no markdown fences, no headings, no Thinking section, "
+            "and no Response label.\n\n"
+            "Required format:\n"
+            "score: <integer from 1 to 10>\n"
+            "comment: <non-empty review comment>\n"
+            "suggestion: <non-empty future-work suggestion>"
+            f"{additional_field_lines}"
+        )
+
+    @staticmethod
+    def _needs_format_retry(evaluation_result: Dict[str, Any]) -> bool:
+        if evaluation_result.get("evaluation_status") != "success":
+            return True
+
+        comment = str(evaluation_result.get("comment", "") or "").strip()
+        suggestion = str(evaluation_result.get("suggestion", "") or "").strip()
+        return not comment or not suggestion
+
+    @staticmethod
+    def _choose_fallback_score(initial_result: Dict[str, Any], retry_result: Optional[Dict[str, Any]]) -> int:
+        for result in (retry_result, initial_result):
+            if not result:
+                continue
+            try:
+                score = int(result.get("score", 1))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= score <= 10:
+                return score
+        return 1
+
+    @staticmethod
+    def _build_raw_response_fallback_result(raw_response: str, score: int) -> Dict[str, Any]:
+        return {
+            "score": score,
+            "comment": str(raw_response or "").strip(),
+            "suggestion": "",
+            "evaluation_status": "format_retry_fallback"
+        }
+
     def _parse_evaluation_response(self, llm_response: str) -> Dict[str, Any]:
         """Parse evaluation result from LLM response"""
         def _build_result(parsed_yaml: Dict[str, Any]) -> Dict[str, Any]:
@@ -806,12 +1147,22 @@ class AutoArchiveEvaluator:
             except (ValueError, TypeError):
                 score = 1  # Default to lowest score if invalid
             
+            comment = str(parsed_yaml.get("comment", "") or "").strip()
+            suggestion = str(parsed_yaml.get("suggestion", "") or "").strip()
+            missing_required_fields = []
+            if not comment:
+                missing_required_fields.append("comment")
+            if not suggestion:
+                missing_required_fields.append("suggestion")
+
             result = {
                 "score": score,
-                "comment": str(parsed_yaml.get("comment", "No comment provided")),
-                "suggestion": str(parsed_yaml.get("suggestion", "No suggestion provided")),
-                "evaluation_status": "success"
+                "comment": comment,
+                "suggestion": suggestion,
+                "evaluation_status": "success" if not missing_required_fields else "missing_required_fields"
             }
+            if missing_required_fields:
+                result["missing_required_fields"] = missing_required_fields
             
             # Handle additional fields if configured
             additional_fields = getattr(constants, 'AUTO_EVAL_ARCHIVE_ADDITIONAL_FIELDS', None)
@@ -834,23 +1185,13 @@ class AutoArchiveEvaluator:
                         result[field_name] = None
             return result
 
-        # Look for YAML block in the response
-        lines = llm_response.split('\n')
-        yaml_start = -1
-        yaml_end = -1
-        
-        for i, line in enumerate(lines):
-            if '```yaml' in line.lower():
-                yaml_start = i + 1
-            elif yaml_start != -1 and '```' in line:
-                yaml_end = i
-                break
-        
-        if yaml_start != -1 and yaml_end != -1:
-            yaml_content = '\n'.join(lines[yaml_start:yaml_end])
+        def _try_parse_yaml(yaml_content: str) -> Optional[Dict[str, Any]]:
+            yaml_content = yaml_content.strip()
+            if not yaml_content:
+                return None
             try:
                 parsed_yaml = yaml.safe_load(yaml_content)
-                if isinstance(parsed_yaml, dict):
+                if isinstance(parsed_yaml, dict) and self._looks_like_review_yaml(parsed_yaml):
                     return _build_result(parsed_yaml)
             except yaml.YAMLError as e:
                 print(f"AutoArchiveEvaluator: YAML parsing error: {e}")
@@ -864,20 +1205,57 @@ class AutoArchiveEvaluator:
                 if sanitized_yaml_content != yaml_content:
                     try:
                         parsed_yaml = yaml.safe_load(sanitized_yaml_content)
-                        if isinstance(parsed_yaml, dict):
+                        if isinstance(parsed_yaml, dict) and self._looks_like_review_yaml(parsed_yaml):
                             return _build_result(parsed_yaml)
                     except yaml.YAMLError as retry_error:
                         print(f"AutoArchiveEvaluator: YAML parsing error after sanitization: {retry_error}")
+            return None
+
+        if not llm_response:
+            llm_response = ""
+
+        # First prefer explicit fenced YAML blocks.
+        lines = llm_response.split('\n')
+        yaml_start = -1
+        yaml_end = -1
+        
+        for i, line in enumerate(lines):
+            if '```yaml' in line.lower():
+                yaml_start = i + 1
+            elif yaml_start != -1 and '```' in line:
+                yaml_end = i
+                break
+        
+        if yaml_start != -1 and yaml_end != -1:
+            result = _try_parse_yaml('\n'.join(lines[yaml_start:yaml_end]))
+            if result:
+                return result
+
+        # Some providers wrap valid YAML in sections like "Thinking:" and "Response:".
+        # Try the most likely trailing YAML fragments before falling back to score-only parsing.
+        candidate_starts = []
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*(?:response|final(?:\s+evaluation)?|final\s+yaml|yaml)\s*:\s*$', line, re.IGNORECASE):
+                candidate_starts.append(i + 1)
+            if re.match(r'^\s*score\s*:', line, re.IGNORECASE):
+                candidate_starts.append(i)
+
+        for start_index in reversed(candidate_starts):
+            result = _try_parse_yaml('\n'.join(lines[start_index:]))
+            if result:
+                return result
+
+        result = _try_parse_yaml(llm_response)
+        if result:
+            return result
         
         # Fallback: try to extract simple score from response
         response_lower = llm_response.lower()
         score = 1  # Default to lowest score
         
-        # Simple regex-like extraction
-        for i in range(1, 11):
-            if f"score: {i}" in response_lower or f"score:{i}" in response_lower:
-                score = i
-                break
+        score_match = re.search(r'\bscore\s*:\s*(10|[1-9])\b', response_lower)
+        if score_match:
+            score = int(score_match.group(1))
         
         return {
             "score": score,
@@ -885,9 +1263,17 @@ class AutoArchiveEvaluator:
             "suggestion": "Please ensure your submission follows the publication guidelines",
             "evaluation_status": "parsing_error"
         }
+
+    @staticmethod
+    def _looks_like_review_yaml(parsed_yaml: Dict[str, Any]) -> bool:
+        expected_fields = {"score", "comment", "suggestion"}
+        additional_fields = getattr(constants, 'AUTO_EVAL_ARCHIVE_ADDITIONAL_FIELDS', None) or []
+        expected_fields.update(str(field) for field in additional_fields)
+        return any(field in parsed_yaml for field in expected_fields)
     
     def _save_evaluation_log(self, archive_entry: Dict[str, Any], evaluation_prompt: str, 
-                           llm_response: str, thinking_text: Optional[str], evaluation_result: Dict[str, Any]):
+                           llm_response: str, thinking_text: Optional[str], evaluation_result: Dict[str, Any],
+                           format_retry_data: Optional[Dict[str, Any]] = None):
         """Save evaluation log to file"""
         try:
             # Ensure evaluations directory exists
@@ -915,9 +1301,15 @@ class AutoArchiveEvaluator:
                 "extracted_result": evaluation_result,
                 "result": "accepted" if evaluation_result.get("score", 0) >= self.pass_threshold else "rejected"
             }
+            if format_retry_data:
+                log_data["format_retry"] = format_retry_data
             
-            with open(log_filepath, 'w', encoding='utf-8') as f:
-                yaml.dump(log_data, f, default_flow_style=False, allow_unicode=True)
+            file_io_utils.save_yaml(log_data, log_filepath)
+            try:
+                archive_evaluation_index.upsert_archive_evaluation(log_data, log_filepath)
+            except Exception as index_error:
+                print(f"ArchiveEvalIndex: upsert failed path={log_filepath!r}: {index_error}")
+                raise
                 
             print(f"AutoArchiveEvaluator: Saved evaluation log to {log_filepath}")
             
@@ -1047,7 +1439,7 @@ class AutoArchiveEvaluator:
             content = archive_entry.get("content", "")
             submission_tick = archive_entry.get("submission_tick", self.station._get_current_tick())
             
-            # Create YAML data in the format expected by the capsule protocol
+            # Create YAML data in the format expected by the archive capsule flow.
             yaml_data = {
                 constants.YAML_CAPSULE_TITLE: title,
                 constants.YAML_CAPSULE_TAGS: tags,
@@ -1103,7 +1495,7 @@ class AutoArchiveEvaluator:
 **Suggestions for Future Work:**
 {suggestion}
 
-*This evaluation was conducted by the automated review system to ensure publication quality standards.*"""
+*This review was conducted automatically and should not be treated as authoritative. Acceptance indicates only that the paper meets the Archive's publication standards; it does not validate every claim. Agents should independently assess both the paper's claims and the reviewer's recommendations, and may disagree when supported by evidence.*"""
             
             # Create fake agent data for the reviewer system
             reviewer_agent_data = {
@@ -1390,17 +1782,17 @@ class AutoArchiveEvaluator:
             # Reset counter for retry (this will be retried on next evaluation attempt)
             self.evaluation_tick_counter = current_eval_tick
 
-    def _update_initial_context_in_history_file(self):
+    def _update_initial_context_in_history_file(self) -> bool:
         """Update tick 1 entry in history file with fresh research/archive data"""
         if not self.llm_connector:
             print("AutoArchiveEvaluator: No LLM connector available for history update")
-            return
+            return False
         
         history_file_path = self.llm_connector.history_file_path
         
         if not file_io_utils.file_exists(history_file_path):
             print("AutoArchiveEvaluator: History file does not exist, cannot update initial context")
-            return
+            return False
         
         # Load fresh context data
         research_spec = self._load_research_task_spec()
@@ -1444,16 +1836,18 @@ class AutoArchiveEvaluator:
         
         if not updated:
             print("AutoArchiveEvaluator: Tick 1 entry not found in history file, cannot update initial context")
-            return
+            return False
         
-        # Write updated history back to file atomically
-        with open(history_file_path, 'w', encoding='utf-8') as f:
-            import yaml
-            for entry in history_entries:
-                yaml_str = yaml.dump(entry, default_flow_style=False, allow_unicode=True).strip()
-                f.write(yaml_str + '\n---\n')
+        updated_history_content = self._render_yaml_documents(history_entries)
+        current_history_content = file_io_utils.load_text(history_file_path) or ""
+        if current_history_content == updated_history_content:
+            print("AutoArchiveEvaluator: Initial context already current; no history write needed")
+            return False
+
+        file_io_utils.save_text(updated_history_content, history_file_path)
         
         print("AutoArchiveEvaluator: Successfully refreshed initial context in history file")
+        return True
 
     def _format_additional_scores(self, evaluation_result: Dict[str, Any]) -> str:
         """Format additional score fields for display in notifications and capsules"""

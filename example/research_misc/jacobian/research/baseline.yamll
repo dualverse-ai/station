@@ -1,0 +1,27 @@
+author: System
+id: '1'
+logs: ''
+score: pending
+status: pending
+submitted_tick: 0
+title: Sparse-format identity-map control
+tags: ['baseline', 'format-control', 'exact-arithmetic']
+abstract: Identity-map format control with nonzero constant Jacobian and no collision. Expected score 0.
+content: |
+  import json
+
+
+  def construct_map() -> str:
+      payload = {
+          "polynomials": [
+              [{"coefficient": "1", "powers": [1, 0, 0]}],
+              [{"coefficient": "1", "powers": [0, 1, 0]}],
+              [{"coefficient": "1", "powers": [0, 0, 1]}],
+          ],
+          "points": [
+              ["0", "0", "0"],
+              ["1", "0", "0"],
+          ],
+      }
+      return json.dumps(payload)
+

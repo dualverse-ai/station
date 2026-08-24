@@ -95,6 +95,8 @@ def _get_capsule_dir_path(capsule_type: str, lineage_name: Optional[str] = None)
         return os.path.join(base_capsules_path, constants.MAIL_CAPSULES_SUBDIR_NAME)
     elif capsule_type == constants.CAPSULE_TYPE_ARCHIVE:
         return os.path.join(base_capsules_path, constants.ARCHIVE_CAPSULES_SUBDIR_NAME)
+    elif capsule_type == constants.CAPSULE_TYPE_QUESTION:
+        return os.path.join(base_capsules_path, constants.QUESTION_CAPSULES_SUBDIR_NAME)
     elif capsule_type == constants.CAPSULE_TYPE_PRIVATE:
         if not lineage_name: raise ValueError("Lineage name required for private capsules.")
         safe_lineage_name = "".join(c if c.isalnum() or c in ['_', '-'] else '_' for c in lineage_name)
@@ -105,6 +107,7 @@ def _get_capsule_file_prefix_and_full_id(capsule_type: str, numeric_id: int, lin
     if capsule_type == constants.CAPSULE_TYPE_PUBLIC: prefix = "public_"
     elif capsule_type == constants.CAPSULE_TYPE_MAIL: prefix = "mail_"
     elif capsule_type == constants.CAPSULE_TYPE_ARCHIVE: prefix = "archive_"
+    elif capsule_type == constants.CAPSULE_TYPE_QUESTION: prefix = "question_"
     elif capsule_type == constants.CAPSULE_TYPE_PRIVATE:
         if not lineage_name: raise ValueError("Lineage name required for private capsule ID prefix.")
         safe_lineage_name = "".join(c if c.isalnum() or c in ['_', '-'] else '_' for c in lineage_name)
@@ -167,6 +170,9 @@ def create_capsule(capsule_content_from_agent: Dict[str, Any],
             constants.MESSAGE_WORD_COUNT_KEY: initial_word_count,
             constants.MESSAGE_IS_DELETED_KEY: False,
         }
+        if capsule_type == constants.CAPSULE_TYPE_QUESTION:
+            first_message[constants.QUESTION_SOLUTION_VOTES_KEY] = {}
+            first_message[constants.QUESTION_SOLUTION_NET_UPVOTE_KEY] = 0
         capsule_data = {
             constants.CAPSULE_ID_KEY: full_capsule_id_str, constants.CAPSULE_TYPE_KEY: capsule_type,
             constants.CAPSULE_AUTHOR_NAME_KEY: author_agent_data.get(constants.AGENT_NAME_KEY),
@@ -182,6 +188,11 @@ def create_capsule(capsule_content_from_agent: Dict[str, Any],
         if capsule_type == constants.CAPSULE_TYPE_MAIL:
             recipients_raw = capsule_content_from_agent.get(constants.YAML_CAPSULE_RECIPIENTS)
             capsule_data[constants.CAPSULE_RECIPIENTS_KEY] = _process_list_field_from_yaml(recipients_raw)
+        elif capsule_type == constants.CAPSULE_TYPE_QUESTION:
+            capsule_data[constants.QUESTION_STATUS_KEY] = constants.QUESTION_STATUS_PENDING
+            capsule_data[constants.QUESTION_VOTES_KEY] = {}
+            capsule_data[constants.QUESTION_NET_UPVOTE_KEY] = 0
+            capsule_data[constants.QUESTION_SOLVED_BY_MESSAGE_ID_KEY] = None
         
         if capsule_type == constants.CAPSULE_TYPE_PRIVATE and lineage_for_private:
             capsule_data[constants.CAPSULE_LINEAGE_ASSOCIATION_KEY] = lineage_for_private
@@ -224,6 +235,9 @@ def add_message_to_capsule(numeric_id: int,
             constants.MESSAGE_WORD_COUNT_KEY: new_message_word_count,
             constants.MESSAGE_IS_DELETED_KEY: False,
         }
+        if capsule_type == constants.CAPSULE_TYPE_QUESTION:
+            new_message[constants.QUESTION_SOLUTION_VOTES_KEY] = {}
+            new_message[constants.QUESTION_SOLUTION_NET_UPVOTE_KEY] = 0
         messages_list.append(new_message) 
         capsule_data[constants.CAPSULE_MESSAGES_KEY] = messages_list
         capsule_data[constants.CAPSULE_LAST_UPDATED_AT_TICK_KEY] = current_tick
@@ -291,7 +305,7 @@ def update_capsule_metadata(numeric_id: int,
             _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
             
             # Notify agents about the capsule update if room_context is provided
-            if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
+            if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE, constants.CAPSULE_TYPE_QUESTION]:
                 capsule_id = capsule_data.get(constants.CAPSULE_ID_KEY, "")
                 capsule_title = capsule_data.get(constants.CAPSULE_TITLE_KEY, f"Capsule #{numeric_id}")
                 notify_agents_of_capsule_update(capsule_id, capsule_type, capsule_title, str(numeric_id), room_context)
@@ -371,7 +385,7 @@ def update_message_content(numeric_id: int,
             _sync_capsule_index_after_save(capsule_data, file_path, lineage_name)
             
             # Notify agents about the message update if room_context is provided
-            if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
+            if room_context and capsule_type in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE, constants.CAPSULE_TYPE_QUESTION]:
                 capsule_id = capsule_data.get(constants.CAPSULE_ID_KEY, "")
                 capsule_title = capsule_data.get(constants.CAPSULE_TITLE_KEY, f"Capsule #{numeric_id}")
                 notify_agents_of_capsule_update(capsule_id, capsule_type, capsule_title, message_id_str, room_context)
@@ -440,7 +454,9 @@ def list_capsules_page(capsule_type: str,
                        visible_agent_name: Optional[str] = None,
                        exclude_capsule_ids: Optional[List[str]] = None,
                        page: int = 1,
-                       page_size: int = 20) -> Tuple[List[Dict[str, Any]], int]:
+                       page_size: int = 20,
+                       sort_by: str = "numeric_id",
+                       sort_direction: str = "desc") -> Tuple[List[Dict[str, Any]], int]:
     page = page if isinstance(page, int) and page > 0 else 1
     page_size = page_size if isinstance(page_size, int) and page_size > 0 else 20
     return capsule_index.list_capsules(
@@ -452,6 +468,8 @@ def list_capsules_page(capsule_type: str,
         exclude_capsule_ids=exclude_capsule_ids,
         limit=page_size,
         offset=(page - 1) * page_size,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
     )
 
 
@@ -553,8 +571,8 @@ def _update_agent_name_references_in_capsule_data(capsule_data: Dict[str, Any], 
 
 def update_agent_name_in_capsules(old_agent_name: str, new_agent_name: str, current_tick: int, capsule_type_to_scan: str = constants.CAPSULE_TYPE_MAIL):
     # ... (no changes) ...
-    if capsule_type_to_scan not in [constants.CAPSULE_TYPE_MAIL, constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
-        print(f"Name update currently supported only for mail, public, or archive. Skipping {capsule_type_to_scan}."); return 0
+    if capsule_type_to_scan not in [constants.CAPSULE_TYPE_MAIL, constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE, constants.CAPSULE_TYPE_QUESTION]:
+        print(f"Name update currently supported only for mail, public, archive, or question. Skipping {capsule_type_to_scan}."); return 0
     dir_path = _get_capsule_dir_path(capsule_type_to_scan) # Lineage not needed for these types scan
     if not file_io_utils.dir_exists(dir_path): print(f"Directory {dir_path} for {capsule_type_to_scan} not found."); return 0
     updated_capsule_count = 0
@@ -591,10 +609,10 @@ def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str,
     """
     Notify all active agents who have read the capsule/message that it has been updated.
     Clears their read status for the updated content and sends notification.
-    Only works for public_memory and archive capsule types.
+    Only works for shared capsule types.
     """
     # Only notify for shared capsule types
-    if capsule_type not in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE]:
+    if capsule_type not in [constants.CAPSULE_TYPE_PUBLIC, constants.CAPSULE_TYPE_ARCHIVE, constants.CAPSULE_TYPE_QUESTION]:
         return
     
     try:
@@ -611,6 +629,8 @@ def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str,
             room_short_name = constants.SHORT_ROOM_NAME_PUBLIC_MEMORY
         elif capsule_type == constants.CAPSULE_TYPE_ARCHIVE:
             room_short_name = constants.SHORT_ROOM_NAME_ARCHIVE
+        elif capsule_type == constants.CAPSULE_TYPE_QUESTION:
+            room_short_name = constants.SHORT_ROOM_NAME_QUESTION
             
         if not room_short_name:
             return
@@ -624,6 +644,17 @@ def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str,
             agent_data = room_context.agent_manager.load_agent_data(agent_name)
             if not agent_data:
                 continue
+            if capsule_type == constants.CAPSULE_TYPE_QUESTION:
+                station_instance = getattr(room_context, "station_instance", None)
+                if hasattr(station_instance, "_is_agent_question_room_allowed"):
+                    current_tick = station_instance._get_current_tick()
+                    if not station_instance._is_agent_question_room_allowed(agent_data, current_tick):
+                        continue
+                else:
+                    is_recursive = agent_data.get(constants.AGENT_STATUS_KEY) == constants.AGENT_STATUS_RECURSIVE
+                    is_supervisor = agent_data.get(constants.AGENT_ROLE_KEY) == constants.ROLE_SUPERVISOR
+                    if not (is_recursive and is_supervisor):
+                        continue
                 
             # Check if agent has read status for this room
             room_data = agent_data.get(room_short_name, {})
@@ -651,7 +682,12 @@ def notify_agents_of_capsule_update(capsule_id: str, capsule_type: str,
                 agent_data[room_short_name][constants.AGENT_ROOM_STATE_READ_STATUS_KEY] = read_statuses
                 
                 # Determine the room display name
-                room_display_name = "Public Memory Room" if capsule_type == constants.CAPSULE_TYPE_PUBLIC else "Archive Room"
+                if capsule_type == constants.CAPSULE_TYPE_PUBLIC:
+                    room_display_name = "Public Memory Room"
+                elif capsule_type == constants.CAPSULE_TYPE_ARCHIVE:
+                    room_display_name = "Archive Room"
+                else:
+                    room_display_name = "Question Room"
                 display_item_id = _format_capsule_item_id_for_action(updated_item_id)
                 
                 # Create notification message
