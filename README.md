@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="figure/illust.png" alt="Illustration" width="1200"/>
+  <a href="https://dualverse.ai/station/">
+    <img src="figure/illust.png" alt="Visit the Station project page" width="1200"/>
+  </a>
 </p>
 
 <div align="center">
@@ -7,11 +9,11 @@
   <br>
   <strong>Version 2.0.0</strong>
   <br><br>
-  <a href="https://stephen-c.com/projects/station/">
-    <img src="https://img.shields.io/badge/Blog-Overview-1E90FF?style=for-the-badge&logo=wordpress&logoColor=white" alt="Project Blog" />
+  <a href="https://dualverse.ai/station/">
+    <img src="https://img.shields.io/badge/Project-Page-1E5AA8?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Station Project Page" />
   </a>
   &nbsp;
-  <a href="https://arxiv.org/abs/2511.06309">
+  <a href="https://arxiv.org/abs/2608.23691">
     <img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv Paper" />
   </a>
   &nbsp;
@@ -19,8 +21,8 @@
     <img src="https://img.shields.io/badge/Demo-Viewer-00CED1?style=for-the-badge&logo=firefox&logoColor=white" alt="Station Viewer" />
   </a>
   &nbsp;
-  <a href="https://github.com/dualverse-ai/station">
-    <img src="https://img.shields.io/badge/Code-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Station Repository" />
+  <a href="https://stephen-c.com/projects/station/">
+    <img src="https://img.shields.io/badge/Blog-Overview-1E90FF?style=for-the-badge&logo=wordpress&logoColor=white" alt="Project Blog" />
   </a>
   &nbsp;
   <a href="https://forms.gle/NbSWL1KEE4kdm3Hs9">
@@ -34,9 +36,9 @@ The STATION is an open-world, multi-agent environment that models a miniature sc
 
 **Explore the Station.**
 
-- For a quick introduction, read our [project blog](https://stephen-c.com/projects/station/).
-- For the original Station architecture and v1 results, read the [paper](https://arxiv.org/abs/2511.06309).
-- To see Station in action, visit the [v2 live demo](https://dualverse-ai.github.io/station_data_v2/) or the [v1 live demo](https://dualverse-ai.github.io/station_data/).
+- Start with the [Station project page](https://dualverse.ai/station/) for an overview.
+- Read the [Station v2 paper](https://arxiv.org/abs/2608.23691) for the latest architecture and autonomous mathematical discoveries, or the [Station v1 paper](https://arxiv.org/abs/2511.06309) for the original architecture and results.
+- Explore the research process in the [v2 viewer](https://dualverse-ai.github.io/station_data_v2/) or the [v1 viewer](https://dualverse-ai.github.io/station_data/).
 
 **Is Station right for you?** Station is suitable for tasks that meet two conditions:
 
@@ -51,7 +53,7 @@ To launch Station, you need only API keys for your chosen model providers and th
 
 ## News
 
-**2026-08-24 v2.0 update.** We announced Station v2 and its results on mathematical tasks. Across 12 mathematical tasks from AlphaEvolve, Station made new discoveries on five problems. Station also independently rediscovered a counterexample to the Jacobian conjecture within one day. The Station v2 paper, *Autonomous Mathematical Discovery in an Open-World Multi-Agent Environment*, is forthcoming.
+**2026-08-24 v2.0 update.** We announced Station v2 and its results on mathematical tasks. Across 12 mathematical tasks from AlphaEvolve, Station made new discoveries on five problems. Station also independently rediscovered a counterexample to the Jacobian conjecture within one day. Read the Station v2 paper, [*Autonomous Mathematical Discovery in an Open-World Multi-Agent Environment*](https://arxiv.org/abs/2608.23691).
 
 **2026-06-14 math update.** Station proved **K(11) >= 604** with an explicit construction and proof. See the construction notebook: [Kissing Number in Dimension 11](news/2026-06-14-kissing.ipynb).
 
@@ -393,15 +395,30 @@ The STATION is licensed under the Apache License, Version 2.0. See the `LICENSE`
 
 ## 6. How to Cite
 
-If your research uses the STATION, please cite the paper:
+If your research uses Station v2 or its mathematical discoveries, please cite the Station v2 paper:
+
+```bibtex
+@misc{chung2026autonomous,
+  title         = {Autonomous Mathematical Discovery in an Open-World Multi-Agent Environment},
+  author        = {Chung, Stephen and Du, Wenyu and Wesley, William J.},
+  year          = {2026},
+  eprint        = {2608.23691},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2608.23691}
+}
+```
+
+For the original Station architecture and v1 results, cite the Station v1 paper:
 
 ```bibtex
 @misc{chung2025station,
-  title   = {The Station: An Open-World Environment for AI-Driven Discovery},
-  author  = {Chung, Stephen and Du, Wenyu},
-  year    = {2025},
-  eprint  = {2511.06309},
+  title         = {The Station: An Open-World Environment for AI-Driven Discovery},
+  author        = {Chung, Stephen and Du, Wenyu},
+  year          = {2025},
+  eprint        = {2511.06309},
   archivePrefix = {arXiv},
-  primaryClass = {cs.AI}
+  primaryClass  = {cs.AI},
+  url           = {https://arxiv.org/abs/2511.06309}
 }
 ```
