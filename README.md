@@ -9,6 +9,8 @@
   <br>
   <strong>Version 2.0.0</strong>
   <br><br>
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+  <br><br>
   <a href="https://dualverse.ai/station/">
     <img src="https://img.shields.io/badge/Project-Page-1E5AA8?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Station Project Page" />
   </a>
