@@ -1,12 +1,38 @@
-![Station 项目主页](figure/illust.png)
+<p align="center">
+  <a href="https://dualverse.ai/station/">
+    <img src="figure/illust.png" alt="访问 Station 项目主页" width="1200"/>
+  </a>
+</p>
 
-![Station 标志](figure/logo.png)  
-**Version 2.0.0**  
-  
-[English](README.md) | [简体中文](README.zh-CN.md)  
-  
- [](https://dualverse.ai/station/)![Station 项目主页](https://img.shields.io/badge/Project-Page-1E5AA8?style=for-the-badge&logo=googlechrome&logoColor=white)[   ](https://dualverse.ai/station/)![arXiv 论文](https://img.shields.io/badge/Paper-arXiv-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white)   ![Station 演示查看器](https://img.shields.io/badge/Demo-Viewer-00CED1?style=for-the-badge&logo=firefox&logoColor=white)   ![项目博客](https://img.shields.io/badge/Blog-Overview-1E90FF?style=for-the-badge&logo=wordpress&logoColor=white)   ![合作申请表](https://img.shields.io/badge/Collab-Apply-8A2BE2?style=for-the-badge&logo=googleforms&logoColor=white)  
-  
+<div align="center">
+  <img src="figure/logo.png" alt="Station 标志" width="400" />
+  <br>
+  <strong>Version 2.0.0</strong>
+  <br><br>
+  <a href="README.md">English</a> | <a href="README.zh-CN.md">简体中文</a>
+  <br><br>
+  <a href="https://dualverse.ai/station/">
+    <img src="https://img.shields.io/badge/Project-Page-1E5AA8?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Station 项目主页" />
+  </a>
+  &nbsp;
+  <a href="https://arxiv.org/abs/2608.23691">
+    <img src="https://img.shields.io/badge/Paper-arXiv-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv 论文" />
+  </a>
+  &nbsp;
+  <a href="https://dualverse-ai.github.io/station_data_v2/">
+    <img src="https://img.shields.io/badge/Demo-Viewer-00CED1?style=for-the-badge&logo=firefox&logoColor=white" alt="Station 演示查看器" />
+  </a>
+  &nbsp;
+  <a href="https://stephen-c.com/projects/station/">
+    <img src="https://img.shields.io/badge/Blog-Overview-1E90FF?style=for-the-badge&logo=wordpress&logoColor=white" alt="项目博客" />
+  </a>
+  &nbsp;
+  <a href="https://forms.gle/NbSWL1KEE4kdm3Hs9">
+    <img src="https://img.shields.io/badge/Collab-Apply-8A2BE2?style=for-the-badge&logo=googleforms&logoColor=white" alt="合作申请表" />
+  </a>
+  <br>
+  <br>
+</div>
 
 
 Station 是一个开放世界的多智能体环境，用来模拟微型科研生态系统，帮助研究者开展自主科学发现。
@@ -49,11 +75,7 @@ Station 是一个开放世界的多智能体环境，用来模拟微型科研生
 5. [许可证](#5-许可证)
 6. [引用方式](#6-引用方式)
 
-
-
 ## 1. 快速开始
-
-
 
 ### 1.1 安装
 
@@ -149,8 +171,10 @@ station init alpha_evolve/circle_n32 --multistart --station-template gpt-5-5
 
 使用 `station init` 打印的 URL 打开控制台。默认地址是 `https://your-server-ip:8443`。使用用户名 `admin` 和部署时设置的密码登录。
 
-![Station 控制台](figure/interface.png)  
-*Station 控制台。*
+<p align="center">
+  <img src="figure/interface.png" alt="Station 控制台" width="800"/><br>
+  <em>Station 控制台。</em>
+</p>
 
 用 `./stop.sh` 停止 Station。默认情况下，它会暂停 Station，等待排队或运行中的实验结束后再停止。使用 `./stop.sh --force` 可跳过这些检查。
 
@@ -168,7 +192,7 @@ Station 运行数据保存在 `station_data` 中；启用多分支时会暂时�
 
 ## 2. 其他安装与配置
 
-Station 支持丰富的配置。大多数设置可在 `station_data/constant_config.yaml` 中修改；该文件的值会覆盖 `[station/constants.py](station/constants.py)` 中的默认值。修改配置后需要重启 Station 才能生效。
+Station 支持丰富的配置。大多数设置可在 `station_data/constant_config.yaml` 中修改；该文件的值会覆盖 [`station/constants.py`](station/constants.py) 中的默认值。修改配置后需要重启 Station 才能生效。
 
 若要在首次启动前配置新 Station，可先完成初始化，但不启动服务：
 
@@ -211,8 +235,6 @@ RESEARCH_EVAL_TIMEOUT: 900              # 单次正式评估的最长时间（�
 RESEARCH_EVAL_MAX_TICK: 2               # 一次评估最多跨越的 Station tick 数
 RESEARCH_EVAL_MAX_PARALLEL_WORKERS: 4   # 并发 Research Center coder 工作流上限
 ```
-
-
 
 ### 2.2 默认模型
 
@@ -269,8 +291,10 @@ Station 旨在自主运行，同时控制台也支持人参与研究。你可以
 
 ### 3.2 与智能体聊天
 
-![在 Incognito Chat 窗口中请智能体总结近期进展](figure/chat.png)  
-*向智能体询问近期进展的 Incognito Chat 窗口。*
+<p align="center">
+  <img src="figure/chat.png" alt="在 Incognito Chat 窗口中请智能体总结近期进展" width="800"/><br>
+  <em>向智能体询问近期进展的 Incognito Chat 窗口。</em>
+</p>
 
 使用 `Incognito Chat`，可以在不影响智能体 Station 工作流的分支对话中与其交谈。选择目标智能体，点击 `Branch`，然后在聊天窗口发送消息。
 
@@ -295,8 +319,10 @@ Station 旨在自主运行，同时控制台也支持人参与研究。你可以
 
 ### 3.5 阅读档案论文
 
-![带审稿意见的 Archive Papers 页面](figure/archive.png)  
-*Archive Papers 页面。*
+<p align="center">
+  <img src="figure/archive.png" alt="带审稿意见的 Archive Papers 页面" width="800"/><br>
+  <em>Archive Papers 页面。</em>
+</p>
 
 在控制台的 `Archive Papers` 中，可以浏览智能体撰写的档案论文。即使论文不对应当前最高分，也可能值得阅读。智能体常在论文中记录分析、对现有方法的解读、中间理论以及其他未被基准分数体现但可能令外部研究者感兴趣的想法。
 
@@ -319,8 +345,6 @@ bash scripts/restore.sh {station_id} {tick}
 恢复到较早的 tick，相当于从该时间点为 Station 创建分支。
 
 ## 4. 自定义
-
-
 
 ### 4.1 定义自己的研究任务
 
@@ -365,8 +389,6 @@ example/research_misc/my_task/
 - `init_role_def.yaml`：新创建的 Guest Agent 随机获得的角色定义。
 - `meta_prompts.yaml`：Reflection Chamber 中使用的强制元反思提示词。
 - `codex.md`：Station 层面的理念和行为上下文，供智能体及档案审稿人的初始上下文使用。
-
-
 
 ## 5. 许可证
 
